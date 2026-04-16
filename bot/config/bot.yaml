@@ -1,0 +1,35 @@
+bot:
+  name: polymarket-bot
+  mode: dry_run
+  log_level: INFO
+  heartbeat_interval_seconds: 5
+  housekeeping_interval_seconds: 15
+  snapshot_interval_seconds: 30
+  shutdown_timeout_seconds: 10
+  kill_switch_on_startup: false
+
+market_data:
+  ws_url: wss://ws-subscriptions-clob.polymarket.com/ws/market
+  reconnect_initial_seconds: 1
+  reconnect_max_seconds: 30
+  stale_after_seconds: 10
+  heartbeat_timeout_seconds: 15
+  subscribed_market_ids: []
+  subscribed_token_ids: []
+
+execution:
+  dry_run_force: true
+  allow_live_trading: false
+  default_order_size: 5
+  max_order_size: 25
+  min_order_size: 1
+  max_slippage_bps: 20
+  time_in_force: GTC
+  client_order_id_prefix: pm-bot
+  large_order_notional: 100
+
+notifications:
+  telegram_enabled: false
+  telegram_send_retries: 2
+  repeated_failure_alert_threshold: 3
+  large_order_threshold: 100

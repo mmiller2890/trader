@@ -1,0 +1,10 @@
+spike_strategy:
+  enabled: true
+  lookback_ticks: 3
+  spike_threshold_bps: 80
+  cooldown_seconds: 30
+  min_top_of_book_liquidity: 20
+  emit_on_upward_spike: true
+  emit_on_downward_spike: true
+  target_market_ids: []
+  target_token_ids: []
