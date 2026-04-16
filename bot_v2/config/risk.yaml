@@ -1,0 +1,12 @@
+risk:
+  max_single_position_size: 50
+  max_total_exposure: 150
+  max_open_orders: 5
+  max_daily_loss: 50
+  max_data_staleness_seconds: 15
+  min_top_of_book_liquidity: 20
+  max_slippage_bps: 25
+  duplicate_signal_window_seconds: 15
+  circuit_breaker_failures: 5
+  circuit_breaker_window_seconds: 60
+  circuit_breaker_cooldown_seconds: 120

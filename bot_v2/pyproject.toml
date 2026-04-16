@@ -1,0 +1,32 @@
+[project]
+name = "polymarket-bot-v2"
+version = "0.1.0"
+description = "Production-minded, dry-run-first Polymarket bot."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.7.0",
+  "pydantic-settings>=2.3.0",
+  "PyYAML>=6.0.1",
+  "py-clob-client>=0.19.0",
+  "websockets>=12.0",
+  "httpx>=0.27.0",
+  "structlog>=24.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+  "pytest-asyncio>=0.23.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+asyncio_mode = "auto"
