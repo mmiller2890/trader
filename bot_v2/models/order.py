@@ -40,6 +40,7 @@ class OrderStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     FILLED = "filled"
+    PARTIALLY_FILLED = "partially_filled"
 
 
 class OrderRequest(BaseModel):

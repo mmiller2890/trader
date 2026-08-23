@@ -1,0 +1,83 @@
+{
+  "equity_curve": [
+    {
+      "realized_pnl": "0",
+      "timestamp": "2025-01-01 00:00:00+00:00",
+      "total_pnl": "0",
+      "unrealized_pnl": "0"
+    },
+    {
+      "realized_pnl": "0",
+      "timestamp": "2025-01-01 00:00:01+00:00",
+      "total_pnl": "0",
+      "unrealized_pnl": "0"
+    },
+    {
+      "realized_pnl": "0",
+      "timestamp": "2025-01-01 00:00:02+00:00",
+      "total_pnl": "0",
+      "unrealized_pnl": "0"
+    },
+    {
+      "realized_pnl": "0",
+      "timestamp": "2025-01-01 00:00:03+00:00",
+      "total_pnl": "-0.05",
+      "unrealized_pnl": "-0.05"
+    }
+  ],
+  "metrics": {
+    "filled_order_count": 1,
+    "realized_pnl": "0",
+    "rejected_order_count": 0,
+    "signal_count": 1,
+    "simulated_order_count": 0,
+    "total_pnl": "-0.05",
+    "unrealized_pnl": "-0.05"
+  },
+  "order_results": [
+    {
+      "accepted": true,
+      "avg_fill_price": "0.55",
+      "client_order_id": "pm-bot-bc06abe48e4f4a3aab",
+      "created_at": "2026-08-23T01:38:58.183938Z",
+      "exchange_order_id": null,
+      "filled_size": "5",
+      "latency_ms": null,
+      "market_id": "example-market",
+      "message": "backtest_top_of_book_fill",
+      "requested_size": "5",
+      "side": "sell",
+      "signal_id": "bc06abe48e4f4a3aab405f8c5b53f2c8",
+      "status": "filled",
+      "strategy_name": "spike",
+      "token_id": "example-token"
+    }
+  ],
+  "positions": [
+    {
+      "average_entry_price": "0.55",
+      "mark_price": "0.56",
+      "market_id": "example-market",
+      "quantity": "-5",
+      "realized_pnl": "0",
+      "token_id": "example-token",
+      "unrealized_pnl": "-0.05",
+      "updated_at": "2025-01-01T00:00:03Z"
+    }
+  ],
+  "signals": [
+    {
+      "created_at": "2025-01-01T00:00:03Z",
+      "market_id": "example-market",
+      "observed_move_bps": 1200.0,
+      "reason": "spike_up_1200.00bps",
+      "reference_price": "0.50",
+      "side": "sell",
+      "signal_id": "bc06abe48e4f4a3aab405f8c5b53f2c8",
+      "signal_type": "price_spike",
+      "strategy_name": "spike",
+      "target_price": "0.56",
+      "token_id": "example-token"
+    }
+  ]
+}

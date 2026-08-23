@@ -20,6 +20,7 @@ class PreTradeRiskPolicy(Protocol):
         snapshot: MarketSnapshot | None,
         proposed_size: Decimal,
         proposed_price: Decimal,
+        executable_liquidity: Decimal | None = None,
     ) -> RiskDecision:
         """Return decision for the proposed order intent."""
 

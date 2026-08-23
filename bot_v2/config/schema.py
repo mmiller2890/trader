@@ -95,6 +95,18 @@ class ExecutionConfig(BaseModel):
         return self
 
 
+class BacktestConfig(BaseModel):
+    """Deterministic paper-exchange settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    starting_cash: Decimal = Field(default=Decimal("1000"), gt=Decimal("0"))
+    taker_fee_bps: Decimal = Field(default=Decimal("10"), ge=Decimal("0"), le=Decimal("1000"))
+    allow_short_positions: bool = True
+    reject_sequence_gaps: bool = True
+    max_payout_per_share: Decimal = Field(default=Decimal("1"), gt=Decimal("0"), le=Decimal("1"))
+
+
 class RiskConfig(BaseModel):
     """Risk configuration used by pre-trade and runtime guards."""
 
@@ -171,6 +183,7 @@ class AppConfig(BaseModel):
     market_data: MarketDataConfig = Field(default_factory=MarketDataConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
+    backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     spike_strategy: SpikeStrategyConfig = Field(default_factory=SpikeStrategyConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     secrets: SecretsConfig = Field(default_factory=SecretsConfig)

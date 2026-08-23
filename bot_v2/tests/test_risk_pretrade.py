@@ -84,6 +84,22 @@ async def test_pretrade_rejects_position_limit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pretrade_can_evaluate_depth_liquidity_override() -> None:
+    config = AppConfig(risk={"min_top_of_book_liquidity": "2"})
+    state = InMemoryStateStore(mode=Mode.BACKTEST)
+    engine = PreTradeRiskEngine(config=config, state_store=state)
+    item = fresh_snapshot().model_copy(update={"top_ask_size": Decimal("1")})
+    decision = await engine.evaluate(
+        signal=make_signal(),
+        snapshot=item,
+        proposed_size=Decimal("3"),
+        proposed_price=Decimal("0.46"),
+        executable_liquidity=Decimal("3"),
+    )
+    assert next(check for check in decision.checks if check.check_name == "top_of_book_liquidity").passed
+
+
+@pytest.mark.asyncio
 async def test_pretrade_rejects_stale_market_data() -> None:
     config = AppConfig()
     state = InMemoryStateStore(mode=Mode.DRY_RUN)

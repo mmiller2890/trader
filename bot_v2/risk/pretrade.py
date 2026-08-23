@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -28,9 +29,16 @@ def _bps_distance(reference: Decimal, candidate: Decimal) -> float:
 class PreTradeRiskEngine(PreTradeRiskPolicy):
     """Concrete risk engine that evaluates order intents before execution."""
 
-    def __init__(self, *, config: AppConfig, state_store: InMemoryStateStore) -> None:
+    def __init__(
+        self,
+        *,
+        config: AppConfig,
+        state_store: InMemoryStateStore,
+        now: Callable[[], datetime] = utc_now,
+    ) -> None:
         self._config = config
         self._state_store = state_store
+        self._now = now
 
     async def evaluate(
         self,
@@ -39,6 +47,7 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
         snapshot: MarketSnapshot | None,
         proposed_size: Decimal,
         proposed_price: Decimal,
+        executable_liquidity: Decimal | None = None,
     ) -> RiskDecision:
         checks: list[RiskCheckResult] = []
 
@@ -49,7 +58,11 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
         checks.append(await self._total_exposure_check(proposed_size))
         checks.append(await self._open_orders_check())
         checks.append(await self._duplicate_guard_check(signal))
-        checks.append(self._top_of_book_liquidity_check(signal, snapshot, proposed_size))
+        checks.append(
+            self._top_of_book_liquidity_check(
+                signal, snapshot, proposed_size, executable_liquidity
+            )
+        )
         checks.append(self._slippage_check(signal, snapshot, proposed_price))
 
         failed = [check for check in checks if not check.passed]
@@ -90,7 +103,7 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
         if snapshot is None:
             return RiskCheckResult(check_name="stale_data", passed=False, reason="market_snapshot_missing")
         max_age = timedelta(seconds=self._config.risk.max_data_staleness_seconds)
-        age = utc_now() - snapshot.received_ts
+        age = self._now() - snapshot.received_ts
         return RiskCheckResult(
             check_name="stale_data",
             passed=age <= max_age,
@@ -134,7 +147,7 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
 
     async def _duplicate_guard_check(self, signal: TradeSignal) -> RiskCheckResult:
         window = timedelta(seconds=self._config.risk.duplicate_signal_window_seconds)
-        cutoff = utc_now() - window
+        cutoff = self._now() - window
         signals = await self._state_store.get_signals()
         for existing in signals:
             if (
@@ -171,6 +184,7 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
         signal: TradeSignal,
         snapshot: MarketSnapshot | None,
         proposed_size: Decimal,
+        executable_liquidity: Decimal | None = None,
     ) -> RiskCheckResult:
         if snapshot is None:
             return RiskCheckResult(
@@ -178,7 +192,9 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
                 passed=False,
                 reason="market_snapshot_missing",
             )
-        available = snapshot.top_ask_size if signal.side.value == "buy" else snapshot.top_bid_size
+        available = executable_liquidity
+        if available is None:
+            available = snapshot.top_ask_size if signal.side.value == "buy" else snapshot.top_bid_size
         minimum = max(self._config.risk.min_top_of_book_liquidity, proposed_size)
         return RiskCheckResult(
             check_name="top_of_book_liquidity",

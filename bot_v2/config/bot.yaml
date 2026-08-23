@@ -28,6 +28,13 @@ execution:
   client_order_id_prefix: pm-bot
   large_order_notional: 100
 
+backtest:
+  starting_cash: 1000
+  taker_fee_bps: 10
+  allow_short_positions: true
+  reject_sequence_gaps: true
+  max_payout_per_share: 1
+
 notifications:
   telegram_enabled: false
   telegram_send_retries: 2

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -28,14 +29,25 @@ def _bps_change(reference: Decimal, current: Decimal) -> float:
 class SpikeStrategy(StrategyBase):
     """Simple price-spike strategy with cooldown and liquidity filter."""
 
-    def __init__(self, config: SpikeStrategyConfig) -> None:
+    def __init__(
+        self,
+        config: SpikeStrategyConfig,
+        *,
+        now: Callable[[], datetime] = utc_now,
+    ) -> None:
         self._config = config
+        self._now = now
         self._history = MarketHistoryCache(max_points_per_market=max(200, config.lookback_ticks * 20))
         self._last_signal_at: dict[tuple[str, str], datetime] = {}
 
     @property
     def name(self) -> str:
         return "spike"
+
+    def set_clock(self, now: Callable[[], datetime]) -> None:
+        """Set the clock used for cooldowns and emitted signal timestamps."""
+
+        self._now = now
 
     async def on_market_update(self, snapshot: MarketSnapshot) -> list[TradeSignal]:
         if not self._config.enabled:
@@ -72,7 +84,7 @@ class SpikeStrategy(StrategyBase):
         if side is None:
             return []
 
-        self._last_signal_at[key] = utc_now()
+        self._last_signal_at[key] = self._now()
         signal = TradeSignal(
             strategy_name=self.name,
             market_id=snapshot.market_id,
@@ -81,6 +93,7 @@ class SpikeStrategy(StrategyBase):
             reference_price=reference,
             target_price=snapshot.mid_price,
             observed_move_bps=abs(move_bps),
+            created_at=self._now(),
             reason=f"spike_{'up' if move_bps > 0 else 'down'}_{abs(move_bps):.2f}bps",
         )
         return [signal]
@@ -98,7 +111,7 @@ class SpikeStrategy(StrategyBase):
         previous = self._last_signal_at.get(key)
         if previous is None:
             return True
-        return (utc_now() - previous).total_seconds() >= self._config.cooldown_seconds
+        return (self._now() - previous).total_seconds() >= self._config.cooldown_seconds
 
     def _choose_side(self, move_bps: float) -> SignalSide | None:
         if move_bps > 0 and self._config.emit_on_upward_spike:

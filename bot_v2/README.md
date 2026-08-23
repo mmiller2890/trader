@@ -680,6 +680,79 @@ allow_live_trading: false
 python3 -m app.main
 ```
 
+## Run A Backtest
+
+The backtest is fully offline: it never starts the WebSocket, instantiates a CLOB client, or calls the exchange. It replays normalized historical book events through the configured spike strategy, existing pre-trade risk checks, and a deterministic paper exchange that reconstructs full books, consumes depth, produces partial fills, charges fees, and tracks cash, collateral, positions, and equity.
+
+```bash
+python3 -m backtest.cli \
+  --snapshots backtest/example_orderbook_events.json \
+  --output backtest/results/realistic-backtest.json
+```
+
+For a legacy smoke test, use the included [`backtest/example_snapshots.json`](backtest/example_snapshots.json) file as `--snapshots`; it is automatically converted to one-level book events.
+
+### Input formats
+
+The CLI accepts either a JSON array of legacy `MarketSnapshot` objects (no `event_type` field) or a JSON array of richer `book_snapshot` and `book_delta` events. Legacy objects become one-level full-book snapshots with deterministic sequence IDs. See [`backtest/example_orderbook_events.json`](backtest/example_orderbook_events.json) for the event format:
+
+```json
+[
+  {
+    "event_type": "book_snapshot",
+    "market_id": "market-1",
+    "token_id": "token-1",
+    "bids": [{"price": "0.49", "size": "100"}],
+    "asks": [{"price": "0.51", "size": "100"}],
+    "sequence_id": 100,
+    "source_ts": "2025-01-01T00:00:00+00:00",
+    "received_ts": "2025-01-01T00:00:00+00:00"
+  }
+]
+```
+
+A full snapshot replaces the book for that `(market_id, token_id)`. A delta upserts non-zero levels and deletes zero-size levels. Events are processed deterministically in `(received_ts, source_ts, sequence_id)` order. Out-of-order sequence numbers and crossed books are rejected; sequence gaps are rejected by default and only full snapshots may resynchronize the book.
+
+### Paper-exchange behavior
+
+- Approved buys consume asks from lowest price upward; approved sells consume bids from highest price downward.
+- The execution limit derives from the current best quote plus `execution.max_slippage_bps`.
+- `FOK` orders fill completely or leave the book and portfolio untouched. `IOC` and `GTC` may partially fill; this version does not model a resting maker queue, so any remainder is reported unfilled.
+- Taker fees are `notional * taker_fee_bps / 10000` and reduce cash and net P&L. Position `realized_pnl` and `unrealized_pnl` remain gross of fees.
+- Signed positions are preserved: a negative position is a synthetic short and reserves `max_payout_per_share` USDC per short share (maximum prediction-market payout liability). Available cash is `cash - reserved_cash`, and a fill is rejected when projected cash falls below projected reserves.
+- After every event, `equity == cash + sum(position.quantity * last_mark_price)` and `net_pnl == equity - starting_cash`.
+
+### Backtest YAML settings
+
+Under `backtest` in `bot.yaml`:
+
+```yaml
+backtest:
+  starting_cash: 1000          # initial USDC balance
+  taker_fee_bps: 10            # taker fee in basis points
+  allow_short_positions: true  # permit synthetic shorts with collateral
+  reject_sequence_gaps: true   # require contiguous delta sequence ids
+  max_payout_per_share: 1      # collateral reserved per short share
+```
+
+### Output
+
+The output file retains `signals`, `order_results`, `positions`, `equity_curve`, and `metrics`, and adds `execution_reports` (individual fills, VWAP, fees, filled size, unfilled remainder, and executable liquidity inside the limit) and `portfolio_snapshots` (cash, reserved/available cash, position value, equity, realized/unrealized/gross/net P&L, fees, and positions per event). Metrics add `starting_cash`, `ending_cash`, `ending_equity`, `reserved_cash`, `fees_paid`, `gross_pnl`, `net_pnl`, `fill_rate`, and maximum drawdown; `total_pnl` remains as an alias for `net_pnl`.
+
+Use `--config-dir /path/to/config` to supply a different `bot.yaml`, `risk.yaml`, or `strategies/spike.yaml`. The command always forces `backtest` mode, then writes signals, accepted/rejected orders, final positions, metrics, and an equity curve to the output file.
+
+### Modeling limitations
+
+This is a conservative taker simulator, not an execution-quality estimate:
+
+- no maker queue or resting-order model; unfilled remainder is cancelled
+- no latency model
+- fixed configurable taker fee rather than market-specific Polymarket fee curves
+- synthetic shorts reserve full payout collateral but do not emulate token minting
+- no settlement/resolution event yet
+
+Future work (maker queues, latency, settlement, parameter sweeps, market-specific fee curves) is intentionally out of scope until the taker simulator above is verified.
+
 ## What Should Happen
 
 If the bot starts correctly:
