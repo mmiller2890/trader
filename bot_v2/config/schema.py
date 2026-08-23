@@ -85,6 +85,7 @@ class ExecutionConfig(BaseModel):
     time_in_force: TimeInForce = TimeInForce.GTC
     client_order_id_prefix: str = Field(default="pm-bot", min_length=1, max_length=24)
     large_order_notional: Decimal = Field(default=Decimal("100"), gt=Decimal("0"))
+    max_live_order_notional: Decimal = Field(default=Decimal("1"), gt=Decimal("0"))
 
     @model_validator(mode="after")
     def validate_order_size_bounds(self) -> Self:
@@ -105,6 +106,20 @@ class BacktestConfig(BaseModel):
     allow_short_positions: bool = True
     reject_sequence_gaps: bool = True
     max_payout_per_share: Decimal = Field(default=Decimal("1"), gt=Decimal("0"), le=Decimal("1"))
+
+
+class ExchangeConfig(BaseModel):
+    """Production exchange endpoints and live-safety settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    clob_host: str = "https://clob.polymarket.com"
+    data_api_host: str = "https://data-api.polymarket.com"
+    chain_id: int = Field(default=137, gt=0)
+    signature_type: int = Field(default=3, ge=0, le=3)
+    geoblock_url: str = "https://polymarket.com/api/geoblock"
+    ws_ping_interval_seconds: float = Field(default=10, ge=5, le=60)
+    compliance_timeout_seconds: float = Field(default=5, gt=0, le=30)
 
 
 class RiskConfig(BaseModel):
@@ -184,6 +199,7 @@ class AppConfig(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
+    exchange: ExchangeConfig = Field(default_factory=ExchangeConfig)
     spike_strategy: SpikeStrategyConfig = Field(default_factory=SpikeStrategyConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     secrets: SecretsConfig = Field(default_factory=SecretsConfig)
@@ -194,4 +210,6 @@ class AppConfig(BaseModel):
             raise ValueError("live mode requires execution.allow_live_trading=true")
         if self.bot.mode == Mode.LIVE and self.execution.dry_run_force:
             raise ValueError("live mode requires execution.dry_run_force=false")
+        if self.execution.max_live_order_notional > self.notifications.large_order_threshold:
+            raise ValueError("max_live_order_notional must be <= notifications.large_order_threshold")
         return self

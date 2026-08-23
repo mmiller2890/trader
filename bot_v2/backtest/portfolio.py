@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime
 from decimal import Decimal
 
@@ -89,7 +90,9 @@ class PortfolioLedger:
             and not self.config.allow_short_positions
         ):
             return False, "short_positions_disabled"
-        reserved = self._reserved_cash(projected_position)
+        projected_positions = dict(self.positions)
+        projected_positions[key] = projected_position
+        reserved = self._reserved_cash(projected_positions.values())
         if projected_cash < reserved:
             if projected_position.quantity < 0:
                 return False, "insufficient_short_collateral"
@@ -129,7 +132,7 @@ class PortfolioLedger:
         self.marks[key] = snapshot.mid_price
 
     def snapshot(self, timestamp: datetime) -> PortfolioSnapshot:
-        reserved = self._reserved_cash(None)
+        reserved = self._reserved_cash(self.positions.values())
         position_value = sum(
             (
                 position.quantity * self.marks.get(key, position.average_entry_price)
@@ -170,11 +173,7 @@ class PortfolioLedger:
             return self.cash - report.total_notional - report.total_fees
         return self.cash + report.total_notional - report.total_fees
 
-    def _reserved_cash(self, override: Position | None) -> Decimal:
-        if override is not None:
-            positions = [override]
-        else:
-            positions = list(self.positions.values())
+    def _reserved_cash(self, positions: Iterable[Position]) -> Decimal:
         return sum(
             (
                 abs(min(position.quantity, Decimal("0")))

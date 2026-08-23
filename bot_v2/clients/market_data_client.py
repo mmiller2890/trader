@@ -6,15 +6,14 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
 
-from models.market import MarketSnapshot, OrderBookLevel, OrderBookUpdate
+from clients.live_book import LiveBookState
+from models.market import MarketSnapshot
 from state.store import InMemoryStateStore
 
 logger = logging.getLogger(__name__)
 
 MarketUpdateHandler = Callable[[MarketSnapshot], Awaitable[None]]
-OrderBookHandler = Callable[[OrderBookUpdate], Awaitable[None]]
 
 
 def utc_now() -> datetime:
@@ -24,55 +23,176 @@ def utc_now() -> datetime:
 
 
 class MarketDataClient:
-    """Parse transport payloads into internal typed market models."""
+    """Parse production market-channel payloads into typed market models."""
 
     def __init__(
         self,
         *,
         state_store: InMemoryStateStore,
         on_snapshot: MarketUpdateHandler | None = None,
-        on_orderbook: OrderBookHandler | None = None,
     ) -> None:
         self._state_store = state_store
         self._on_snapshot = on_snapshot
-        self._on_orderbook = on_orderbook
+        self._books: dict[tuple[str, str], LiveBookState] = {}
 
     async def handle_ws_message(self, message: dict | str) -> None:
-        """Ingest websocket message and fan out typed updates."""
+        """Ingest one websocket message and fan out typed updates."""
 
         if not isinstance(message, dict):
             return
+        event_type = str(message.get("event_type") or "")
+        if event_type == "book":
+            await self._handle_book(message)
+        elif event_type == "price_change":
+            await self._handle_price_change(message)
+        elif event_type == "tick_size_change":
+            await self._handle_tick_size_change(message)
+        elif event_type == "market_resolved":
+            await self._handle_market_resolved(message)
+        elif event_type == "last_trade_price":
+            await self._handle_last_trade_price(message)
+        else:
+            logger.debug(
+                "unknown websocket event ignored",
+                extra={
+                    "component": "market_data_client",
+                    "event_type": "unknown_ws_event",
+                    "reason": event_type,
+                },
+            )
 
-        market_id = self._get_first(message, ("market_id", "market", "marketId"))
-        token_id = self._get_first(message, ("token_id", "token", "asset_id", "tokenId"))
-        if not market_id or not token_id:
+    async def _handle_book(self, message: dict) -> None:
+        market_id, token_id = self._ids(message)
+        if market_id is None or token_id is None:
+            logger.warning(
+                "malformed book event ignored",
+                extra={
+                    "component": "market_data_client",
+                    "event_type": "malformed_ws_event",
+                    "reason": "missing market or asset id",
+                },
+            )
             return
-
-        bids = self._parse_levels(message.get("bids") or message.get("buy") or [])
-        asks = self._parse_levels(message.get("asks") or message.get("sell") or [])
-        if not bids or not asks:
+        book = self._books.setdefault((market_id, token_id), LiveBookState(market_id, token_id))
+        try:
+            book.apply_book(message)
+        except (KeyError, ValueError) as exc:
+            logger.warning(
+                "malformed book event ignored",
+                extra={
+                    "component": "market_data_client",
+                    "event_type": "malformed_ws_event",
+                    "reason": str(exc),
+                },
+            )
             return
+        await self._publish(book)
 
-        update = OrderBookUpdate(
-            market_id=str(market_id),
-            token_id=str(token_id),
-            bids=bids,
-            asks=asks,
-            sequence_id=self._maybe_int(message.get("sequence") or message.get("seq")),
-            source_ts=utc_now(),
-            received_ts=utc_now(),
-        )
-        snapshot = self._to_snapshot(update)
+    async def _handle_price_change(self, message: dict) -> None:
+        market_id = message.get("market") or message.get("market_id")
+        if market_id is None:
+            logger.warning(
+                "malformed price_change event ignored",
+                extra={
+                    "component": "market_data_client",
+                    "event_type": "malformed_ws_event",
+                    "reason": "missing market id",
+                },
+            )
+            return
+        changes = message.get("price_changes")
+        if not isinstance(changes, list):
+            logger.warning(
+                "malformed price_change event ignored",
+                extra={
+                    "component": "market_data_client",
+                    "event_type": "malformed_ws_event",
+                    "reason": "price_changes is not a list",
+                },
+            )
+            return
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            asset_id = str(change.get("asset_id") or "")
+            if not asset_id:
+                continue
+            book = self._books.get((str(market_id), asset_id))
+            if book is None:
+                continue
+            try:
+                book.apply_price_change(change, message["timestamp"])
+            except (KeyError, ValueError) as exc:
+                logger.warning(
+                    "malformed price_change ignored",
+                    extra={
+                        "component": "market_data_client",
+                        "event_type": "malformed_ws_event",
+                        "reason": str(exc),
+                    },
+                )
+                continue
+            await self._publish(book)
 
-        await self._state_store.update_orderbook(update)
+    async def _handle_tick_size_change(self, message: dict) -> None:
+        market_id, token_id = self._ids(message)
+        if market_id is None or token_id is None:
+            return
+        book = self._books.get((market_id, token_id))
+        if book is None:
+            return
+        try:
+            book.tick_size = Decimal(str(message["new_tick_size"]))
+        except (KeyError, ValueError, TypeError):
+            logger.warning(
+                "malformed tick_size_change ignored",
+                extra={
+                    "component": "market_data_client",
+                    "event_type": "malformed_ws_event",
+                    "reason": "invalid new_tick_size",
+                },
+            )
+
+    async def _handle_market_resolved(self, message: dict) -> None:
+        market_id, token_id = self._ids(message)
+        if market_id is None or token_id is None:
+            return
+        book = self._books.get((market_id, token_id))
+        if book is None:
+            return
+        book.resolved = True
+
+    async def _handle_last_trade_price(self, message: dict) -> None:
+        market_id, token_id = self._ids(message)
+        if market_id is None or token_id is None:
+            return
+        book = self._books.get((market_id, token_id))
+        if book is None:
+            return
+        try:
+            book.last_trade_price = Decimal(str(message["price"]))
+        except (KeyError, ValueError, TypeError):
+            logger.warning(
+                "malformed last_trade_price ignored",
+                extra={
+                    "component": "market_data_client",
+                    "event_type": "malformed_ws_event",
+                    "reason": "invalid price",
+                },
+            )
+            return
+        await self._publish(book)
+
+    async def _publish(self, book: LiveBookState) -> None:
+        if book.resolved:
+            return
+        snapshot = book.snapshot()
+        if snapshot is None:
+            return
         await self._state_store.update_market_snapshot(snapshot)
         await self._state_store.update_heartbeat("market_data", snapshot.received_ts)
-
-        if self._on_orderbook is not None:
-            await self._on_orderbook(update)
         if self._on_snapshot is not None:
             await self._on_snapshot(snapshot)
-
         logger.debug(
             "market data ingested",
             extra={
@@ -83,52 +203,9 @@ class MarketDataClient:
             },
         )
 
-    def _to_snapshot(self, update: OrderBookUpdate) -> MarketSnapshot:
-        best_bid = update.bids[0]
-        best_ask = update.asks[0]
-        mid_price = (best_bid.price + best_ask.price) / Decimal("2")
-        return MarketSnapshot(
-            market_id=update.market_id,
-            token_id=update.token_id,
-            best_bid=best_bid.price,
-            best_ask=best_ask.price,
-            mid_price=mid_price,
-            top_bid_size=best_bid.size,
-            top_ask_size=best_ask.size,
-            source_ts=update.source_ts,
-            received_ts=update.received_ts,
-        )
-
-    def _parse_levels(self, levels: Any) -> list[OrderBookLevel]:
-        out: list[OrderBookLevel] = []
-        if not isinstance(levels, list):
-            return out
-        for level in levels:
-            price: Any
-            size: Any
-            if isinstance(level, dict):
-                price = level.get("price")
-                size = level.get("size")
-            elif isinstance(level, (list, tuple)) and len(level) >= 2:
-                price, size = level[0], level[1]
-            else:
-                continue
-            try:
-                out.append(OrderBookLevel(price=Decimal(str(price)), size=Decimal(str(size))))
-            except Exception:
-                continue
-        return out
-
-    def _get_first(self, payload: dict[str, Any], keys: tuple[str, ...]) -> Any:
-        for key in keys:
-            if key in payload:
-                return payload[key]
-        return None
-
-    def _maybe_int(self, value: Any) -> int | None:
-        if value is None:
-            return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
+    def _ids(self, message: dict) -> tuple[str | None, str | None]:
+        market_id = message.get("market") or message.get("market_id")
+        token_id = message.get("asset_id") or message.get("token_id")
+        if market_id is None or token_id is None:
+            return None, None
+        return str(market_id), str(token_id)

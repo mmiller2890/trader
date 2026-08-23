@@ -37,10 +37,11 @@ def main() -> int:
 
     heartbeats = payload.get("heartbeats", {})
     market_data_heartbeat = heartbeats.get("market_data")
-    if isinstance(market_data_heartbeat, str):
-        heartbeat_at = datetime.fromisoformat(market_data_heartbeat.replace("Z", "+00:00"))
-        if (utc_now() - heartbeat_at).total_seconds() > max_age_seconds:
-            return 1
+    if not isinstance(market_data_heartbeat, str):
+        return 1
+    heartbeat_at = datetime.fromisoformat(market_data_heartbeat.replace("Z", "+00:00"))
+    if (utc_now() - heartbeat_at).total_seconds() > max_age_seconds:
+        return 1
 
     return 0
 

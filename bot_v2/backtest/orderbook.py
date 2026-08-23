@@ -111,7 +111,8 @@ class OrderBookState:
 
         eligible_levels = list(eligible)
         executable_liquidity = sum(
-            (size for _price, size in levels), start=Decimal("0")
+            (size for _price, size in eligible_levels),
+            start=Decimal("0"),
         )
 
         fills: list[SimulatedFill] = []
@@ -165,21 +166,23 @@ class OrderBookState:
             or report.order.token_id != self.token_id
         ):
             raise ValueError("execution report targets a different book")
-        if report.order.side == OrderSide.BUY:
-            levels = self.asks
-        else:
-            levels = self.bids
+        live_levels = self.asks if report.order.side == OrderSide.BUY else self.bids
+        candidate_levels = dict(live_levels)
         for fill in report.fills:
-            current = levels.get(fill.price)
+            current = candidate_levels.get(fill.price)
             if current is None or current < fill.size:
                 raise ValueError(
                     f"report consumes unavailable depth at {fill.price}"
                 )
             remaining = current - fill.size
             if remaining > 0:
-                levels[fill.price] = remaining
+                candidate_levels[fill.price] = remaining
             else:
-                levels.pop(fill.price, None)
+                candidate_levels.pop(fill.price)
+        if report.order.side == OrderSide.BUY:
+            self.asks = candidate_levels
+        else:
+            self.bids = candidate_levels
 
     def _validate_event_ids(self, market_id: str, token_id: str) -> None:
         if market_id != self.market_id or token_id != self.token_id:

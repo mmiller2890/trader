@@ -86,6 +86,10 @@ class BacktestEngine:
 
     async def run(self, *, strategy: StrategyBase, snapshots: list[MarketSnapshot]) -> ReplayResult:
         """Run legacy top-of-book snapshots through the paper exchange."""
+        ordered_snapshots = sorted(
+            list(snapshots),
+            key=lambda item: (item.received_ts, item.source_ts),
+        )
         events = [
             BookSnapshotEvent(
                 market_id=item.market_id,
@@ -96,7 +100,7 @@ class BacktestEngine:
                 source_ts=item.source_ts,
                 received_ts=item.received_ts,
             )
-            for index, item in enumerate(sorted(snapshots, key=lambda value: value.received_ts))
+            for index, item in enumerate(ordered_snapshots)
         ]
         return await self.run_events(strategy=strategy, events=events)
 
@@ -174,7 +178,7 @@ class BacktestEngine:
         order = order.model_copy(update={"created_at": self._clock.now()})
         candidate = book.quote(
             order,
-            max_slippage_bps=Decimal(self._config.execution.max_slippage_bps),
+            max_slippage_bps=Decimal(str(self._config.execution.max_slippage_bps)),
             fee_bps=self._config.backtest.taker_fee_bps,
         )
 
@@ -190,11 +194,12 @@ class BacktestEngine:
             result.order_results.append(self._to_order_result(rejected))
             return
 
+        assert candidate.average_fill_price is not None
         decision = await self._risk.evaluate(
             signal=signal,
             snapshot=snapshot,
             proposed_size=candidate.filled_size,
-            proposed_price=order.price,
+            proposed_price=candidate.average_fill_price,
             executable_liquidity=candidate.executable_liquidity,
         )
         if not decision.approved:

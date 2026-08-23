@@ -23,7 +23,7 @@ def utc_now() -> datetime:
 
 
 class WebSocketManager:
-    """Reconnect-capable websocket client with async callbacks."""
+    """Reconnect-capable websocket client with subscription and application ping."""
 
     def __init__(
         self,
@@ -31,20 +31,29 @@ class WebSocketManager:
         url: str,
         on_message: MessageHandler,
         on_connect: Callable[[WebSocketClientProtocol], Awaitable[None]] | None = None,
+        asset_ids: list[str] | None = None,
+        ping_interval_seconds: float = 10,
         reconnect_initial_seconds: float = 1.0,
         reconnect_max_seconds: float = 30.0,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
+        if asset_ids is not None and not asset_ids:
+            raise ValueError("asset_ids must not be empty when provided")
         self._url = url
         self._on_message = on_message
         self._on_connect = on_connect
+        self._asset_ids = asset_ids
+        self._ping_interval = ping_interval_seconds
         self._reconnect_initial = reconnect_initial_seconds
         self._reconnect_max = reconnect_max_seconds
+        self._sleep = sleep
 
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._ws: WebSocketClientProtocol | None = None
         self._last_heartbeat: datetime | None = None
         self._connection_attempts = 0
+        self._connect_factory = websockets.connect
 
     @property
     def last_heartbeat(self) -> datetime | None:
@@ -101,19 +110,35 @@ class WebSocketManager:
             },
         )
 
-        async with websockets.connect(self._url, ping_interval=20, ping_timeout=20) as websocket:
+        async with self._connect_factory(self._url, ping_interval=20, ping_timeout=20) as websocket:
             self._ws = websocket
             self._last_heartbeat = utc_now()
             if self._on_connect is not None:
                 await self._on_connect(websocket)
+            if self._asset_ids:
+                await websocket.send(
+                    json.dumps({"assets_ids": self._asset_ids, "type": "market"})
+                )
 
-            async for frame in websocket:
-                if self._stop_event.is_set():
-                    break
-                self._last_heartbeat = utc_now()
-                message = self._decode_frame(frame)
-                await self._on_message(message)
+            ping_task = asyncio.create_task(
+                self._ping_loop(websocket), name="ws-application-ping"
+            )
+            try:
+                async for frame in websocket:
+                    if self._stop_event.is_set():
+                        break
+                    self._last_heartbeat = utc_now()
+                    message = self._decode_frame(frame)
+                    await self._on_message(message)
+            finally:
+                ping_task.cancel()
+                await asyncio.gather(ping_task, return_exceptions=True)
             self._ws = None
+
+    async def _ping_loop(self, websocket: WebSocketClientProtocol) -> None:
+        while True:
+            await self._sleep(self._ping_interval)
+            await websocket.send("PING")
 
     def _decode_frame(self, frame: str | bytes) -> dict | str:
         if isinstance(frame, bytes):

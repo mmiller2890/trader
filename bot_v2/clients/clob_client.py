@@ -1,44 +1,62 @@
-"""Thin adapter around py-clob-client."""
+"""Typed adapter around the Polymarket CLOB V2 SDK."""
 
 from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from clients.auth import ClobCredentials
-from models.market import OrderBookLevel, OrderBookUpdate
-from models.order import OrderRequest, OrderResult, OrderStatus
-from models.position import Position
+from config.schema import AppConfig
+from models.order import (
+    OrderRequest,
+    OrderResult,
+    OrderSide,
+    OrderStatus,
+    OrderTimeInForce,
+)
 
 logger = logging.getLogger(__name__)
 
-try:
-    from py_clob_client.client import ClobClient as _SdkClobClient
-except Exception:  # pragma: no cover - depends on runtime dependency presence
-    _SdkClobClient = None
-
 
 class ClobAdapterError(RuntimeError):
-    """Raised when SDK adapter cannot satisfy requested operation."""
+    """Raised when the V2 adapter cannot satisfy a requested operation."""
+
+
+class ClobUncertainOutcomeError(ClobAdapterError):
+    """Raised when a submission outcome is unknown (timeout or transport failure)."""
+
+
+class CollateralStatus(BaseModel):
+    """Normalized pUSD collateral balance and allowance."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    balance: Decimal = Field(ge=Decimal("0"))
+    allowance: Decimal = Field(ge=Decimal("0"))
 
 
 class ClobClientAdapter:
     """
-    Polymarket CLOB boundary.
+    Polymarket CLOB V2 boundary.
 
-    All SDK uncertainty is intentionally centralized in this class.
+    All SDK interaction is centralized here. Production code calls explicit
+    V2 methods; tests inject a fake SDK client through ``sdk_factory``.
     """
 
     def __init__(
         self,
         client: Any,
         *,
+        config: AppConfig,
         allow_trading: bool,
         read_only: bool = True,
     ) -> None:
         self._client = client
+        self._config = config
         self._allow_trading = allow_trading
         self._read_only = read_only
 
@@ -46,149 +64,180 @@ class ClobClientAdapter:
     def disabled(cls) -> "ClobClientAdapter":
         """Create a safe no-op adapter used outside explicit live mode."""
 
-        return cls(_DisabledClobClient(), allow_trading=False, read_only=True)
+        return cls(
+            _DisabledClobClient(),
+            config=AppConfig(),
+            allow_trading=False,
+            read_only=True,
+        )
 
     @classmethod
-    def from_sdk(
+    def from_v2(
         cls,
         *,
-        host: str,
+        config: AppConfig,
         credentials: ClobCredentials,
-        chain_id: int = 137,
-        allow_trading: bool = False,
+        sdk_factory: Callable[..., Any] | None = None,
     ) -> "ClobClientAdapter":
-        """
-        Build adapter with an SDK client instance.
+        """Build a live adapter from explicit V2 constructor arguments."""
 
-        Adapter boundary note:
-        py-clob-client constructor signatures have changed between versions,
-        so initialization attempts are bounded here instead of leaked elsewhere.
-        """
+        if sdk_factory is None:
+            from py_clob_client_v2 import ClobClient as sdk_factory
 
-        if _SdkClobClient is None:
-            raise ClobAdapterError("py-clob-client is not installed or unavailable")
+        if not credentials.private_key:
+            raise ClobAdapterError("live mode requires a private key")
+        if not credentials.has_l2:
+            raise ClobAdapterError("live mode requires complete L2 API credentials")
+        if not credentials.proxy_address:
+            raise ClobAdapterError("live mode requires a funder address")
 
-        init_attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = [
-            ((host, credentials.private_key, chain_id), {}),
-            ((), {"host": host, "key": credentials.private_key, "chain_id": chain_id}),
-            ((), {"host": host, "private_key": credentials.private_key, "chain_id": chain_id}),
-        ]
-        last_error: Exception | None = None
-        for args, kwargs in init_attempts:
-            try:
-                client = _SdkClobClient(*args, **kwargs)
-                return cls(client, allow_trading=allow_trading, read_only=not allow_trading)
-            except Exception as exc:  # pragma: no cover - runtime sdk behavior
-                last_error = exc
-                continue
-        raise ClobAdapterError(f"failed to initialize SDK client: {last_error}")
+        from py_clob_client_v2 import ApiCreds
 
-    def get_order_book(self, market_id: str, token_id: str) -> OrderBookUpdate:
-        """Fetch and normalize orderbook for a token."""
-
-        raw = self._call_first_available(
-            ("get_order_book", "get_book", "order_book"),
-            market_id=market_id,
-            token_id=token_id,
+        client = sdk_factory(
+            host=config.exchange.clob_host,
+            chain_id=config.exchange.chain_id,
+            key=credentials.private_key,
+            creds=ApiCreds(
+                api_key=credentials.api_key or "",
+                api_secret=credentials.secret or "",
+                api_passphrase=credentials.passphrase or "",
+            ),
+            signature_type=config.exchange.signature_type,
+            funder=credentials.proxy_address,
         )
-        return self._normalize_order_book(raw=raw, market_id=market_id, token_id=token_id)
+        return cls(
+            client,
+            config=config,
+            allow_trading=True,
+            read_only=False,
+        )
+
+    def healthcheck(self) -> bool:
+        """Return True only when the CLOB health endpoint answers OK."""
+
+        try:
+            raw = self._client.get_ok()
+        except Exception as exc:
+            raise ClobAdapterError(f"clob healthcheck failed: {exc}") from exc
+        if raw != "OK":
+            raise ClobAdapterError(f"clob healthcheck returned unexpected response: {raw!r}")
+        return True
 
     def get_open_orders(self, market_id: str | None = None) -> list[OrderResult]:
-        """Fetch open orders as internal typed results."""
+        """Fetch open orders through the explicit V2 method."""
 
-        raw = self._call_first_available(
-            ("get_open_orders", "list_open_orders", "get_orders"),
-            market_id=market_id,
-        )
+        from py_clob_client_v2 import OpenOrderParams
+
+        params = OpenOrderParams(market=market_id) if market_id else None
+        try:
+            raw = self._client.get_open_orders(params=params)
+        except Exception as exc:
+            raise ClobAdapterError(f"open orders read failed: {exc}") from exc
         if not isinstance(raw, list):
-            return []
+            raise ClobAdapterError(f"open orders response is not a list: {type(raw).__name__}")
 
         results: list[OrderResult] = []
         for row in raw:
             if not isinstance(row, dict):
-                continue
-            client_order_id = str(row.get("client_order_id") or row.get("id") or "")
-            if not client_order_id:
-                continue
-            size = Decimal(str(row.get("size", "0") or "0"))
-            if size <= 0:
-                continue
+                raise ClobAdapterError(f"open orders row is not an object: {type(row).__name__}")
+            order_id = str(row.get("id") or "")
+            if not order_id:
+                raise ClobAdapterError("open orders row missing order id")
+            try:
+                requested = Decimal(str(row.get("original_size") or "0"))
+                filled = Decimal(str(row.get("size_matched") or "0"))
+            except Exception as exc:
+                raise ClobAdapterError(f"open orders row has invalid sizes: {exc}") from exc
             results.append(
                 OrderResult(
-                    client_order_id=client_order_id,
-                    exchange_order_id=str(row.get("order_id")) if row.get("order_id") else None,
-                    market_id=str(row.get("market_id")) if row.get("market_id") else None,
-                    token_id=str(row.get("token_id")) if row.get("token_id") else None,
+                    client_order_id=order_id,
+                    exchange_order_id=order_id,
+                    market_id=str(row.get("market")) if row.get("market") else None,
+                    token_id=str(row.get("asset_id")) if row.get("asset_id") else None,
                     status=OrderStatus.SUBMITTED,
                     accepted=True,
                     message="open_order_snapshot",
-                    requested_size=size,
-                    filled_size=Decimal(str(row.get("filled_size", "0") or "0")),
+                    requested_size=requested,
+                    filled_size=filled,
                 )
             )
         return results
 
-    def get_positions(self) -> list[Position]:
-        """
-        Fetch positions from exchange if available.
+    def get_collateral_status(self) -> CollateralStatus:
+        """Read pUSD balance and allowance through the explicit V2 method."""
 
-        If SDK support is unavailable, return empty list from this safe boundary.
-        """
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
 
         try:
-            raw = self._call_first_available(("get_positions", "list_positions", "positions"))
-        except ClobAdapterError:
-            logger.info(
-                "positions API unavailable",
-                extra={"component": "clob_client", "event_type": "positions_unavailable"},
+            raw = self._client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             )
-            return []
-
-        if not isinstance(raw, list):
-            return []
-        positions: list[Position] = []
-        for row in raw:
-            if not isinstance(row, dict):
-                continue
-            market_id = str(row.get("market_id") or "")
-            token_id = str(row.get("token_id") or "")
-            if not market_id or not token_id:
-                continue
-            positions.append(
-                Position(
-                    market_id=market_id,
-                    token_id=token_id,
-                    quantity=Decimal(str(row.get("size", "0") or "0")),
-                    average_entry_price=Decimal(str(row.get("avg_entry", "0") or "0")),
-                    mark_price=Decimal(str(row["mark_price"])) if row.get("mark_price") else None,
-                    unrealized_pnl=Decimal(str(row.get("unrealized_pnl", "0") or "0")),
-                    realized_pnl=Decimal(str(row.get("realized_pnl", "0") or "0")),
-                )
-            )
-        return positions
+        except Exception as exc:
+            raise ClobAdapterError(f"collateral read failed: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise ClobAdapterError(f"collateral response is not an object: {type(raw).__name__}")
+        try:
+            balance = Decimal(str(raw.get("balance") or "0"))
+            allowance = Decimal(str(raw.get("allowance") or "0"))
+        except Exception as exc:
+            raise ClobAdapterError(f"collateral response has invalid numbers: {exc}") from exc
+        return CollateralStatus(balance=balance, allowance=allowance)
 
     def submit_order(self, order: OrderRequest) -> OrderResult:
-        """Submit order through SDK when live trading is explicitly enabled."""
+        """Sign and submit one order through explicit V2 methods."""
 
         if self._read_only or not self._allow_trading:
             raise ClobAdapterError("real order submission disabled in current mode")
 
+        notional = order.price * order.size
+        if notional > self._config.execution.max_live_order_notional:
+            raise ClobAdapterError(
+                f"order notional {notional} exceeds live notional cap "
+                f"{self._config.execution.max_live_order_notional}"
+            )
+
+        from py_clob_client_v2 import OrderArgs, OrderType, Side
+
+        side = Side.BUY if order.side == OrderSide.BUY else Side.SELL
+        order_type = {
+            OrderTimeInForce.GTC: OrderType.GTC,
+            OrderTimeInForce.IOC: OrderType.FAK,
+            OrderTimeInForce.FOK: OrderType.FOK,
+        }[order.time_in_force]
+        args = OrderArgs(
+            token_id=order.token_id,
+            price=float(str(order.price)),
+            size=float(str(order.size)),
+            side=side,
+        )
+
         started = datetime.now(tz=UTC)
-        payload = {
-            "market_id": order.market_id,
-            "token_id": order.token_id,
-            "side": order.side.value,
-            "price": str(order.price),
-            "size": str(order.size),
-            "time_in_force": order.time_in_force.value,
-            "client_order_id": order.client_order_id,
-        }
-        raw = self._call_first_available(("submit_order", "create_order", "place_order"), **payload)
+        try:
+            signed = self._client.create_order(args)
+            raw = self._client.post_order(signed, order_type=order_type)
+        except ClobAdapterError:
+            raise
+        except Exception as exc:
+            raise ClobUncertainOutcomeError(f"order submission outcome unknown: {exc}") from exc
         latency_ms = int((datetime.now(tz=UTC) - started).total_seconds() * 1000)
 
-        exchange_order_id = None
-        if isinstance(raw, dict) and raw.get("order_id"):
-            exchange_order_id = str(raw["order_id"])
+        if not isinstance(raw, dict):
+            raise ClobAdapterError(f"submission response is not an object: {type(raw).__name__}")
+        exchange_order_id = str(raw.get("orderID") or raw.get("order_id") or "")
+        if not exchange_order_id:
+            return OrderResult(
+                client_order_id=order.client_order_id,
+                market_id=order.market_id,
+                token_id=order.token_id,
+                side=order.side,
+                status=OrderStatus.REJECTED,
+                accepted=False,
+                message="submission_response_missing_order_id",
+                signal_id=order.signal_id,
+                strategy_name=order.strategy_name,
+                requested_size=order.size,
+                latency_ms=latency_ms,
+            )
         return OrderResult(
             client_order_id=order.client_order_id,
             exchange_order_id=exchange_order_id,
@@ -205,76 +254,36 @@ class ClobClientAdapter:
         )
 
     def cancel_order(self, order_id: str) -> bool:
-        """Cancel an order if trading is enabled."""
+        """Cancel one order through the explicit V2 method."""
 
         if self._read_only or not self._allow_trading:
             raise ClobAdapterError("real order cancellation disabled in current mode")
-        raw = self._call_first_available(("cancel_order", "cancel"), order_id=order_id)
+        from py_clob_client_v2 import OrderPayload
+
+        try:
+            raw = self._client.cancel_order(OrderPayload(orderID=order_id))
+        except Exception as exc:
+            raise ClobAdapterError(f"order cancellation failed: {exc}") from exc
         if isinstance(raw, dict):
             return bool(raw.get("success", True))
-        if isinstance(raw, bool):
-            return raw
         return True
 
-    def _call_first_available(self, names: tuple[str, ...], *args: Any, **kwargs: Any) -> Any:
-        for name in names:
-            target = getattr(self._client, name, None)
-            if target is None:
-                continue
-            try:
-                return target(*args, **kwargs)
-            except TypeError:
-                if kwargs:
-                    return target(*args)
-                raise
-        raise ClobAdapterError(f"SDK method not found for adapter operation: {names}")
+    def cancel_all(self) -> bool:
+        """Cancel every open order through the explicit V2 method."""
 
-    def _normalize_order_book(self, *, raw: Any, market_id: str, token_id: str) -> OrderBookUpdate:
-        if not isinstance(raw, dict):
-            raise ClobAdapterError("unexpected orderbook payload shape")
-        bids_raw = raw.get("bids") or raw.get("buy") or []
-        asks_raw = raw.get("asks") or raw.get("sell") or []
-        sequence_id = raw.get("sequence") or raw.get("seq")
-        return OrderBookUpdate(
-            market_id=market_id,
-            token_id=token_id,
-            bids=self._normalize_levels(bids_raw),
-            asks=self._normalize_levels(asks_raw),
-            sequence_id=int(sequence_id) if sequence_id is not None else None,
-        )
-
-    def _normalize_levels(self, levels: Any) -> list[OrderBookLevel]:
-        normalized: list[OrderBookLevel] = []
-        if not isinstance(levels, list):
-            return normalized
-        for row in levels:
-            if isinstance(row, dict):
-                price = row.get("price")
-                size = row.get("size")
-            elif isinstance(row, (list, tuple)) and len(row) >= 2:
-                price, size = row[0], row[1]
-            else:
-                continue
-            try:
-                normalized.append(
-                    OrderBookLevel(price=Decimal(str(price)), size=Decimal(str(size)))
-                )
-            except Exception:
-                continue
-        return normalized
+        if self._read_only or not self._allow_trading:
+            raise ClobAdapterError("real order cancellation disabled in current mode")
+        try:
+            raw = self._client.cancel_all()
+        except Exception as exc:
+            raise ClobAdapterError(f"cancel-all failed: {exc}") from exc
+        if isinstance(raw, dict):
+            return bool(raw.get("success", True))
+        return True
 
 
 class _DisabledClobClient:
-    """No-op client used when SDK initialization is intentionally skipped."""
+    """No-op client used when live SDK construction is intentionally skipped."""
 
-    def get_open_orders(self, market_id: str | None = None) -> list[dict[str, Any]]:
-        _ = market_id
+    def get_open_orders(self, params: Any = None) -> list[dict[str, Any]]:
         return []
-
-    def get_positions(self) -> list[dict[str, Any]]:
-        return []
-
-    def get_order_book(self, market_id: str, token_id: str) -> dict[str, Any]:
-        raise ClobAdapterError(
-            f"order book unavailable via disabled client for market_id={market_id} token_id={token_id}"
-        )

@@ -256,7 +256,7 @@ async def test_backtest_consumes_depth_and_records_partial_fill_and_fees() -> No
         bot={"mode": Mode.BACKTEST},
         execution={"default_order_size": "5", "max_slippage_bps": 300, "time_in_force": "IOC"},
         backtest={"starting_cash": "100", "taker_fee_bps": "10"},
-        risk={"min_top_of_book_liquidity": "1"},
+        risk={"min_top_of_book_liquidity": "1", "max_slippage_bps": 100},
     )
     engine = BacktestEngine(config=config)
     result = await engine.run_events(
@@ -276,6 +276,52 @@ async def test_backtest_consumes_depth_and_records_partial_fill_and_fees() -> No
     assert report.total_fees == Decimal("0.00151")
     assert result.positions[0].quantity == Decimal("3")
     assert result.metrics.fill_rate == Decimal("0.6")
+
+
+@pytest.mark.asyncio
+async def test_backtest_risk_rejects_depth_vwap_outside_risk_limit() -> None:
+    config = AppConfig(
+        bot={"mode": Mode.BACKTEST},
+        execution={
+            "default_order_size": "5",
+            "max_slippage_bps": 1000,
+            "time_in_force": "IOC",
+        },
+        risk={"min_top_of_book_liquidity": "1", "max_slippage_bps": 25},
+        backtest={"starting_cash": "100", "taker_fee_bps": "0"},
+    )
+    engine = BacktestEngine(config=config)
+    result = await engine.run_events(
+        strategy=BuyOnceStrategy(),
+        events=[snapshot_event(
+            sequence=1,
+            bids=[("0.49", "100")],
+            asks=[("0.50", "1"), ("0.54", "4")],
+        )],
+    )
+    report = result.execution_reports[0]
+    assert report.status == ExecutionStatus.REJECTED
+    assert report.average_fill_price is None
+    assert report.reason.startswith("slippage_limit")
+    assert engine._books[("m1", "t1")].asks[Decimal("0.50")] == Decimal("1")
+
+
+@pytest.mark.asyncio
+async def test_legacy_snapshots_assign_sequence_after_source_ordering() -> None:
+    received = datetime(2025, 1, 1, tzinfo=UTC)
+    later = snapshot(price="0.60", at=received).model_copy(
+        update={"source_ts": received + timedelta(seconds=2)}
+    )
+    earlier = snapshot(price="0.50", at=received).model_copy(
+        update={"source_ts": received + timedelta(seconds=1)}
+    )
+    engine = BacktestEngine(config=AppConfig(bot={"mode": Mode.BACKTEST}))
+    result = await engine.run(
+        strategy=FixedIdBuyOnceStrategy(),
+        snapshots=[later, earlier],
+    )
+    assert len(result.portfolio_snapshots) == 2
+    assert result.order_results[0].avg_fill_price == Decimal("0.51")
 
 
 @pytest.mark.asyncio

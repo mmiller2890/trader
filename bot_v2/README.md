@@ -680,6 +680,18 @@ allow_live_trading: false
 python3 -m app.main
 ```
 
+`python3 -m app.main` uses `dry_run` until the final operator gate. Live mode additionally requires every preflight check to pass; see [`docs/live-runbook.md`](docs/live-runbook.md) for the staged shadow-to-live rollout gates.
+
+## Live Preflight
+
+Before any live startup, run the read-only preflight command. It performs authenticated account reads, geographic compliance, balance/allowance checks, and reconciliation, and never submits, signs, or cancels orders:
+
+```bash
+python3 -m scripts.live_preflight --config-dir config
+```
+
+Exit `0` means every check passed; exit `2` means live startup would be blocked.
+
 ## Run A Backtest
 
 The backtest is fully offline: it never starts the WebSocket, instantiates a CLOB client, or calls the exchange. It replays normalized historical book events through the configured spike strategy, existing pre-trade risk checks, and a deterministic paper exchange that reconstructs full books, consumes depth, produces partial fills, charges fees, and tracks cash, collateral, positions, and equity.

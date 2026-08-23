@@ -27,6 +27,16 @@ execution:
   time_in_force: GTC
   client_order_id_prefix: pm-bot
   large_order_notional: 100
+  max_live_order_notional: 1
+
+exchange:
+  clob_host: https://clob.polymarket.com
+  data_api_host: https://data-api.polymarket.com
+  chain_id: 137
+  signature_type: 3
+  geoblock_url: https://polymarket.com/api/geoblock
+  ws_ping_interval_seconds: 10
+  compliance_timeout_seconds: 5
 
 backtest:
   starting_cash: 1000

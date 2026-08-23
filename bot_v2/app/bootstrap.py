@@ -11,6 +11,8 @@ from pathlib import Path
 from app.modes import is_live_mode
 from clients.auth import build_clob_credentials
 from clients.clob_client import ClobClientAdapter
+from clients.data_api import DataApiClient
+from clients.geoblock import GeoblockClient
 from clients.market_data_client import MarketDataClient
 from clients.ws_client import WebSocketManager
 from config.loader import load_config
@@ -28,6 +30,7 @@ from persistence.snapshots import SnapshotStore
 from risk.circuit_breaker import CircuitBreaker
 from risk.pretrade import PreTradeRiskEngine
 from risk.runtime import RuntimeRiskEngine
+from scripts.live_preflight import run_preflight
 from state.reconciliation import ReconciliationService
 from state.store import InMemoryStateStore
 from strategies.spike import SpikeStrategy
@@ -110,7 +113,7 @@ class AppServices:
     reconciliation: ReconciliationService
 
 
-def bootstrap_app(config_dir: str | Path | None = None) -> AppServices:
+async def bootstrap_app(config_dir: str | Path | None = None) -> AppServices:
     """Load config, configure logging, and wire all runtime services."""
 
     config = load_config(config_dir)
@@ -133,12 +136,33 @@ def bootstrap_app(config_dir: str | Path | None = None) -> AppServices:
 
     credentials = build_clob_credentials(config)
     if is_live_mode(config.bot.mode):
-        raise RuntimeError(
-            "live mode bootstrap is intentionally guarded in v1; "
-            "wire an explicit CLOB host and validate the adapter boundary before enabling live startup"
+        clob_client = ClobClientAdapter.from_v2(config=config, credentials=credentials)
+        positions_client = DataApiClient(config)
+        geoblock = GeoblockClient(config)
+        state_for_reconciliation = InMemoryStateStore(mode=config.bot.mode)
+        reconciliation_probe = ReconciliationService(
+            state_store=state_for_reconciliation,
+            mode=config.bot.mode,
+            open_orders_reader=clob_client,
         )
-    _ = credentials
-    clob_client = ClobClientAdapter.disabled()
+
+        async def reconcile_probe() -> bool:
+            report = await reconciliation_probe.reconcile_startup()
+            return report.ok
+
+        preflight = await run_preflight(
+            config=config,
+            credentials=credentials,
+            adapter=clob_client,
+            positions_client=positions_client,
+            geoblock=geoblock,
+            reconcile=reconcile_probe,
+        )
+        if not preflight.ok:
+            failed = [check.name for check in preflight.checks if not check.passed]
+            raise RuntimeError(f"live startup blocked by preflight: {failed}")
+    else:
+        clob_client = ClobClientAdapter.disabled()
 
     event_bus = EventBus()
     telegram = TelegramNotifier(config)
@@ -191,6 +215,8 @@ def bootstrap_app(config_dir: str | Path | None = None) -> AppServices:
     ws_manager = WebSocketManager(
         url=config.market_data.ws_url,
         on_message=market_data_client.handle_ws_message,
+        asset_ids=config.market_data.subscribed_token_ids or None,
+        ping_interval_seconds=config.exchange.ws_ping_interval_seconds,
         reconnect_initial_seconds=config.market_data.reconnect_initial_seconds,
         reconnect_max_seconds=config.market_data.reconnect_max_seconds,
     )

@@ -65,8 +65,37 @@ def test_buy_quote_walks_asks_and_calculates_vwap_and_fees() -> None:
     assert report.total_notional == Decimal("2.53")
     assert report.average_fill_price == Decimal("0.506")
     assert report.total_fees == Decimal("0.00253")
-    assert report.executable_liquidity == Decimal("15")
+    assert report.executable_liquidity == Decimal("5")
     assert report.status == ExecutionStatus.FILLED
+
+
+def test_executable_liquidity_excludes_levels_beyond_price_limit() -> None:
+    book = book_with_asks([("0.50", "2"), ("0.51", "3"), ("0.55", "10")])
+    report = book.quote(
+        buy_order(price="0.50", size="1", tif="IOC"),
+        max_slippage_bps=Decimal("300"),
+        fee_bps=Decimal("0"),
+    )
+    assert report.executable_liquidity == Decimal("5")
+
+
+def test_commit_validation_failure_leaves_every_level_unchanged() -> None:
+    book = book_with_asks([("0.50", "2"), ("0.51", "2")])
+    report = book.quote(
+        buy_order(price="0.50", size="4", tif="IOC"),
+        max_slippage_bps=Decimal("300"),
+        fee_bps=Decimal("0"),
+    )
+    invalid = report.model_copy(update={
+        "fills": [
+            report.fills[0].model_copy(update={"size": Decimal("1")}),
+            report.fills[1].model_copy(update={"size": Decimal("3")}),
+        ]
+    })
+    before = book.asks.copy()
+    with pytest.raises(ValueError, match="unavailable depth"):
+        book.commit(invalid)
+    assert book.asks == before
 
 
 def test_partial_quote_does_not_mutate_until_commit() -> None:

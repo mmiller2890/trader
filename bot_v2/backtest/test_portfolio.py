@@ -16,6 +16,31 @@ from config.schema import BacktestConfig
 from models.order import OrderSide
 
 
+def test_second_market_short_uses_combined_portfolio_reserve() -> None:
+    ledger = PortfolioLedger(BacktestConfig(
+        starting_cash="4",
+        taker_fee_bps="0",
+        allow_short_positions=True,
+    ))
+    first = filled_sell(size="5", price="0.50")
+    assert ledger.can_apply(first) == (True, "funded")
+    ledger.apply(first, NOW)
+
+    second = filled_sell(size="5", price="0.50")
+    second = second.model_copy(update={
+        "order": second.order.model_copy(update={
+            "market_id": "m2",
+            "token_id": "t2",
+        })
+    })
+    assert ledger.can_apply(second) == (
+        False,
+        "insufficient_short_collateral",
+    )
+    assert ledger.cash == Decimal("6.50")
+    assert set(ledger.positions) == {("m1", "t1")}
+
+
 def test_buy_reduces_cash_by_notional_and_fee() -> None:
     ledger = PortfolioLedger(BacktestConfig(starting_cash="100", taker_fee_bps="10"))
     report = filled_buy(size="5", price="0.50", fee_bps="10")

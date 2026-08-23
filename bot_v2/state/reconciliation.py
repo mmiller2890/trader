@@ -8,6 +8,7 @@ from typing import Protocol
 
 from config.schema import Mode
 from models.order import OrderResult
+from models.position import Position
 from pydantic import BaseModel, ConfigDict, Field
 from state.store import InMemoryStateStore
 
@@ -25,6 +26,13 @@ class OpenOrdersReader(Protocol):
 
     def get_open_orders(self, market_id: str | None = None) -> list[OrderResult]:
         """Return currently open orders from exchange."""
+
+
+class PositionsReader(Protocol):
+    """Read-only subset of the Data API client used by reconciliation."""
+
+    def get_positions(self, user_address: str) -> list[Position]:
+        """Return current positions for a user address."""
 
 
 class ReconciliationReport(BaseModel):
@@ -51,10 +59,14 @@ class ReconciliationService:
         state_store: InMemoryStateStore,
         mode: Mode,
         open_orders_reader: OpenOrdersReader | None = None,
+        positions_reader: PositionsReader | None = None,
+        funder_address: str | None = None,
     ) -> None:
         self._state_store = state_store
         self._mode = mode
         self._open_orders_reader = open_orders_reader
+        self._positions_reader = positions_reader
+        self._funder_address = funder_address
 
     async def reconcile_startup(self) -> ReconciliationReport:
         """Run conservative startup reconciliation."""
@@ -78,6 +90,18 @@ class ReconciliationService:
 
         for remote_order in remote:
             await self._state_store.set_order_status(remote_order)
+
+        if self._positions_reader is not None:
+            try:
+                remote_positions = self._positions_reader.get_positions(
+                    self._funder_address or ""
+                )
+            except Exception as exc:
+                errors.append(f"remote_positions_fetch_failed:{exc}")
+                remote_positions = []
+            local_positions = await self._state_store.get_positions()
+            if not self._positions_match(local_positions, remote_positions):
+                errors.append("position_mismatch")
 
         ok = not errors and not missing_on_remote
         if self._mode == Mode.LIVE and not ok:
@@ -110,3 +134,18 @@ class ReconciliationService:
             missing_locally=missing_locally,
             errors=errors,
         )
+
+    def _positions_match(
+        self,
+        local: list[Position],
+        remote: list[Position],
+    ) -> bool:
+        local_map = {
+            (position.market_id, position.token_id): position.quantity
+            for position in local
+        }
+        remote_map = {
+            (position.market_id, position.token_id): position.quantity
+            for position in remote
+        }
+        return local_map == remote_map

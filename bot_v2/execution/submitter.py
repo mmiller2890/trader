@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 
 from clients.auth import is_live_trading_enabled
-from clients.clob_client import ClobAdapterError, ClobClientAdapter
+from clients.clob_client import (
+    ClobAdapterError,
+    ClobClientAdapter,
+    ClobUncertainOutcomeError,
+)
 from config.schema import AppConfig, Mode
 from models.order import OrderRequest, OrderResult, OrderStatus
 from risk.circuit_breaker import CircuitBreaker
@@ -48,6 +53,26 @@ class OrderSubmitter:
                 requested_size=order.size,
             )
 
+        notional = order.price * order.size
+        if notional > self._config.execution.max_live_order_notional:
+            if self._circuit_breaker is not None:
+                self._circuit_breaker.record_failure()
+            return OrderResult(
+                client_order_id=order.client_order_id,
+                market_id=order.market_id,
+                token_id=order.token_id,
+                side=order.side,
+                status=OrderStatus.REJECTED,
+                accepted=False,
+                message=(
+                    f"order notional {notional} exceeds live notional cap "
+                    f"{self._config.execution.max_live_order_notional}"
+                ),
+                signal_id=order.signal_id,
+                strategy_name=order.strategy_name,
+                requested_size=order.size,
+            )
+
         self._submitted_ids.add(order.client_order_id)
         started = datetime.now(tz=UTC)
         logger.info(
@@ -84,6 +109,23 @@ class OrderSubmitter:
 
         try:
             result = self._clob_client.submit_order(order)
+        except ClobUncertainOutcomeError as exc:
+            latency_ms = int((datetime.now(tz=UTC) - started).total_seconds() * 1000)
+            if self._circuit_breaker is not None:
+                self._circuit_breaker.record_failure()
+            return OrderResult(
+                client_order_id=order.client_order_id,
+                market_id=order.market_id,
+                token_id=order.token_id,
+                side=order.side,
+                status=OrderStatus.UNKNOWN,
+                accepted=False,
+                message=str(exc),
+                signal_id=order.signal_id,
+                strategy_name=order.strategy_name,
+                requested_size=order.size,
+                latency_ms=latency_ms,
+            )
         except ClobAdapterError as exc:
             latency_ms = int((datetime.now(tz=UTC) - started).total_seconds() * 1000)
             if self._circuit_breaker is not None:
@@ -110,3 +152,19 @@ class OrderSubmitter:
         result.signal_id = order.signal_id
         result.strategy_name = order.strategy_name
         return result
+
+    async def cancel_all_open_orders(self) -> bool:
+        """Cancel every known open order through the adapter."""
+
+        try:
+            return await asyncio.to_thread(self._clob_client.cancel_all)
+        except ClobAdapterError as exc:
+            logger.error(
+                "cancel-all failed",
+                extra={
+                    "component": "submitter",
+                    "event_type": "cancel_all_failed",
+                    "reason": str(exc),
+                },
+            )
+            raise

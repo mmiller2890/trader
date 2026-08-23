@@ -51,6 +51,20 @@ async def housekeeping_loop(services: AppServices, stop_event: asyncio.Event) ->
                     reason=runtime_decision.reason,
                 ),
             )
+            if services.config.bot.mode == Mode.LIVE:
+                try:
+                    await services.submitter.cancel_all_open_orders()
+                except Exception as exc:
+                    await emit_event(
+                        services,
+                        BotEvent(
+                            event_type=EventType.KILL_SWITCH_TRIPPED,
+                            component="submitter",
+                            mode=services.config.bot.mode.value,
+                            message="cancel-all failed after halt",
+                            reason=str(exc),
+                        ),
+                    )
 
         timer_signals = await services.strategy.on_timer()
         for signal_item in timer_signals:
@@ -70,7 +84,7 @@ def _has_check(checks: list[RiskCheckResult], check_name: str) -> bool:
 async def run() -> None:
     """Boot and run the main bot runtime."""
 
-    services = bootstrap_app()
+    services = await bootstrap_app()
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
