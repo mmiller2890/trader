@@ -88,6 +88,7 @@ class InMemoryStateStore:
             if result.status in {
                 OrderStatus.CANCELLED,
                 OrderStatus.FILLED,
+                OrderStatus.PARTIALLY_FILLED,
                 OrderStatus.REJECTED,
                 OrderStatus.FAILED,
                 OrderStatus.SIMULATED,
