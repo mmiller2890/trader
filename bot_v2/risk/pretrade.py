@@ -8,6 +8,7 @@ from decimal import Decimal
 
 from config.schema import AppConfig, Mode
 from models.market import MarketSnapshot
+from models.operations import OperationalState
 from models.risk import RiskAction, RiskCheckResult, RiskDecision
 from models.signal import TradeSignal
 from risk.policy import PreTradeRiskPolicy
@@ -53,6 +54,7 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
 
         checks.append(self._mode_check())
         checks.append(await self._kill_switch_check())
+        checks.append(await self._operational_state_check(signal))
         checks.append(self._stale_data_check(snapshot))
         checks.append(self._reduce_only_check(signal))
         checks.append(await self._pending_exit_check(signal))
@@ -105,6 +107,29 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
             check_name="kill_switch",
             passed=not active,
             reason="kill_switch_inactive" if not active else "kill_switch_active",
+        )
+
+    async def _operational_state_check(self, signal: TradeSignal) -> RiskCheckResult:
+        """Block new BUY entries outside RUNNING; reduce-only passes this gate."""
+
+        state, reason = await self._state_store.get_operational_state()
+        if state == OperationalState.RUNNING:
+            return RiskCheckResult(
+                check_name="operational_state",
+                passed=True,
+                reason=f"state={state.value}",
+            )
+        if signal.reduce_only or signal.side.value == "sell":
+            return RiskCheckResult(
+                check_name="operational_state",
+                passed=True,
+                reason=f"reduce_only_allowed:{state.value}",
+            )
+        suffix = f":{reason}" if reason else ""
+        return RiskCheckResult(
+            check_name="operational_state",
+            passed=False,
+            reason=f"entries_paused:{state.value}{suffix}",
         )
 
     def _stale_data_check(self, snapshot: MarketSnapshot | None) -> RiskCheckResult:

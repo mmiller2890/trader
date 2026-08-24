@@ -9,8 +9,58 @@ from config.schema import AppConfig, Mode
 from models.market import MarketSnapshot
 from models.position import ExitReason, Position, PositionLifecycle
 from models.signal import SignalSide, SignalType, TradeSignal
+from models.operations import OperationalState
 from risk.pretrade import PreTradeRiskEngine
 from state.store import InMemoryStateStore
+
+
+def ready_state_store() -> InMemoryStateStore:
+    return InMemoryStateStore(mode=Mode.DRY_RUN)
+
+
+def risk_engine(store: InMemoryStateStore) -> PreTradeRiskEngine:
+    return PreTradeRiskEngine(config=AppConfig(), state_store=store)
+
+
+def buy_signal() -> TradeSignal:
+    return make_signal()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    [
+        OperationalState.DEGRADED,
+        OperationalState.HALTING,
+        OperationalState.HALTED,
+        OperationalState.FAILED,
+    ],
+)
+async def test_buy_is_rejected_outside_running_state(state: OperationalState) -> None:
+    store = ready_state_store()
+    await store.set_operational_state(state, reason="test_incident")
+    decision = await risk_engine(store).evaluate(
+        signal=buy_signal(), snapshot=fresh_snapshot(),
+        proposed_size=Decimal("1"), proposed_price=Decimal("0.5"),
+        executable_liquidity=Decimal("100"),
+    )
+    assert decision.approved is False
+    assert decision.reason == f"entries_paused:{state.value}:test_incident"
+
+
+@pytest.mark.asyncio
+async def test_sell_still_evaluated_when_entries_paused() -> None:
+    store = ready_state_store()
+    await store.set_operational_state(OperationalState.DEGRADED, reason="test_incident")
+    await store.set_position(
+        Position(market_id="m1", token_id="t1", quantity=Decimal("2"))
+    )
+    sell_signal = buy_signal().model_copy(update={"side": SignalSide.SELL})
+    decision = await risk_engine(store).evaluate(
+        signal=sell_signal, snapshot=fresh_snapshot(),
+        proposed_size=Decimal("2"), proposed_price=Decimal("0.45"),
+    )
+    assert "entries_paused" not in decision.reason
 
 
 def fresh_snapshot() -> MarketSnapshot:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import signal
-from app.runtime import BotRuntime, emit_event, housekeeping_loop
+from app.runtime import BotRuntime, FatalRuntimeError
 
 
 def parser() -> argparse.ArgumentParser:
@@ -16,6 +16,11 @@ def parser() -> argparse.ArgumentParser:
         "--live",
         action="store_true",
         help="allow a fully armed live configuration to start",
+    )
+    result.add_argument(
+        "--resume-live",
+        action="store_true",
+        help="resume live trading only through a persisted valid lease",
     )
     return result
 
@@ -32,8 +37,11 @@ async def run(*, allow_live: bool = False) -> None:
     try:
         status = await runtime.start(allow_live=allow_live)
         if status.phase.value == "failed":
-            raise RuntimeError(status.reason or "bot_start_failed")
-        await runtime.wait()
+            await runtime.stop()
+            raise FatalRuntimeError(status.reason or "bot_start_failed")
+        status = await runtime.wait()
+        if status.phase.value == "failed":
+            raise FatalRuntimeError(status.reason or "bot_failed")
     finally:
         await runtime.stop()
 
@@ -42,6 +50,8 @@ def main(argv: list[str] | None = None) -> None:
     """Synchronous CLI entrypoint."""
 
     args = parser().parse_args(argv)
+    if args.resume_live and args.live:
+        raise SystemExit("--live and --resume-live are mutually exclusive")
     asyncio.run(run(allow_live=args.live))
 
 

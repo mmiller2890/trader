@@ -26,7 +26,7 @@ async def _persist_cancel_failure(services: AppServices, reason: str) -> None:
 
 
 async def shutdown_app(services: AppServices, tasks: Iterable[asyncio.Task[object]]) -> None:
-    """Cancel tasks, cancel live orders, persist snapshot, and stop clients."""
+    """Stop supervisor, cancel live orders, persist snapshot, and stop clients."""
 
     for task in tasks:
         task.cancel()

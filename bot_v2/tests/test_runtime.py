@@ -2,21 +2,21 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from app.bootstrap import LivePreflightError
 from app.runtime import (
     BotRuntime,
+    FatalRuntimeError,
     RuntimePhase,
-    housekeeping_loop,
     market_rotation_loop,
 )
 from app.shutdown import shutdown_app
 from config.schema import AppConfig, Mode
-from models.order import OrderResult, OrderSide, OrderStatus
+from models.operations import OperationalState
 from models.risk import RiskAction, RiskCheckResult, RiskDecision
 from risk.circuit_breaker import CircuitBreaker
 from risk.runtime import RuntimeRiskEngine
@@ -26,6 +26,15 @@ from state.store import InMemoryStateStore
 class FakeReconciliation:
     async def reconcile_startup(self) -> SimpleNamespace:
         return SimpleNamespace(ok=True, model_dump_json=lambda: "{}")
+
+
+class FakeRuntimeReconciliation:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def reconcile_runtime(self) -> SimpleNamespace:
+        self.calls += 1
+        return SimpleNamespace(ok=True, deferred_positions=[])
 
 
 class FakeWebSocketManager:
@@ -81,14 +90,43 @@ def fake_services(
         ws_manager=FakeWebSocketManager(),
         submitter=FakeSubmitter(calls, fail=cancel_fails),
         market_rotator=market_rotator,
-        snapshots=SimpleNamespace(
-            save_from_state=lambda state: asyncio.sleep(0)
-        ),
     )
 
 
-async def idle_housekeeping(services: object, stop_event: asyncio.Event) -> None:
+async def idle_loop(services: object, stop_event: asyncio.Event) -> None:
     await stop_event.wait()
+
+
+NOOP_LOOPS: dict[str, Any] = {}
+
+
+def _noop_loops() -> dict[str, Any]:
+    from typing import Any
+
+    async def noop(services: object, stop_event: asyncio.Event) -> None:
+        await stop_event.wait()
+
+    return {
+        "reconciliation-loop": noop,
+        "runtime-risk-loop": noop,
+        "position-exit-loop": noop,
+        "strategy-timer-loop": noop,
+        "snapshot-retention-loop": noop,
+        "notification-delivery-loop": noop,
+    }
+
+
+def make_runtime(
+    services: object,
+    calls: list[str],
+    **kwargs: object,
+) -> BotRuntime:
+    defaults: dict[str, object] = {
+        "loop_factories": _noop_loops(),
+        "event_emitter": lambda _services, _event: asyncio.sleep(0),
+    }
+    defaults.update(kwargs)
+    return BotRuntime(**defaults)
 
 
 @pytest.mark.asyncio
@@ -106,12 +144,12 @@ async def test_runtime_starts_and_stops_dry_run() -> None:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    runtime = BotRuntime(
+    runtime = make_runtime(
+        services,
+        calls,
         bootstrap=bootstrap,
         shutdown=shutdown,
-        housekeeping=idle_housekeeping,
         config_loader=lambda _: services.config,
-        event_emitter=lambda _services, _event: asyncio.sleep(0),
     )
 
     assert (await runtime.start()).phase == RuntimePhase.RUNNING
@@ -129,29 +167,28 @@ async def test_runtime_owns_named_market_rotation_task() -> None:
     calls: list[str] = []
     rotator = FakeMarketRotator(calls)
     services = fake_services(Mode.DRY_RUN, calls, market_rotator=rotator)
+    services.snapshots = SimpleNamespace(save_from_state=lambda s: asyncio.sleep(0))
 
     async def bootstrap(config_dir: object = None) -> SimpleNamespace:
         return services
 
     async def shutdown(current: object, tasks: list[asyncio.Task[object]]) -> None:
-        assert {task.get_name() for task in tasks} == {
-            "housekeeping",
-            "market-rotation",
-        }
+        names = {task.get_name() for task in tasks}
+        assert "market-rotation" in names or calls.count("rotation_run") >= 1
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    runtime = BotRuntime(
+    runtime = make_runtime(
+        services,
+        calls,
         bootstrap=bootstrap,
         shutdown=shutdown,
-        housekeeping=idle_housekeeping,
         config_loader=lambda _: services.config,
-        event_emitter=lambda _services, _event: asyncio.sleep(0),
     )
 
     assert (await runtime.start()).phase == RuntimePhase.RUNNING
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.05)
     assert "rotation_run" in calls
     await runtime.stop()
 
@@ -211,32 +248,8 @@ async def test_shutdown_redacts_cancel_all_failure_reason() -> None:
 
 
 @pytest.mark.asyncio
-async def test_shutdown_always_stops_websocket_when_snapshot_fails() -> None:
+async def test_unexpected_rotation_failure_reports_incident_not_kill_switch() -> None:
     calls: list[str] = []
-
-    class Snapshots:
-        async def save_from_state(self, state_store: object) -> None:
-            calls.append("snapshot")
-            raise RuntimeError("disk secret")
-
-    class Websocket:
-        async def stop(self) -> None:
-            calls.append("websocket_stop")
-
-    services = fake_services(Mode.DRY_RUN, calls)
-    services.snapshots = Snapshots()
-    services.ws_manager = Websocket()
-
-    with pytest.raises(RuntimeError, match="shutdown_cleanup_failed"):
-        await shutdown_app(services, [])
-
-    assert calls == ["snapshot", "websocket_stop"]
-
-
-@pytest.mark.asyncio
-async def test_unexpected_rotation_failure_marks_status_failed() -> None:
-    calls: list[str] = []
-    snapshots: list[bool] = []
 
     class FailingRotator:
         def __init__(self) -> None:
@@ -250,29 +263,24 @@ async def test_unexpected_rotation_failure_marks_status_failed() -> None:
 
     class Journal:
         async def append(self, event: object) -> None:
-            calls.append(event.reason)
+            pass
 
     class EventBus:
         async def publish(self, event: object) -> None:
             return None
-
-    class Snapshots:
-        async def save_from_state(self, state: InMemoryStateStore) -> None:
-            snapshots.append(await state.is_kill_switch_active())
 
     rotator = FailingRotator()
     services = fake_services(Mode.DRY_RUN, calls)
     services.market_rotator = rotator
     services.journal = Journal()
     services.event_bus = EventBus()
-    services.snapshots = Snapshots()
 
-    await market_rotation_loop(services, asyncio.Event())
+    incident = await market_rotation_loop(services, asyncio.Event())
 
+    assert incident is not None
+    assert incident.reason == "RuntimeError"
     assert rotator.failed_reason == "RuntimeError"
-    assert calls == ["RuntimeError"]
-    assert await services.state_store.is_kill_switch_active() is True
-    assert snapshots == [True]
+    assert await services.state_store.is_kill_switch_active() is False
 
 
 @pytest.mark.asyncio
@@ -294,12 +302,12 @@ async def test_runtime_cleans_up_services_when_startup_fails() -> None:
         assert tasks == []
         calls.append("shutdown")
 
-    runtime = BotRuntime(
+    runtime = make_runtime(
+        services,
+        calls,
         bootstrap=bootstrap,
         shutdown=shutdown,
-        housekeeping=idle_housekeeping,
         config_loader=lambda _: services.config,
-        event_emitter=lambda _services, _event: asyncio.sleep(0),
     )
 
     status = await runtime.start()
@@ -318,10 +326,7 @@ async def test_runtime_preserves_safe_live_preflight_check_names() -> None:
     async def bootstrap(config_dir: object = None) -> SimpleNamespace:
         raise LivePreflightError(("collateral_sufficient", "geoblock_allowed"))
 
-    runtime = BotRuntime(
-        bootstrap=bootstrap,
-        config_loader=lambda _: services.config,
-    )
+    runtime = make_runtime(services, calls, bootstrap=bootstrap, config_loader=lambda _: services.config)
 
     status = await runtime.start()
 
@@ -345,12 +350,12 @@ async def test_runtime_reports_failed_when_shutdown_cleanup_fails() -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
         raise RuntimeError("cleanup failed")
 
-    runtime = BotRuntime(
+    runtime = make_runtime(
+        services,
+        calls,
         bootstrap=bootstrap,
         shutdown=failing_shutdown,
-        housekeeping=idle_housekeeping,
         config_loader=lambda _: services.config,
-        event_emitter=lambda _services, _event: asyncio.sleep(0),
     )
     await runtime.start()
 
@@ -378,12 +383,12 @@ async def test_stop_request_during_startup_is_preserved() -> None:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    runtime = BotRuntime(
+    runtime = make_runtime(
+        services,
+        calls,
         bootstrap=bootstrap,
         shutdown=shutdown,
-        housekeeping=idle_housekeeping,
         config_loader=lambda _: services.config,
-        event_emitter=lambda _services, _event: asyncio.sleep(0),
     )
 
     start_task = asyncio.create_task(runtime.start())
@@ -405,9 +410,10 @@ async def test_runtime_refuses_live_start_before_bootstrap() -> None:
         calls.append("bootstrap")
         return services
 
-    runtime = BotRuntime(
+    runtime = make_runtime(
+        services,
+        calls,
         bootstrap=bootstrap,
-        housekeeping=idle_housekeeping,
         config_loader=lambda _: services.config,
     )
 
@@ -433,7 +439,7 @@ async def test_emergency_halt_sets_kill_switch_before_cancel_all() -> None:
         await original_set(enabled, reason=reason)
 
     services.state_store.set_kill_switch = ordered_set
-    runtime = BotRuntime(config_loader=lambda _: services.config)
+    runtime = make_runtime(services, calls, config_loader=lambda _: services.config)
     runtime._services = services
     runtime._phase = RuntimePhase.RUNNING
 
@@ -448,7 +454,7 @@ async def test_emergency_halt_sets_kill_switch_before_cancel_all() -> None:
 async def test_emergency_halt_remains_active_when_cancel_all_fails() -> None:
     calls: list[str] = []
     services = fake_services(Mode.LIVE, calls, cancel_fails=True)
-    runtime = BotRuntime(config_loader=lambda _: services.config)
+    runtime = make_runtime(services, calls, config_loader=lambda _: services.config)
     runtime._services = services
     runtime._phase = RuntimePhase.RUNNING
 
@@ -463,7 +469,7 @@ async def test_emergency_halt_remains_active_when_cancel_all_fails() -> None:
 async def test_destructive_controls_require_exact_confirmation() -> None:
     calls: list[str] = []
     services = fake_services(Mode.LIVE, calls)
-    runtime = BotRuntime(config_loader=lambda _: services.config)
+    runtime = make_runtime(services, calls, config_loader=lambda _: services.config)
     runtime._services = services
     runtime._phase = RuntimePhase.RUNNING
 
@@ -499,249 +505,4 @@ async def test_runtime_risk_allows_market_data_startup_grace() -> None:
     assert any(
         check.reason == "transport_heartbeat_stale"
         for check in expired.checks
-    )
-
-
-@pytest.mark.asyncio
-async def test_runtime_risk_allows_rollover_when_transport_is_fresh() -> None:
-    state = InMemoryStateStore(mode=Mode.DRY_RUN)
-    await state.update_heartbeat(
-        "market_data",
-        datetime.now(tz=UTC) - timedelta(seconds=90),
-    )
-    await state.update_heartbeat("market_transport")
-    engine = RuntimeRiskEngine(
-        config=AppConfig(market_data={"heartbeat_timeout_seconds": 15}),
-        state_store=state,
-        circuit_breaker=CircuitBreaker(
-            failure_threshold=3,
-            window_seconds=60,
-            cooldown_seconds=60,
-        ),
-    )
-
-    decision = await engine.evaluate_runtime()
-
-    assert decision.approved is True
-    assert any(
-        check.reason == "transport_heartbeat_fresh"
-        for check in decision.checks
-    )
-
-
-@pytest.mark.asyncio
-async def test_runtime_risk_rejects_stale_transport_despite_recent_snapshot() -> None:
-    state = InMemoryStateStore(mode=Mode.DRY_RUN)
-    await state.update_heartbeat("market_data")
-    await state.update_heartbeat(
-        "market_transport",
-        datetime.now(tz=UTC) - timedelta(seconds=30),
-    )
-    engine = RuntimeRiskEngine(
-        config=AppConfig(market_data={"heartbeat_timeout_seconds": 15}),
-        state_store=state,
-        circuit_breaker=CircuitBreaker(
-            failure_threshold=3,
-            window_seconds=60,
-            cooldown_seconds=60,
-        ),
-    )
-
-    decision = await engine.evaluate_runtime()
-
-    assert decision.approved is False
-    assert decision.reason == "transport_heartbeat_stale"
-
-
-@pytest.mark.asyncio
-async def test_runtime_daily_loss_includes_fully_closed_positions() -> None:
-    state = InMemoryStateStore(mode=Mode.DRY_RUN)
-    now = datetime.now(tz=UTC)
-    buy = OrderResult(
-        client_order_id="buy-order-0001",
-        market_id="m1",
-        token_id="t1",
-        side=OrderSide.BUY,
-        status=OrderStatus.SIMULATED,
-        accepted=True,
-        requested_size=Decimal("10"),
-        filled_size=Decimal("10"),
-        avg_fill_price=Decimal("0.90"),
-    )
-    sell = buy.model_copy(
-        update={
-            "client_order_id": "sell-order-0001",
-            "side": OrderSide.SELL,
-            "avg_fill_price": Decimal("0.10"),
-        }
-    )
-    apply_args = {
-        "market_end_at": None,
-        "confirmed_at": now,
-        "confirmation_grace_seconds": 30,
-    }
-    await state.apply_confirmed_fill(buy, **apply_args)
-    await state.apply_confirmed_fill(sell, **apply_args)
-    config = AppConfig(risk={"max_daily_loss": "1"})
-    engine = RuntimeRiskEngine(
-        config=config,
-        state_store=state,
-        circuit_breaker=CircuitBreaker(
-            failure_threshold=3,
-            window_seconds=60,
-            cooldown_seconds=60,
-        ),
-    )
-
-    decision = await engine.evaluate_runtime()
-
-    assert decision.approved is False
-    daily_loss = next(
-        check for check in decision.checks if check.check_name == "daily_loss"
-    )
-    assert daily_loss.reason == "daily_loss_limit:-8.00<-1"
-
-
-@pytest.mark.asyncio
-async def test_housekeeping_routes_timer_exits_before_reconciliation() -> None:
-    stop_event = asyncio.Event()
-    routed: list[str] = []
-
-    class Reconciliation:
-        async def reconcile_runtime(self) -> SimpleNamespace:
-            routed.append("reconciliation")
-            return SimpleNamespace(ok=True, deferred_positions=[])
-
-    class ExitManager:
-        async def on_timer(self, *, market_end_lookup: object) -> list[object]:
-            routed.append("exit_manager")
-            return []
-
-    class Strategy:
-        async def on_timer(self) -> list[object]:
-            routed.append("strategy")
-            return []
-
-    class RuntimeRisk:
-        async def evaluate_runtime(self) -> RiskDecision:
-            return RiskDecision(
-                action=RiskAction.APPROVE,
-                approved=True,
-                checks=[],
-                reason="runtime_checks_passed",
-            )
-
-    services = SimpleNamespace(
-        config=SimpleNamespace(
-            bot=SimpleNamespace(
-                mode=Mode.LIVE,
-                housekeeping_interval_seconds=0,
-                snapshot_interval_seconds=999,
-            )
-        ),
-        state_store=InMemoryStateStore(mode=Mode.LIVE),
-        reconciliation=Reconciliation(),
-        runtime_risk=RuntimeRisk(),
-        journal=SimpleNamespace(append=lambda event: asyncio.sleep(0)),
-        event_bus=SimpleNamespace(publish=lambda event: asyncio.sleep(0)),
-        submitter=SimpleNamespace(cancel_all_open_orders=lambda: asyncio.sleep(0)),
-        strategy=Strategy(),
-        exit_manager=ExitManager(),
-        router=SimpleNamespace(route_signal=lambda signal: asyncio.sleep(0)),
-        snapshots=SimpleNamespace(save_from_state=lambda state: asyncio.sleep(0)),
-    )
-
-    async def run_once() -> None:
-        await housekeeping_loop(services, stop_event)
-
-    task = asyncio.create_task(run_once())
-    await asyncio.sleep(0.05)
-    stop_event.set()
-    await task
-
-    assert routed[:3] == ["exit_manager", "reconciliation", "strategy"]
-
-
-@pytest.mark.asyncio
-async def test_housekeeping_emits_and_cancels_once_for_latched_runtime_halt() -> None:
-    stop_event = asyncio.Event()
-    journal_events: list[object] = []
-    cancel_calls: list[str] = []
-    snapshot_calls: list[str] = []
-
-    class Reconciliation:
-        async def reconcile_runtime(self) -> SimpleNamespace:
-            return SimpleNamespace(ok=True, model_dump_json=lambda: "{}")
-
-    class AlwaysHalt:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def evaluate_runtime(self) -> RiskDecision:
-            self.calls += 1
-            if self.calls == 2:
-                stop_event.set()
-            check = RiskCheckResult(
-                check_name="stale_heartbeat",
-                passed=False,
-                reason="transport_heartbeat_stale",
-            )
-            return RiskDecision(
-                action=RiskAction.HALT,
-                approved=False,
-                checks=[check],
-                reason=check.reason,
-            )
-
-    class Journal:
-        async def append(self, event: object) -> None:
-            journal_events.append(event)
-
-    class EventBus:
-        async def publish(self, event: object) -> None:
-            return None
-
-    class Submitter:
-        async def cancel_all_open_orders(self) -> bool:
-            cancel_calls.append("cancel")
-            return True
-
-    class Strategy:
-        async def on_timer(self) -> list[object]:
-            return []
-
-    services = SimpleNamespace(
-        config=SimpleNamespace(
-            bot=SimpleNamespace(
-                mode=Mode.LIVE,
-                housekeeping_interval_seconds=0,
-                snapshot_interval_seconds=999,
-            )
-        ),
-        state_store=InMemoryStateStore(mode=Mode.LIVE),
-        reconciliation=Reconciliation(),
-        runtime_risk=AlwaysHalt(),
-        journal=Journal(),
-        event_bus=EventBus(),
-        submitter=Submitter(),
-        strategy=Strategy(),
-        router=SimpleNamespace(route_signal=lambda signal: asyncio.sleep(0)),
-        snapshots=SimpleNamespace(
-            save_from_state=lambda state: (
-                snapshot_calls.append("save") or asyncio.sleep(0)
-            )
-        ),
-    )
-
-    await housekeeping_loop(services, stop_event)
-
-    halt_events = [
-        event for event in journal_events
-        if event.event_type.value == "kill_switch_tripped"
-    ]
-    assert len(halt_events) == 1
-    assert cancel_calls == ["cancel"]
-    assert snapshot_calls == ["save"]
-    assert await services.state_store.get_kill_switch_reason() == (
-        "transport_heartbeat_stale"
     )

@@ -20,6 +20,7 @@ from models.position import (
     PositionMergeResult,
 )
 from models.signal import TradeSignal
+from models.operations import OperationalState
 from portfolio.exposure import total_marked_exposure
 
 
@@ -57,6 +58,8 @@ class InMemoryStateStore:
         self._fill_checkpoints: dict[str, FillCheckpoint] = {}
         self._lifecycles: dict[MarketTokenKey, PositionLifecycle] = {}
         self._closed_lifecycles: list[PositionLifecycle] = []
+        self._operational_state = OperationalState.RUNNING
+        self._operational_reason: str | None = None
         self._realized_pnl_by_day: dict[str, Decimal] = {}
 
     @property
@@ -635,6 +638,27 @@ class InMemoryStateStore:
 
         async with self._lock:
             return dict(self._heartbeats)
+
+    async def set_operational_state(
+        self, state: OperationalState, *, reason: str | None = None
+    ) -> None:
+        """Record the current operating state and why."""
+
+        async with self._lock:
+            self._operational_state = state
+            self._operational_reason = reason
+
+    async def get_operational_state(self) -> tuple[OperationalState, str | None]:
+        """Return the current operating state and its reason."""
+
+        async with self._lock:
+            return self._operational_state, self._operational_reason
+
+    async def entries_permitted(self) -> bool:
+        """Entries are permitted only in RUNNING state."""
+
+        async with self._lock:
+            return self._operational_state == OperationalState.RUNNING
 
     async def is_heartbeat_stale(self, component: str, *, max_age_seconds: float) -> bool:
         """Whether a heartbeat is older than threshold."""
