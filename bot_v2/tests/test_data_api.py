@@ -30,6 +30,8 @@ def position_row(
     size: str = "5",
     avg: str = "0.50",
     cur: str = "0.55",
+    cash_pnl: str = "0.25",
+    realized_pnl: str = "0.10",
 ) -> dict[str, object]:
     return {
         "conditionId": condition,
@@ -37,6 +39,8 @@ def position_row(
         "size": size,
         "avgPrice": avg,
         "curPrice": cur,
+        "cashPnl": cash_pnl,
+        "realizedPnl": realized_pnl,
     }
 
 
@@ -50,6 +54,7 @@ def test_data_api_requests_exact_first_page_params() -> None:
     assert request.url.path == "/positions"
     assert request.url.params["user"] == "0x1111111111111111111111111111111111111111"
     assert request.url.params["sizeThreshold"] == "0"
+    assert request.url.params["redeemable"] == "false"
     assert request.url.params["limit"] == "500"
     assert request.url.params["offset"] == "0"
 
@@ -66,6 +71,8 @@ def test_data_api_paginates_until_short_page() -> None:
     assert positions[0].quantity == Decimal("5")
     assert positions[0].average_entry_price == Decimal("0.50")
     assert positions[0].mark_price == Decimal("0.55")
+    assert positions[0].unrealized_pnl == Decimal("0.25")
+    assert positions[0].realized_pnl == Decimal("0.10")
     assert positions[500].market_id == "c500"
     assert transport.requests[1].url.params["offset"] == "500"
 

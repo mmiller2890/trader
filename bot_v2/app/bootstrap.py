@@ -125,6 +125,31 @@ class AppServices:
 DiscoveryClientFactory = Callable[[AutomaticMarketConfig], DiscoveryClient]
 
 
+def _position_market_end(
+    initial_market: object | None,
+    market_rotator: object | None,
+    *,
+    market_id: str,
+    token_id: str,
+) -> datetime | None:
+    """Return the deadline only when the position matches the current market."""
+
+    current = None
+    if market_rotator is not None:
+        status = market_rotator.status()
+        current = getattr(status, "current_market", None)
+    market = current or initial_market
+    if market is None:
+        return None
+    asset_ids = getattr(market, "asset_ids", [])
+    if (
+        market_id == getattr(market, "condition_id", None)
+        or token_id in asset_ids
+    ):
+        return getattr(market, "end_at", None)
+    return None
+
+
 async def _rotation_safe(
     state_store: InMemoryStateStore,
     market: object,
@@ -188,6 +213,13 @@ async def bootstrap_app(
         restore_heartbeats=False,
         restore_positions=not is_live_mode(config.bot.mode),
     )
+    tracker = OrderTracker(
+        state_store,
+        snapshots=snapshots,
+        confirmation_grace_seconds=(
+            config.position_management.position_confirmation_grace_seconds
+        ),
+    )
     circuit_breaker = CircuitBreaker(
         failure_threshold=config.risk.circuit_breaker_failures,
         window_seconds=config.risk.circuit_breaker_window_seconds,
@@ -195,6 +227,7 @@ async def bootstrap_app(
     )
 
     discovery_client: DiscoveryClient | None = None
+    market_rotator: Btc15mMarketRotator | None = None
     initial_market = None
     asset_ids = config.market_data.subscribed_token_ids or None
     if config.market_data.automatic_market.enabled:
@@ -213,6 +246,17 @@ async def bootstrap_app(
                 raise LivePreflightError(("market_discovery",)) from exc
             raise
         asset_ids = initial_market.asset_ids
+
+    def position_market_end_lookup(
+        market_id: str,
+        token_id: str,
+    ) -> datetime | None:
+        return _position_market_end(
+            initial_market,
+            market_rotator,
+            market_id=market_id,
+            token_id=token_id,
+        )
 
     try:
         try:
@@ -235,6 +279,12 @@ async def bootstrap_app(
                     open_orders_reader=clob_client,
                     positions_reader=positions_client,
                     funder_address=credentials.proxy_address,
+                    apply_fill=tracker.handle_order_result,
+                    market_end_lookup=position_market_end_lookup,
+                    require_position_market_end=(
+                        config.market_data.automatic_market.enabled
+                    ),
+                    min_order_size=config.execution.min_order_size,
                 )
             except Exception as exc:
                 raise LivePreflightError(("client_initialization",)) from exc
@@ -290,19 +340,18 @@ async def bootstrap_app(
         clob_client=clob_client,
         circuit_breaker=circuit_breaker,
     )
-    tracker = OrderTracker(
-        state_store,
-        snapshots=snapshots,
-        confirmation_grace_seconds=(
-            config.position_management.position_confirmation_grace_seconds
-        ),
-    )
     reconciliation = ReconciliationService(
         state_store=state_store,
         mode=config.bot.mode,
         open_orders_reader=clob_client,
         positions_reader=positions_client if is_live_mode(config.bot.mode) else None,
         funder_address=credentials.proxy_address,
+        apply_fill=tracker.handle_order_result,
+        market_end_lookup=position_market_end_lookup,
+        require_position_market_end=(
+            config.market_data.automatic_market.enabled
+        ),
+        min_order_size=config.execution.min_order_size,
     )
     router = ExecutionRouter(
         config=config,
@@ -314,6 +363,7 @@ async def bootstrap_app(
         journal=journal,
         event_bus=event_bus,
         post_fill_reconcile=reconciliation.reconcile_runtime,
+        snapshots=snapshots,
     )
     exit_policy = PositionExitPolicy(
         config.position_management,
@@ -327,14 +377,11 @@ async def bootstrap_app(
         policy=exit_policy,
         on_event=emit_event,
     )
-    market_rotator: Btc15mMarketRotator | None = None
-
     async def on_snapshot(snapshot) -> None:  # type: ignore[no-untyped-def]
-        market_end_at = None
-        if market_rotator is not None:
-            current = market_rotator.status().current_market
-            if current is not None:
-                market_end_at = current.end_at
+        market_end_at = position_market_end_lookup(
+            snapshot.market_id,
+            snapshot.token_id,
+        )
         for exit_signal in await exit_manager.on_market_update(
             snapshot, market_end_at=market_end_at
         ):

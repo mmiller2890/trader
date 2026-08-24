@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 from config.schema import Mode
@@ -36,6 +37,8 @@ class StateSnapshot(BaseModel):
     kill_switch_reason: str | None = None
     fill_checkpoints: list[FillCheckpoint] = Field(default_factory=list)
     position_lifecycles: list[PositionLifecycle] = Field(default_factory=list)
+    closed_position_lifecycles: list[PositionLifecycle] = Field(default_factory=list)
+    realized_pnl_by_day: dict[str, Decimal] = Field(default_factory=dict)
     saved_at: datetime = Field(default_factory=utc_now)
 
 
@@ -66,6 +69,10 @@ class SnapshotStore:
             kill_switch_reason=await state_store.get_kill_switch_reason(),
             fill_checkpoints=await state_store.get_fill_checkpoints(),
             position_lifecycles=await state_store.get_position_lifecycles(),
+            closed_position_lifecycles=(
+                await state_store.get_closed_position_lifecycles()
+            ),
+            realized_pnl_by_day=await state_store.get_realized_pnl_by_day(),
         )
         await self.save(snapshot)
         return snapshot
@@ -126,6 +133,16 @@ class SnapshotStore:
             await state_store.restore_fill_checkpoint(checkpoint)
         for lifecycle in snapshot.position_lifecycles:
             await state_store.restore_position_lifecycle(lifecycle)
+        for lifecycle in snapshot.closed_position_lifecycles:
+            await state_store.restore_closed_position_lifecycle(lifecycle)
+        await state_store.restore_realized_pnl_by_day(
+            snapshot.realized_pnl_by_day
+        )
+        if snapshot.kill_switch_active:
+            await state_store.set_kill_switch(
+                True,
+                reason=snapshot.kill_switch_reason or "restored_kill_switch",
+            )
         if restore_heartbeats:
             for component, timestamp in snapshot.heartbeats.items():
                 await state_store.update_heartbeat(component, timestamp)

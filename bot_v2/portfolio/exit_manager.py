@@ -15,6 +15,7 @@ from models.position import ExitReason, Position, PositionLifecycle
 from models.signal import SignalSide, SignalType, TradeSignal
 from persistence.snapshots import SnapshotStore
 from portfolio.exit_policy import PositionExitPolicy
+from portfolio.sizing import fixed_size
 from state.store import InMemoryStateStore
 
 
@@ -58,6 +59,8 @@ class PositionExitManager:
     ) -> list[TradeSignal]:
         """Evaluate the exit policy for the position this snapshot belongs to."""
 
+        if not self._config.position_management.enabled:
+            return []
         signals: list[TradeSignal] = []
         for position in await self._state_store.get_positions():
             if (
@@ -95,7 +98,7 @@ class PositionExitManager:
             if not decision.should_exit or decision.reason is None:
                 continue
             if lifecycle.exit_attempt_count >= self._config.position_management.max_exit_attempts:
-                await self._state_store.activate_kill_switch(
+                await self._activate_kill_switch(
                     f"exit_attempts_exhausted:{position.market_id}:{position.token_id}"
                 )
                 continue
@@ -119,6 +122,8 @@ class PositionExitManager:
     ) -> TradeSignal | None:
         """Convert a strategy SELL into a reserved exit when inventory exists."""
 
+        if not self._config.position_management.enabled:
+            return None
         if signal.side != SignalSide.SELL:
             return None
         if not self._config.position_management.exit_on_strategy_sell:
@@ -150,6 +155,8 @@ class PositionExitManager:
     ) -> list[TradeSignal]:
         """Evaluate time-based exits for every open position."""
 
+        if not self._config.position_management.enabled:
+            return []
         signals: list[TradeSignal] = []
         for position in await self._state_store.get_positions():
             lifecycle = await self._state_store.get_position_lifecycle(
@@ -191,6 +198,11 @@ class PositionExitManager:
         requested_size: Decimal,
         market_end_at: datetime | None,
     ) -> TradeSignal | None:
+        effective_size = (
+            requested_size
+            if self._config.position_management.liquidate_full_position
+            else min(requested_size, fixed_size(self._config.execution))
+        )
         if lifecycle.pending_exit_client_order_id is not None:
             return None
         if lifecycle.exit_attempt_count >= self._config.position_management.max_exit_attempts:
@@ -227,7 +239,7 @@ class PositionExitManager:
                 token_id=position.token_id,
                 client_order_id=client_order_id,
                 reason=f"position_exit:{reason.value}",
-                quantity=requested_size,
+                quantity=effective_size,
             )
         )
         return TradeSignal(
@@ -242,7 +254,7 @@ class PositionExitManager:
             observed_move_bps=0,
             created_at=self._now(),
             reason=f"position_exit:{reason.value}",
-            requested_size=requested_size,
+            requested_size=effective_size,
             reduce_only=True,
             time_in_force=self._config.position_management.exit_time_in_force,
         )
@@ -250,3 +262,11 @@ class PositionExitManager:
     async def _emit_event(self, event: BotEvent) -> None:
         if self._on_event is not None:
             await self._on_event(event)
+
+    async def _activate_kill_switch(self, reason: str) -> bool:
+        """Persist a newly activated halt before returning control."""
+
+        activated = await self._state_store.activate_kill_switch(reason)
+        if activated and self._snapshots is not None:
+            await self._snapshots.save_from_state(self._state_store)
+        return activated

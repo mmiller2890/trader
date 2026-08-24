@@ -16,6 +16,7 @@ from models.risk import RiskAction
 from models.signal import TradeSignal
 from notifications.events import EventBus
 from persistence.journal import JsonlJournal
+from persistence.snapshots import SnapshotStore
 from portfolio.sizing import fixed_size
 from risk.pretrade import PreTradeRiskEngine
 from state.reconciliation import ReconciliationReport
@@ -37,6 +38,7 @@ class ExecutionRouter:
         journal: JsonlJournal,
         event_bus: EventBus,
         post_fill_reconcile: Callable[[], Awaitable[ReconciliationReport]] | None = None,
+        snapshots: SnapshotStore | None = None,
     ) -> None:
         self._config = config
         self._state_store = state_store
@@ -47,6 +49,7 @@ class ExecutionRouter:
         self._journal = journal
         self._event_bus = event_bus
         self._post_fill_reconcile = post_fill_reconcile
+        self._snapshots = snapshots
 
     async def route_signal(
         self,
@@ -134,7 +137,7 @@ class ExecutionRouter:
 
         if not risk_decision.approved:
             if risk_decision.action == RiskAction.HALT:
-                activated = await self._state_store.activate_kill_switch(
+                activated = await self._activate_kill_switch(
                     risk_decision.reason
                 )
                 if activated:
@@ -176,7 +179,7 @@ class ExecutionRouter:
         )
 
         if outcome.unknown_outcome:
-            activated = await self._state_store.activate_kill_switch(
+            activated = await self._activate_kill_switch(
                 f"unknown_order_outcome:{result.client_order_id}"
             )
             if activated:
@@ -193,7 +196,7 @@ class ExecutionRouter:
                     )
                 )
         elif outcome.accounting_error is not None:
-            activated = await self._state_store.activate_kill_switch(
+            activated = await self._activate_kill_switch(
                 f"position_accounting_error:{outcome.accounting_error}"
             )
             if activated:
@@ -274,7 +277,7 @@ class ExecutionRouter:
         try:
             report = await self._post_fill_reconcile()
         except Exception as exc:
-            activated = await self._state_store.activate_kill_switch(
+            activated = await self._activate_kill_switch(
                 f"post_fill_reconciliation_failed:{type(exc).__name__}"
             )
             if activated:
@@ -289,7 +292,7 @@ class ExecutionRouter:
                 )
             return
         if not report.ok:
-            activated = await self._state_store.activate_kill_switch(
+            activated = await self._activate_kill_switch(
                 "post_fill_reconciliation_failed"
             )
             if activated:
@@ -320,11 +323,19 @@ class ExecutionRouter:
         client_order_id = (
             f"{self._config.execution.client_order_id_prefix}-{signal.signal_id[:18]}"
         )
-        await self._state_store.release_exit(
+        released = await self._state_store.release_exit(
             signal.market_id,
             signal.token_id,
             client_order_id=client_order_id,
         )
+        if released and self._snapshots is not None:
+            await self._snapshots.save_from_state(self._state_store)
+
+    async def _activate_kill_switch(self, reason: str) -> bool:
+        activated = await self._state_store.activate_kill_switch(reason)
+        if activated and self._snapshots is not None:
+            await self._snapshots.save_from_state(self._state_store)
+        return activated
 
     async def _emit_event(self, event: BotEvent) -> None:
         await self._journal.append(event)

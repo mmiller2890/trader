@@ -93,6 +93,9 @@ async def housekeeping_loop(services: AppServices, stop_event: asyncio.Event) ->
                     "runtime_reconciliation_failed"
                 )
                 if activated:
+                    await services.snapshots.save_from_state(
+                        services.state_store
+                    )
                     await emit_event(
                         services,
                         BotEvent(
@@ -110,6 +113,7 @@ async def housekeeping_loop(services: AppServices, stop_event: asyncio.Event) ->
                 runtime_decision.reason
             )
             if activated:
+                await services.snapshots.save_from_state(services.state_store)
                 event_type = (
                     EventType.REPEATED_FAILURES
                     if _has_check(runtime_decision.checks, "repeated_failures")
@@ -178,6 +182,7 @@ async def market_rotation_loop(
             f"market_rotation_failed:{reason}"
         )
         if activated:
+            await services.snapshots.save_from_state(services.state_store)
             await emit_event(
                 services,
                 BotEvent(
@@ -353,6 +358,9 @@ class BotRuntime:
             await self._services.state_store.set_kill_switch(
                 True,
                 reason="operator_emergency_halt",
+            )
+            await self._services.snapshots.save_from_state(
+                self._services.state_store
             )
             self._phase = RuntimePhase.HALTED
             if self._services.config.bot.mode == Mode.LIVE:

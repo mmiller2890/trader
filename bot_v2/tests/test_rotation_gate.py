@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from app.bootstrap import _rotation_safe
+from app.bootstrap import _position_market_end, _rotation_safe
 from config.schema import AppConfig, Mode
 from models.position import Position, PositionLifecycle
 from state.store import InMemoryStateStore
@@ -53,3 +53,47 @@ async def test_rotation_allowed_when_only_gamma_ids_differ() -> None:
 async def test_rotation_allowed_for_dust_in_ending_market() -> None:
     state = state_with_position(market_id="0xconditionabc", quantity="0.5")
     assert await _rotation_safe(state, discovered_like_market(), AppConfig()) is True
+
+
+def test_position_deadline_lookup_uses_rotator_current_market() -> None:
+    initial = discovered_like_market()
+
+    class CurrentMarket:
+        market_id = "gamma-market-456"
+        condition_id = "0xconditiondef"
+        end_at = NOW + timedelta(minutes=20)
+
+        class Up:
+            token_id = "up-token"
+
+        class Down:
+            token_id = "down-token"
+
+        up = Up()
+        down = Down()
+
+        @property
+        def asset_ids(self) -> list[str]:
+            return [self.up.token_id, self.down.token_id]
+
+    current = CurrentMarket()
+
+    class Rotator:
+        def status(self) -> object:
+            class Status:
+                current_market = current
+
+            return Status()
+
+    assert _position_market_end(
+        initial,
+        Rotator(),
+        market_id="0xconditiondef",
+        token_id="up-token",
+    ) == current.end_at
+    assert _position_market_end(
+        initial,
+        Rotator(),
+        market_id="0xconditionabc",
+        token_id="old-token",
+    ) is None

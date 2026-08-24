@@ -7,7 +7,8 @@ import pytest
 
 from clients.clob_client import ClobAdapterError
 from config.schema import Mode
-from models.order import OrderResult, OrderStatus
+from execution.tracker import OrderTracker
+from models.order import OrderResult, OrderSide, OrderStatus
 from models.position import Position, PositionLifecycle
 from state.reconciliation import ReconciliationService
 from state.store import InMemoryStateStore
@@ -97,6 +98,49 @@ def open_order(order_id: str) -> OrderResult:
     )
 
 
+def filled_remote_order(
+    order_id: str,
+    *,
+    filled: str = "1",
+    price: str = "0.40",
+    status: OrderStatus = OrderStatus.FILLED,
+) -> OrderResult:
+    return OrderResult(
+        client_order_id=order_id,
+        exchange_order_id=order_id,
+        market_id="m1",
+        token_id="t1",
+        side=OrderSide.BUY,
+        status=status,
+        accepted=True,
+        message="matched",
+        requested_size=Decimal(filled),
+        filled_size=Decimal(filled),
+        avg_fill_price=Decimal(price),
+    )
+
+
+class TerminalOrderReader(FakeOrdersReader):
+    def __init__(
+        self,
+        orders: list[OrderResult] | None = None,
+        *,
+        terminal: OrderResult,
+    ) -> None:
+        super().__init__(orders)
+        self._terminal = terminal
+
+    def get_order(
+        self,
+        order_id: str,
+        *,
+        client_order_id: str | None = None,
+    ) -> OrderResult:
+        return self._terminal.model_copy(
+            update={"client_order_id": client_order_id or order_id}
+        )
+
+
 @pytest.mark.asyncio
 async def test_remote_order_missing_locally_is_imported() -> None:
     state = InMemoryStateStore(mode=Mode.LIVE)
@@ -167,11 +211,11 @@ async def test_missing_open_order_is_resolved_by_terminal_order_poll() -> None:
             client_order_id: str | None = None,
         ) -> OrderResult:
             return local.model_copy(
-                update={
-                    "client_order_id": client_order_id or order_id,
-                    "status": OrderStatus.FILLED,
-                    "filled_size": Decimal("1"),
-                }
+                    update={
+                        "client_order_id": client_order_id or order_id,
+                        "status": OrderStatus.CANCELLED,
+                        "filled_size": Decimal("0"),
+                    }
             )
 
     service = ReconciliationService(
@@ -185,6 +229,39 @@ async def test_missing_open_order_is_resolved_by_terminal_order_poll() -> None:
     assert report.ok is True
     assert report.missing_on_remote == []
     assert await state.get_open_orders() == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_fill_poll_is_accounted_exactly_once() -> None:
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    local = open_order("client-order-0001").model_copy(
+        update={
+            "exchange_order_id": "0xexchange0001",
+            "market_id": "m1",
+            "token_id": "t1",
+            "side": OrderSide.BUY,
+        }
+    )
+    await state.set_order_status(local)
+    terminal = filled_remote_order("0xexchange0001", filled="2", price="0.40")
+    tracker = OrderTracker(state)
+    service = ReconciliationService(
+        state_store=state,
+        mode=Mode.LIVE,
+        open_orders_reader=TerminalOrderReader([], terminal=terminal),
+        apply_fill=tracker.handle_order_result,
+    )
+
+    first = await service.reconcile_runtime()
+    second = await service.reconcile_runtime()
+
+    assert first.ok is True
+    assert second.ok is True
+    position = await state.get_position("m1", "t1")
+    assert position is not None
+    assert position.quantity == Decimal("2")
+    checkpoints = await state.get_fill_checkpoints()
+    assert len(checkpoints) == 1
 
 
 @pytest.mark.asyncio
@@ -225,12 +302,77 @@ async def test_empty_local_positions_adopt_remote_account_truth() -> None:
         open_orders_reader=FakeOrdersReader([]),
         positions_reader=reader,
         funder_address="0xfunder",
+        now=lambda: NOW,
     )
 
     report = await service.reconcile_startup()
 
     assert report.ok is True
     assert await state.get_positions() == [remote]
+    lifecycle = await state.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    assert lifecycle.opened_at == NOW
+
+
+@pytest.mark.asyncio
+async def test_adopted_position_receives_known_market_deadline() -> None:
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    remote = Position(
+        market_id="condition-1",
+        token_id="token-1",
+        quantity=Decimal("2"),
+        average_entry_price=Decimal("0.50"),
+    )
+    end_at = NOW + timedelta(minutes=15)
+    service = ReconciliationService(
+        state_store=state,
+        mode=Mode.LIVE,
+        open_orders_reader=FakeOrdersReader([]),
+        positions_reader=FakePositionsReader([remote]),
+        now=lambda: NOW,
+        market_end_lookup=lambda market_id, token_id: (
+            end_at
+            if (market_id, token_id) == ("condition-1", "token-1")
+            else None
+        ),
+        require_position_market_end=True,
+        min_order_size=Decimal("1"),
+    )
+
+    report = await service.reconcile_startup()
+
+    assert report.ok is True
+    lifecycle = await state.get_position_lifecycle("condition-1", "token-1")
+    assert lifecycle is not None
+    assert lifecycle.market_end_at == end_at
+
+
+@pytest.mark.asyncio
+async def test_unknown_adopted_market_window_blocks_live_reconciliation() -> None:
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    remote = Position(
+        market_id="old-condition",
+        token_id="old-token",
+        quantity=Decimal("2"),
+        average_entry_price=Decimal("0.50"),
+    )
+    service = ReconciliationService(
+        state_store=state,
+        mode=Mode.LIVE,
+        open_orders_reader=FakeOrdersReader([]),
+        positions_reader=FakePositionsReader([remote]),
+        now=lambda: NOW,
+        market_end_lookup=lambda market_id, token_id: None,
+        require_position_market_end=True,
+        min_order_size=Decimal("1"),
+    )
+
+    report = await service.reconcile_startup()
+
+    assert report.ok is False
+    assert report.errors == [
+        "position_market_window_unknown:old-condition:old-token"
+    ]
 
 
 @pytest.mark.asyncio
@@ -396,3 +538,79 @@ async def test_matching_remote_quantity_clears_confirmation_deadline() -> None:
     assert report.ok is True
     assert report.deferred_positions == []
     assert (await state.get_position_lifecycle("m1", "t1")).confirmation_deadline is None
+
+
+@pytest.mark.asyncio
+async def test_delayed_remote_fill_is_applied_to_inventory() -> None:
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    local = open_order("client-order-0001").model_copy(
+        update={"exchange_order_id": "0xexchange0001"}
+    )
+    await state.set_order_status(local)
+    tracker = OrderTracker(state)
+    applied: list[OrderResult] = []
+
+    async def apply_fill(result: OrderResult) -> None:
+        outcome = await tracker.handle_order_result(result)
+        if outcome.fill_applied:
+            applied.append(result)
+
+    service = ReconciliationService(
+        state_store=state,
+        mode=Mode.LIVE,
+        open_orders_reader=TerminalOrderReader(
+            [], terminal=filled_remote_order("0xexchange0001", filled="2", price="0.40")
+        ),
+        apply_fill=apply_fill,
+    )
+    report = await service.reconcile_startup()
+
+    assert report.ok is True
+    assert len(applied) == 1
+    position = await state.get_position("m1", "t1")
+    assert position is not None and position.quantity == Decimal("2")
+    assert len(await state.get_fill_checkpoints()) == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_partial_fill_applies_once_across_cycles() -> None:
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    remote = filled_remote_order(
+        "0xfill00001", filled="3", price="0.50", status=OrderStatus.PARTIALLY_FILLED
+    )
+    applied: list[OrderResult] = []
+
+    async def apply_fill(result: OrderResult) -> None:
+        outcome = await OrderTracker(state).handle_order_result(result)
+        if outcome.fill_applied:
+            applied.append(result)
+
+    service = ReconciliationService(
+        state_store=state,
+        mode=Mode.LIVE,
+        open_orders_reader=FakeOrdersReader([remote]),
+        apply_fill=apply_fill,
+        now=lambda: NOW,
+    )
+    await service.reconcile_runtime()
+    assert len(applied) == 1
+
+    await service.reconcile_runtime()
+    assert len(applied) == 1
+    assert (await state.get_position("m1", "t1")).quantity == Decimal("3")
+
+
+@pytest.mark.asyncio
+async def test_missing_fill_recorder_blocks_live_when_fills_exist() -> None:
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    remote = filled_remote_order("0xfill00001", filled="3", price="0.50")
+    service = ReconciliationService(
+        state_store=state,
+        mode=Mode.LIVE,
+        open_orders_reader=FakeOrdersReader([remote]),
+    )
+    report = await service.reconcile_runtime()
+
+    assert report.ok is False
+    assert "fill_recorder_not_configured" in report.errors
+    assert await state.get_positions() == []

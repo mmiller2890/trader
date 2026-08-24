@@ -111,17 +111,20 @@ class MarketDataClient:
                 },
             )
             return
+        grouped: dict[str, list[dict[str, object]]] = {}
         for change in changes:
             if not isinstance(change, dict):
                 continue
             asset_id = str(change.get("asset_id") or "")
             if not asset_id:
                 continue
+            grouped.setdefault(asset_id, []).append(change)
+        for asset_id, asset_changes in grouped.items():
             book = self._books.get((str(market_id), asset_id))
             if book is None:
                 continue
             try:
-                book.apply_price_change(change, message["timestamp"])
+                book.apply_price_changes(asset_changes, message["timestamp"])
             except (KeyError, ValueError) as exc:
                 logger.warning(
                     "malformed price_change ignored",
@@ -154,13 +157,14 @@ class MarketDataClient:
             )
 
     async def _handle_market_resolved(self, message: dict) -> None:
-        market_id, token_id = self._ids(message)
-        if market_id is None or token_id is None:
+        market_id = str(message.get("market") or message.get("market_id") or "")
+        asset_ids = message.get("assets_ids")
+        if not market_id or not isinstance(asset_ids, list):
             return
-        book = self._books.get((market_id, token_id))
-        if book is None:
-            return
-        book.resolved = True
+        resolved_assets = {str(asset_id) for asset_id in asset_ids}
+        for (book_market_id, token_id), book in self._books.items():
+            if book_market_id == market_id and token_id in resolved_assets:
+                book.resolved = True
 
     async def _handle_last_trade_price(self, message: dict) -> None:
         market_id, token_id = self._ids(message)

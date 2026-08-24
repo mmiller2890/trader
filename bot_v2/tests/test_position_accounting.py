@@ -125,6 +125,44 @@ async def test_sell_to_zero_closes_position_and_retains_close_record() -> None:
 
 
 @pytest.mark.asyncio
+async def test_buy_after_close_creates_fresh_active_lifecycle() -> None:
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    await state.apply_confirmed_fill(
+        filled_result("0xbuyorder001", filled="2", price="0.40"),
+        **APPLY_ARGS,
+    )
+    await state.apply_confirmed_fill(
+        filled_result(
+            "0xsellorder01",
+            filled="2",
+            price="0.60",
+            side=OrderSide.SELL,
+        ),
+        **APPLY_ARGS,
+    )
+    reopened_at = NOW + timedelta(minutes=5)
+    await state.apply_confirmed_fill(
+        filled_result("0xbuyorder002", filled="1", price="0.50"),
+        market_end_at=END_AT,
+        confirmed_at=reopened_at,
+        confirmation_grace_seconds=30,
+    )
+
+    lifecycle = await state.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    assert lifecycle.opened_at == reopened_at
+    assert lifecycle.closed_at is None
+    assert lifecycle.closed_exit_price is None
+    assert lifecycle.closed_realized_pnl is None
+    assert lifecycle.last_exit_reason is None
+    assert lifecycle.pending_exit_client_order_id is None
+    assert lifecycle.exit_attempt_count == 0
+    closed = await state.get_closed_position_lifecycles()
+    assert len(closed) == 1
+    assert closed[0].closed_realized_pnl == Decimal("0.40")
+
+
+@pytest.mark.asyncio
 async def test_cumulative_size_regression_is_rejected() -> None:
     state = InMemoryStateStore(mode=Mode.LIVE)
     await state.apply_confirmed_fill(partial_result("2", "0.40"), **APPLY_ARGS)

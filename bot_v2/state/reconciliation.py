@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Protocol
 
 from config.schema import Mode
@@ -37,15 +38,6 @@ class PositionsReader(Protocol):
         """Return current positions for a user address."""
 
 
-class PositionMergeResult(BaseModel):
-    """Outcome of merging remote positions into local confirmed state."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    deferred_keys: list[str] = Field(default_factory=list)
-    expired_keys: list[str] = Field(default_factory=list)
-
-
 class ReconciliationReport(BaseModel):
     """Startup reconciliation result."""
 
@@ -74,6 +66,10 @@ class ReconciliationService:
         positions_reader: PositionsReader | None = None,
         funder_address: str | None = None,
         now: Callable[[], datetime] = utc_now,
+        apply_fill: Callable[[OrderResult], Awaitable[object]] | None = None,
+        market_end_lookup: Callable[[str, str], datetime | None] | None = None,
+        require_position_market_end: bool = False,
+        min_order_size: Decimal = Decimal("1"),
     ) -> None:
         self._state_store = state_store
         self._mode = mode
@@ -81,6 +77,10 @@ class ReconciliationService:
         self._positions_reader = positions_reader
         self._funder_address = funder_address
         self._now = now
+        self._apply_fill = apply_fill
+        self._market_end_lookup = market_end_lookup
+        self._require_position_market_end = require_position_market_end
+        self._min_order_size = min_order_size
 
     async def reconcile_startup(self) -> ReconciliationReport:
         """Run conservative startup reconciliation."""
@@ -143,10 +143,18 @@ class ReconciliationService:
             if latest.status in {
                 OrderStatus.CANCELLED,
                 OrderStatus.FILLED,
+                OrderStatus.PARTIALLY_FILLED,
                 OrderStatus.REJECTED,
                 OrderStatus.FAILED,
             }:
-                await self._state_store.set_order_status(latest)
+                accounted = await self._apply_confirmed_fill(latest, errors)
+                if latest.status not in {
+                    OrderStatus.FILLED,
+                    OrderStatus.PARTIALLY_FILLED,
+                } or accounted:
+                    await self._state_store.set_order_status(latest)
+                else:
+                    unresolved_missing.append(order_id)
             else:
                 unresolved_missing.append(order_id)
         missing_on_remote = unresolved_missing
@@ -161,6 +169,13 @@ class ReconciliationService:
                 if local_order is not None
                 else remote_order
             )
+            if reconciled_order.status in {
+                OrderStatus.FILLED,
+                OrderStatus.PARTIALLY_FILLED,
+            } and reconciled_order.filled_size > 0:
+                accounted = await self._apply_confirmed_fill(reconciled_order, errors)
+                if not accounted:
+                    continue
             await self._state_store.set_order_status(reconciled_order)
 
         deferred_positions: list[str] = []
@@ -178,16 +193,26 @@ class ReconciliationService:
                 )
                 remote_positions = []
             local_positions = await self._state_store.get_positions()
-            if positions_fetch_succeeded and authoritative_positions:
+            if positions_fetch_succeeded and (
+                authoritative_positions or not local_positions
+            ):
                 merge = await self._state_store.merge_authoritative_positions(
                     remote_positions,
                     now=self._now(),
+                    market_end_lookup=self._market_end_lookup,
                 )
                 deferred_positions = merge.deferred_keys
                 for key in merge.expired_keys:
                     errors.append(f"position_confirmation_timeout:{key}")
-            elif positions_fetch_succeeded and not local_positions:
-                await self._state_store.replace_positions(remote_positions)
+                if self._require_position_market_end:
+                    sellable = {
+                        f"{position.market_id}:{position.token_id}"
+                        for position in remote_positions
+                        if position.quantity >= self._min_order_size
+                    }
+                    for key in merge.unknown_market_keys:
+                        if key in sellable:
+                            errors.append(f"position_market_window_unknown:{key}")
             elif positions_fetch_succeeded and not self._positions_match(
                 local_positions,
                 remote_positions,
@@ -226,6 +251,32 @@ class ReconciliationService:
             deferred_positions=deferred_positions,
             errors=errors,
         )
+
+    async def _apply_confirmed_fill(
+        self,
+        result: OrderResult,
+        errors: list[str],
+    ) -> bool:
+        """Route one confirmed exchange fill into position accounting."""
+
+        if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED}:
+            return True
+        if result.filled_size <= 0 or result.avg_fill_price is None:
+            errors.append("confirmed_fill_missing_accounting_fields")
+            return False
+        if self._apply_fill is None:
+            errors.append("fill_recorder_not_configured")
+            return False
+        try:
+            outcome = await self._apply_fill(result)
+        except Exception as exc:
+            errors.append(f"fill_application_failed:{type(exc).__name__}")
+            return False
+        accounting_error = getattr(outcome, "accounting_error", None)
+        if accounting_error is not None:
+            errors.append(f"fill_accounting_error:{accounting_error}")
+            return False
+        return True
 
     def _positions_match(
         self,

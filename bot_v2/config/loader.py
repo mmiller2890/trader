@@ -76,6 +76,50 @@ def _env_secrets_payload() -> dict[str, Any]:
     return {key: value for key, value in raw.items() if value is not None}
 
 
+def _validate_operator_overlay(payload: dict[str, Any]) -> None:
+    allowed = {
+        "bot": {"mode"},
+        "execution": {"allow_live_trading", "dry_run_force"},
+        "market_data": {"subscribed_token_ids"},
+        "spike_strategy": {"target_token_ids"},
+    }
+    extra_sections = set(payload) - set(allowed)
+    if extra_sections:
+        raise ConfigError(
+            f"operator config contains forbidden sections: {sorted(extra_sections)}"
+        )
+    for section, values in payload.items():
+        if not isinstance(values, dict):
+            raise ConfigError(f"operator config section must be a mapping: {section}")
+        extra_keys = set(values) - allowed[section]
+        if extra_keys:
+            raise ConfigError(
+                f"operator config contains forbidden keys in {section}: {sorted(extra_keys)}"
+            )
+
+    has_mode_bundle = "bot" in payload or "execution" in payload
+    if has_mode_bundle:
+        bot = payload.get("bot")
+        execution = payload.get("execution")
+        if (
+            not isinstance(bot, dict)
+            or set(bot) != {"mode"}
+            or not isinstance(execution, dict)
+            or set(execution) != {"allow_live_trading", "dry_run_force"}
+        ):
+            raise ConfigError("operator config requires a complete mode bundle")
+        bundle = (
+            bot["mode"],
+            execution["allow_live_trading"],
+            execution["dry_run_force"],
+        )
+        if bundle not in {
+            ("live", True, False),
+            ("dry_run", False, True),
+        }:
+            raise ConfigError("operator config contains an invalid mode bundle")
+
+
 def load_config(config_dir: str | Path | None = None) -> AppConfig:
     """Load app configuration from YAML fragments and environment variables."""
 
@@ -90,6 +134,9 @@ def load_config(config_dir: str | Path | None = None) -> AppConfig:
     merged = deepcopy(base_config)
     merged = _deep_merge(merged, _wrap_fragment("risk", risk_config))
     merged = _deep_merge(merged, _wrap_fragment("spike_strategy", spike_config))
+    operator_config = _read_yaml(config_root / "operator.yaml", required=False)
+    _validate_operator_overlay(operator_config)
+    merged = _deep_merge(merged, operator_config)
 
     existing_secrets = merged.get("secrets", {})
     if existing_secrets and not isinstance(existing_secrets, dict):

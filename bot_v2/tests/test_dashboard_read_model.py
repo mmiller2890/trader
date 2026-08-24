@@ -207,6 +207,85 @@ async def test_stopped_read_model_exposes_last_latched_halt_reason(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_total_pnl_retains_closed_realized_result(
+    tmp_path: Path,
+) -> None:
+    config = AppConfig()
+    state = InMemoryStateStore(mode=Mode.DRY_RUN)
+    buy = OrderResult(
+        client_order_id="buy-order-0001",
+        market_id="m1",
+        token_id="t1",
+        side="buy",
+        status=OrderStatus.SIMULATED,
+        accepted=True,
+        requested_size=Decimal("2"),
+        filled_size=Decimal("2"),
+        avg_fill_price=Decimal("0.40"),
+    )
+    sell = buy.model_copy(
+        update={
+            "client_order_id": "sell-order-0001",
+            "side": "sell",
+            "avg_fill_price": Decimal("0.60"),
+        }
+    )
+    apply_args = {
+        "market_end_at": None,
+        "confirmed_at": NOW,
+        "confirmation_grace_seconds": 30,
+    }
+    await state.apply_confirmed_fill(buy, **apply_args)
+    await state.apply_confirmed_fill(sell, **apply_args)
+    runtime = BotRuntime(config_loader=lambda _: config)
+    runtime._phase = RuntimePhase.RUNNING
+    runtime._mode = Mode.DRY_RUN
+    runtime._services = SimpleNamespace(state_store=state, config=config)
+
+    model = await DashboardReadModel(
+        config=config,
+        runtime=runtime,
+        data_dir=tmp_path,
+        now=lambda: NOW,
+    ).build()
+
+    assert model.total_pnl == Decimal("0.40")
+    assert len(model.closed_positions) == 1
+
+
+@pytest.mark.asyncio
+async def test_historical_dashboard_restores_closed_position_history(
+    tmp_path: Path,
+) -> None:
+    config = AppConfig()
+    state = InMemoryStateStore(mode=Mode.DRY_RUN)
+    lifecycle = PositionLifecycle(
+        market_id="m1",
+        token_id="t1",
+        opened_at=NOW - timedelta(seconds=30),
+        last_fill_at=NOW,
+        closed_at=NOW,
+        closed_exit_price=Decimal("0.60"),
+        closed_realized_pnl=Decimal("0.40"),
+    )
+    await state.restore_position_lifecycle(lifecycle)
+    await state.restore_closed_position_lifecycle(lifecycle)
+    await SnapshotStore(
+        tmp_path / "snapshots" / "state.json"
+    ).save_from_state(state)
+
+    model = await DashboardReadModel(
+        config=config,
+        runtime=BotRuntime(config_loader=lambda _: config),
+        data_dir=tmp_path,
+        now=lambda: NOW,
+    ).build()
+
+    assert len(model.closed_positions) == 1
+    assert model.closed_positions[0].closed_realized_pnl == Decimal("0.40")
+
+
+@pytest.mark.asyncio
 async def test_live_read_model_exposes_healthy_automatic_market_without_secrets(
     tmp_path: Path,
 ) -> None:

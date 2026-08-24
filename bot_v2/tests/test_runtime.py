@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,7 @@ from app.runtime import (
 )
 from app.shutdown import shutdown_app
 from config.schema import AppConfig, Mode
+from models.order import OrderResult, OrderSide, OrderStatus
 from models.risk import RiskAction, RiskCheckResult, RiskDecision
 from risk.circuit_breaker import CircuitBreaker
 from risk.runtime import RuntimeRiskEngine
@@ -79,6 +81,9 @@ def fake_services(
         ws_manager=FakeWebSocketManager(),
         submitter=FakeSubmitter(calls, fail=cancel_fails),
         market_rotator=market_rotator,
+        snapshots=SimpleNamespace(
+            save_from_state=lambda state: asyncio.sleep(0)
+        ),
     )
 
 
@@ -231,6 +236,7 @@ async def test_shutdown_always_stops_websocket_when_snapshot_fails() -> None:
 @pytest.mark.asyncio
 async def test_unexpected_rotation_failure_marks_status_failed() -> None:
     calls: list[str] = []
+    snapshots: list[bool] = []
 
     class FailingRotator:
         def __init__(self) -> None:
@@ -250,17 +256,23 @@ async def test_unexpected_rotation_failure_marks_status_failed() -> None:
         async def publish(self, event: object) -> None:
             return None
 
+    class Snapshots:
+        async def save_from_state(self, state: InMemoryStateStore) -> None:
+            snapshots.append(await state.is_kill_switch_active())
+
     rotator = FailingRotator()
     services = fake_services(Mode.DRY_RUN, calls)
     services.market_rotator = rotator
     services.journal = Journal()
     services.event_bus = EventBus()
+    services.snapshots = Snapshots()
 
     await market_rotation_loop(services, asyncio.Event())
 
     assert rotator.failed_reason == "RuntimeError"
     assert calls == ["RuntimeError"]
     assert await services.state_store.is_kill_switch_active() is True
+    assert snapshots == [True]
 
 
 @pytest.mark.asyncio
@@ -542,6 +554,55 @@ async def test_runtime_risk_rejects_stale_transport_despite_recent_snapshot() ->
 
 
 @pytest.mark.asyncio
+async def test_runtime_daily_loss_includes_fully_closed_positions() -> None:
+    state = InMemoryStateStore(mode=Mode.DRY_RUN)
+    now = datetime.now(tz=UTC)
+    buy = OrderResult(
+        client_order_id="buy-order-0001",
+        market_id="m1",
+        token_id="t1",
+        side=OrderSide.BUY,
+        status=OrderStatus.SIMULATED,
+        accepted=True,
+        requested_size=Decimal("10"),
+        filled_size=Decimal("10"),
+        avg_fill_price=Decimal("0.90"),
+    )
+    sell = buy.model_copy(
+        update={
+            "client_order_id": "sell-order-0001",
+            "side": OrderSide.SELL,
+            "avg_fill_price": Decimal("0.10"),
+        }
+    )
+    apply_args = {
+        "market_end_at": None,
+        "confirmed_at": now,
+        "confirmation_grace_seconds": 30,
+    }
+    await state.apply_confirmed_fill(buy, **apply_args)
+    await state.apply_confirmed_fill(sell, **apply_args)
+    config = AppConfig(risk={"max_daily_loss": "1"})
+    engine = RuntimeRiskEngine(
+        config=config,
+        state_store=state,
+        circuit_breaker=CircuitBreaker(
+            failure_threshold=3,
+            window_seconds=60,
+            cooldown_seconds=60,
+        ),
+    )
+
+    decision = await engine.evaluate_runtime()
+
+    assert decision.approved is False
+    daily_loss = next(
+        check for check in decision.checks if check.check_name == "daily_loss"
+    )
+    assert daily_loss.reason == "daily_loss_limit:-8.00<-1"
+
+
+@pytest.mark.asyncio
 async def test_housekeeping_routes_timer_exits_before_reconciliation() -> None:
     stop_event = asyncio.Event()
     routed: list[str] = []
@@ -606,6 +667,7 @@ async def test_housekeeping_emits_and_cancels_once_for_latched_runtime_halt() ->
     stop_event = asyncio.Event()
     journal_events: list[object] = []
     cancel_calls: list[str] = []
+    snapshot_calls: list[str] = []
 
     class Reconciliation:
         async def reconcile_runtime(self) -> SimpleNamespace:
@@ -664,7 +726,11 @@ async def test_housekeeping_emits_and_cancels_once_for_latched_runtime_halt() ->
         submitter=Submitter(),
         strategy=Strategy(),
         router=SimpleNamespace(route_signal=lambda signal: asyncio.sleep(0)),
-        snapshots=SimpleNamespace(save_from_state=lambda state: asyncio.sleep(0)),
+        snapshots=SimpleNamespace(
+            save_from_state=lambda state: (
+                snapshot_calls.append("save") or asyncio.sleep(0)
+            )
+        ),
     )
 
     await housekeeping_loop(services, stop_event)
@@ -675,6 +741,7 @@ async def test_housekeeping_emits_and_cancels_once_for_latched_runtime_halt() ->
     ]
     assert len(halt_events) == 1
     assert cancel_calls == ["cancel"]
+    assert snapshot_calls == ["save"]
     assert await services.state_store.get_kill_switch_reason() == (
         "transport_heartbeat_stale"
     )

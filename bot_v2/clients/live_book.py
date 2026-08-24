@@ -42,24 +42,35 @@ class LiveBookState:
     def apply_price_change(self, change: dict[str, object], timestamp: object) -> None:
         """Apply one price-change delta atomically."""
 
-        side = str(change.get("side") or "").upper()
-        if side not in {"BUY", "SELL"}:
-            raise ValueError(f"price change has invalid side: {side!r}")
-        try:
-            price = Decimal(str(change["price"]))
-            size = Decimal(str(change["size"]))
-        except (KeyError, ValueError, TypeError) as exc:
-            raise ValueError(f"price change has invalid price/size: {exc}") from exc
-        if size < 0:
-            raise ValueError(f"price change has negative size: {size}")
+        self.apply_price_changes([change], timestamp)
+
+    def apply_price_changes(
+        self,
+        changes: list[dict[str, object]],
+        timestamp: object,
+    ) -> None:
+        """Apply all deltas from one WebSocket frame as one book transition."""
 
         candidate_bids = dict(self.bids)
         candidate_asks = dict(self.asks)
-        target = candidate_bids if side == "BUY" else candidate_asks
-        if size > 0:
-            target[price] = size
-        else:
-            target.pop(price, None)
+        for change in changes:
+            side = str(change.get("side") or "").upper()
+            if side not in {"BUY", "SELL"}:
+                raise ValueError(f"price change has invalid side: {side!r}")
+            try:
+                price = Decimal(str(change["price"]))
+                size = Decimal(str(change["size"]))
+            except (KeyError, ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"price change has invalid price/size: {exc}"
+                ) from exc
+            if size < 0:
+                raise ValueError(f"price change has negative size: {size}")
+            target = candidate_bids if side == "BUY" else candidate_asks
+            if size > 0:
+                target[price] = size
+            else:
+                target.pop(price, None)
         if candidate_bids and candidate_asks and max(candidate_bids) > min(candidate_asks):
             raise ValueError("crossed book: best bid exceeds best ask")
         source_ts = _timestamp_to_datetime(timestamp)

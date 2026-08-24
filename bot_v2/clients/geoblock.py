@@ -39,9 +39,15 @@ class GeoblockClient:
             response = self._transport.get(self._config.exchange.geoblock_url)
             response.raise_for_status()
         except httpx.TimeoutException as exc:
-            return GeoblockStatus(allowed=False, reason=f"geoblock_timeout:{exc}")
+            return GeoblockStatus(
+                allowed=False,
+                reason=f"geoblock_timeout:{type(exc).__name__}",
+            )
         except httpx.HTTPError as exc:
-            return GeoblockStatus(allowed=False, reason=f"geoblock_http_error:{exc}")
+            return GeoblockStatus(
+                allowed=False,
+                reason=f"geoblock_http_error:{type(exc).__name__}",
+            )
 
         try:
             payload = response.json()

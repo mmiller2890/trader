@@ -55,6 +55,7 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
         checks.append(await self._kill_switch_check())
         checks.append(self._stale_data_check(snapshot))
         checks.append(self._reduce_only_check(signal))
+        checks.append(await self._pending_exit_check(signal))
         checks.append(await self._single_position_check(signal, proposed_size))
         checks.append(
             await self._total_exposure_check(
@@ -128,6 +129,32 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
             check_name="reduce_only",
             passed=True,
             reason="reduce_only_valid",
+        )
+
+    async def _pending_exit_check(self, signal: TradeSignal) -> RiskCheckResult:
+        if signal.side.value != "buy":
+            return RiskCheckResult(
+                check_name="pending_exit",
+                passed=True,
+                reason="entry_not_requested",
+            )
+        lifecycle = await self._state_store.get_position_lifecycle(
+            signal.market_id,
+            signal.token_id,
+        )
+        pending = (
+            lifecycle.pending_exit_client_order_id
+            if lifecycle is not None
+            else None
+        )
+        return RiskCheckResult(
+            check_name="pending_exit",
+            passed=pending is None,
+            reason=(
+                "no_pending_exit"
+                if pending is None
+                else f"entry_blocked_by_pending_exit:{pending}"
+            ),
         )
 
     async def _single_position_check(

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from decimal import Decimal
+from time import monotonic as monotonic_clock
 
 from config.schema import AppConfig
 from models.risk import RiskAction, RiskCheckResult, RiskDecision
@@ -20,10 +22,13 @@ class RuntimeRiskEngine(RuntimeRiskPolicy):
         config: AppConfig,
         state_store: InMemoryStateStore,
         circuit_breaker: CircuitBreaker,
+        monotonic: Callable[[], float] = monotonic_clock,
     ) -> None:
         self._config = config
         self._state_store = state_store
         self._circuit_breaker = circuit_breaker
+        self._monotonic = monotonic
+        self._started_at = monotonic()
 
     async def evaluate_runtime(self) -> RiskDecision:
         checks = [
@@ -48,7 +53,12 @@ class RuntimeRiskEngine(RuntimeRiskPolicy):
 
     async def _daily_loss_check(self) -> RiskCheckResult:
         positions = await self._state_store.get_positions()
-        pnl = sum((position.realized_pnl + position.unrealized_pnl for position in positions), start=Decimal("0"))
+        realized = await self._state_store.get_daily_realized_pnl()
+        unrealized = sum(
+            (position.unrealized_pnl for position in positions),
+            start=Decimal("0"),
+        )
+        pnl = realized + unrealized
         allowed_loss = self._config.risk.max_daily_loss
         return RiskCheckResult(
             check_name="daily_loss",
@@ -57,14 +67,28 @@ class RuntimeRiskEngine(RuntimeRiskPolicy):
         )
 
     async def _heartbeat_check(self) -> RiskCheckResult:
+        heartbeat = await self._state_store.get_heartbeat("market_transport")
+        if heartbeat is None and (
+            self._monotonic() - self._started_at
+            < self._config.market_data.heartbeat_timeout_seconds
+        ):
+            return RiskCheckResult(
+                check_name="stale_heartbeat",
+                passed=True,
+                reason="heartbeat_startup_grace",
+            )
         stale = await self._state_store.is_heartbeat_stale(
-            "market_data",
+            "market_transport",
             max_age_seconds=self._config.market_data.heartbeat_timeout_seconds,
         )
         return RiskCheckResult(
             check_name="stale_heartbeat",
             passed=not stale,
-            reason="heartbeat_fresh" if not stale else "heartbeat_stale",
+            reason=(
+                "transport_heartbeat_fresh"
+                if not stale
+                else "transport_heartbeat_stale"
+            ),
         )
 
     def _repeated_failure_check(self) -> RiskCheckResult:

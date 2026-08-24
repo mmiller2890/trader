@@ -67,7 +67,7 @@ def test_production_yaml_uses_minimal_fok_execution() -> None:
     assert config.execution.time_in_force == TimeInForce.FOK
     assert config.execution.min_live_buy_notional == Decimal("1")
     assert config.execution.max_live_order_notional == Decimal("1.01")
-    assert config.risk.max_data_staleness_seconds == 1
+    assert config.risk.max_data_staleness_seconds == 15
     assert config.market_data.heartbeat_timeout_seconds == 30
     assert config.market_data.automatic_market.enabled is True
     assert config.market_data.automatic_market.asset == "btc"

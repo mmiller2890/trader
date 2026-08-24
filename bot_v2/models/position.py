@@ -106,3 +106,4 @@ class PositionMergeResult(BaseModel):
 
     deferred_keys: list[str] = Field(default_factory=list)
     expired_keys: list[str] = Field(default_factory=list)
+    unknown_market_keys: list[str] = Field(default_factory=list)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -56,6 +57,7 @@ class InMemoryStateStore:
         self._fill_checkpoints: dict[str, FillCheckpoint] = {}
         self._lifecycles: dict[MarketTokenKey, PositionLifecycle] = {}
         self._closed_lifecycles: list[PositionLifecycle] = []
+        self._realized_pnl_by_day: dict[str, Decimal] = {}
 
     @property
     def mode(self) -> Mode:
@@ -185,6 +187,7 @@ class InMemoryStateStore:
         remote: list[Position],
         *,
         now: datetime,
+        market_end_lookup: Callable[[str, str], datetime | None] | None = None,
     ) -> PositionMergeResult:
         """Merge remote truth while preserving pending confirmed local fills."""
 
@@ -207,16 +210,36 @@ class InMemoryStateStore:
                 )
                 if local_quantity == remote_quantity:
                     lifecycle = self._lifecycles.get(key)
-                    if lifecycle is not None and lifecycle.confirmation_deadline is not None:
-                        self._lifecycles[key] = lifecycle.model_copy(
-                            update={"confirmation_deadline": None}
-                        )
                     if remote_position is not None:
                         self._positions[key] = remote_position
+                        self._lifecycles[key] = self._adopt_lifecycle_locked(
+                            remote_position,
+                            lifecycle=lifecycle,
+                            now=now,
+                            market_end_lookup=market_end_lookup,
+                        )
                     else:
                         self._positions.pop(key, None)
+                        if lifecycle is not None and lifecycle.confirmation_deadline is not None:
+                            self._lifecycles[key] = lifecycle.model_copy(
+                                update={"confirmation_deadline": None}
+                            )
                     continue
                 lifecycle = self._lifecycles.get(key)
+                if (
+                    local is None
+                    and remote_position is not None
+                    and lifecycle is not None
+                    and lifecycle.closed_at is None
+                ):
+                    self._positions[key] = remote_position
+                    self._lifecycles[key] = self._adopt_lifecycle_locked(
+                        remote_position,
+                        lifecycle=lifecycle,
+                        now=now,
+                        market_end_lookup=market_end_lookup,
+                    )
+                    continue
                 if lifecycle is not None and lifecycle.confirmation_deadline is not None:
                     if now < lifecycle.confirmation_deadline:
                         deferred.append(f"{key[0]}:{key[1]}")
@@ -227,12 +250,60 @@ class InMemoryStateStore:
                     )
                 if remote_position is not None:
                     self._positions[key] = remote_position
+                    self._lifecycles[key] = self._adopt_lifecycle_locked(
+                        remote_position,
+                        lifecycle=self._lifecycles.get(key),
+                        now=now,
+                        market_end_lookup=market_end_lookup,
+                    )
                 else:
                     self._positions.pop(key, None)
+            unknown_market = [
+                f"{position.market_id}:{position.token_id}"
+                for position in remote
+                if position.quantity > 0
+                and (
+                    self._lifecycles.get((position.market_id, position.token_id))
+                    is None
+                    or self._lifecycles[
+                        (position.market_id, position.token_id)
+                    ].market_end_at
+                    is None
+                )
+            ] if market_end_lookup is not None else []
             return PositionMergeResult(
                 deferred_keys=deferred,
                 expired_keys=expired,
+                unknown_market_keys=unknown_market,
             )
+
+    def _adopt_lifecycle_locked(
+        self,
+        position: Position,
+        *,
+        lifecycle: PositionLifecycle | None,
+        now: datetime,
+        market_end_lookup: Callable[[str, str], datetime | None] | None,
+    ) -> PositionLifecycle:
+        market_end_at = (
+            market_end_lookup(position.market_id, position.token_id)
+            if market_end_lookup is not None
+            else None
+        )
+        if lifecycle is None or lifecycle.closed_at is not None:
+            return PositionLifecycle(
+                market_id=position.market_id,
+                token_id=position.token_id,
+                opened_at=now,
+                last_fill_at=now,
+                market_end_at=market_end_at,
+            )
+        return lifecycle.model_copy(
+            update={
+                "confirmation_deadline": None,
+                "market_end_at": market_end_at or lifecycle.market_end_at,
+            }
+        )
 
     async def get_position(self, market_id: str, token_id: str) -> Position | None:
         """Get position by market token."""
@@ -323,12 +394,14 @@ class InMemoryStateStore:
                 else Decimal("0")
             )
             new_realized = realized_pnl
+            realized_delta = Decimal("0")
         else:
             if delta_size > quantity:
                 raise PositionAccountingError("sell_exceeds_inventory")
             new_quantity = quantity - delta_size
             new_entry_price = entry_price if new_quantity != 0 else Decimal("0")
-            new_realized = realized_pnl + (delta_price - entry_price) * delta_size
+            realized_delta = (delta_price - entry_price) * delta_size
+            new_realized = realized_pnl + realized_delta
 
         position = Position(
             market_id=result.market_id,
@@ -342,7 +415,10 @@ class InMemoryStateStore:
         )
 
         lifecycle = self._lifecycles.get(key)
-        if lifecycle is None:
+        if (
+            lifecycle is None
+            or (result.side == OrderSide.BUY and lifecycle.closed_at is not None)
+        ):
             lifecycle = PositionLifecycle(
                 market_id=result.market_id,
                 token_id=result.token_id,
@@ -395,6 +471,12 @@ class InMemoryStateStore:
             accounted_fill_notional=cumulative_notional,
             confirmed_at=confirmed_at,
         )
+        if realized_delta != 0:
+            day_key = confirmed_at.astimezone(UTC).date().isoformat()
+            self._realized_pnl_by_day[day_key] = (
+                self._realized_pnl_by_day.get(day_key, Decimal("0"))
+                + realized_delta
+            )
 
         return FillApplication(
             order_key=order_key,
@@ -441,6 +523,41 @@ class InMemoryStateStore:
 
         async with self._lock:
             self._lifecycles[(lifecycle.market_id, lifecycle.token_id)] = lifecycle
+
+    async def restore_closed_position_lifecycle(
+        self,
+        lifecycle: PositionLifecycle,
+    ) -> None:
+        """Restore one immutable closed lifecycle record from a snapshot."""
+
+        async with self._lock:
+            self._closed_lifecycles.append(lifecycle)
+            self._closed_lifecycles = self._closed_lifecycles[-20:]
+
+    async def get_realized_pnl_by_day(self) -> dict[str, Decimal]:
+        """Return confirmed realized P&L grouped by UTC trading day."""
+
+        async with self._lock:
+            return dict(self._realized_pnl_by_day)
+
+    async def get_daily_realized_pnl(
+        self,
+        at: datetime | None = None,
+    ) -> Decimal:
+        """Return confirmed realized P&L for one UTC day."""
+
+        current = (at or utc_now()).astimezone(UTC).date().isoformat()
+        async with self._lock:
+            return self._realized_pnl_by_day.get(current, Decimal("0"))
+
+    async def restore_realized_pnl_by_day(
+        self,
+        values: dict[str, Decimal],
+    ) -> None:
+        """Restore the durable UTC daily realized-P&L ledger."""
+
+        async with self._lock:
+            self._realized_pnl_by_day = dict(values)
 
     async def reserve_exit(
         self,

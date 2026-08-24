@@ -14,6 +14,7 @@ from models.order import OrderRequest, OrderResult, OrderStatus
 from models.position import ExitReason, Position, PositionLifecycle
 from models.signal import SignalSide, SignalType, TradeSignal
 from notifications.events import EventBus
+from persistence.snapshots import SnapshotStore
 from risk.pretrade import PreTradeRiskEngine
 from state.store import InMemoryStateStore
 
@@ -214,5 +215,66 @@ async def test_builder_failure_releases_exit_reservation() -> None:
 
     assert submitter.orders == []
     lifecycle = await state.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    assert lifecycle.pending_exit_client_order_id is None
+
+
+@pytest.mark.asyncio
+async def test_exit_reservation_release_is_saved_immediately(tmp_path) -> None:
+    config = live_config(cap="0.01", max_position="5")
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    now = datetime.now(tz=UTC)
+    await state.set_position(
+        Position(
+            market_id="m1",
+            token_id="t1",
+            quantity=Decimal("2"),
+            average_entry_price=Decimal("0.40"),
+        )
+    )
+    await state.restore_position_lifecycle(
+        PositionLifecycle(
+            market_id="m1",
+            token_id="t1",
+            opened_at=now,
+            last_fill_at=now,
+        )
+    )
+    await state.reserve_exit(
+        "m1",
+        "t1",
+        client_order_id="pm-bot-signal12345678",
+        reason=ExitReason.TAKE_PROFIT,
+        attempted_at=now,
+    )
+    snapshots = SnapshotStore(tmp_path / "state.json")
+    await snapshots.save_from_state(state)
+    submitter = RecordingSubmitter()
+    execution_router = ExecutionRouter(
+        config=config,
+        state_store=state,
+        risk_engine=PreTradeRiskEngine(config=config, state_store=state),
+        order_builder=OrderBuilder(config),
+        submitter=submitter,
+        tracker=OrderTracker(state, snapshots=snapshots),
+        journal=RecordingJournal(),
+        event_bus=EventBus(),
+        snapshots=snapshots,
+    )
+    exit_sell = signal().model_copy(
+        update={
+            "side": SignalSide.SELL,
+            "signal_type": SignalType.POSITION_EXIT,
+            "reduce_only": True,
+            "requested_size": Decimal("2"),
+            "reason": "position_exit:take_profit",
+        }
+    )
+
+    await execution_router.route_signal(exit_sell, snapshot=snapshot())
+
+    restored = InMemoryStateStore(mode=Mode.LIVE)
+    assert await snapshots.restore_into_state(restored) is True
+    lifecycle = await restored.get_position_lifecycle("m1", "t1")
     assert lifecycle is not None
     assert lifecycle.pending_exit_client_order_id is None

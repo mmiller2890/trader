@@ -40,6 +40,7 @@ class DataApiClient:
         params = {
             "user": user_address,
             "sizeThreshold": "0",
+            "redeemable": "false",
             "limit": "500",
             "offset": str(offset),
         }
@@ -68,6 +69,8 @@ class DataApiClient:
                         quantity=Decimal(str(row["size"])),
                         average_entry_price=Decimal(str(row["avgPrice"])),
                         mark_price=Decimal(str(row["curPrice"])),
+                        unrealized_pnl=Decimal(str(row["cashPnl"])),
+                        realized_pnl=Decimal(str(row["realizedPnl"])),
                     )
                 )
             except KeyError as exc:

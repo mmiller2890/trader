@@ -1,0 +1,9 @@
+bot:
+  mode: dry_run
+execution:
+  allow_live_trading: false
+  dry_run_force: true
+market_data:
+  subscribed_token_ids: []
+spike_strategy:
+  target_token_ids: []

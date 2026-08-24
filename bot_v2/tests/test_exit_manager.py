@@ -111,14 +111,14 @@ async def test_rejected_exit_waits_two_seconds_before_retry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_three_attempts_without_reduction_exhausts_exits() -> None:
+async def test_three_attempts_without_reduction_exhausts_exits(tmp_path: object) -> None:
     state = state_with_position(quantity="2.5", average="0.40")
     clock = {"now": NOW}
 
     def now() -> datetime:
         return clock["now"]
 
-    manager = make_exit_manager(state=state, now=now)
+    manager = make_exit_manager(state=state, now=now, tmp_path=tmp_path)
     for _ in range(3):
         signals = await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
         assert len(signals) == 1
@@ -129,6 +129,12 @@ async def test_three_attempts_without_reduction_exhausts_exits() -> None:
     lifecycle = await state.get_position_lifecycle("m1", "t1")
     assert lifecycle is not None
     assert lifecycle.exit_attempt_count == 3
+    assert await state.is_kill_switch_active() is True
+
+    restored = InMemoryStateStore(mode=Mode.DRY_RUN)
+    await SnapshotStore(tmp_path / "state.json").restore_into_state(restored)
+    assert await restored.is_kill_switch_active() is True
+    assert await restored.get_kill_switch_reason() == "exit_attempts_exhausted:m1:t1"
 
 
 @pytest.mark.asyncio
@@ -245,3 +251,74 @@ async def test_timer_exit_uses_market_end_lookup() -> None:
     )
     assert len(signals) == 1
     assert signals[0].reason == "position_exit:market_expiry"
+
+
+@pytest.mark.asyncio
+async def test_disabled_position_management_emits_no_exits() -> None:
+    state = state_with_position(quantity="2.5", average="0.40")
+    config = AppConfig(
+        bot={"mode": Mode.DRY_RUN},
+        position_management={"enabled": False},
+    )
+    manager = PositionExitManager(
+        config=config,
+        state_store=state,
+        snapshots=None,
+        policy=PositionExitPolicy(
+            config.position_management,
+            min_order_size=config.execution.min_order_size,
+            max_data_age_seconds=config.risk.max_data_staleness_seconds,
+        ),
+        now=lambda: NOW,
+    )
+    sell = TradeSignal(
+        strategy_name="spike",
+        market_id="m1",
+        token_id="t1",
+        side=SignalSide.SELL,
+        reference_price=Decimal("0.40"),
+        target_price=Decimal("0.42"),
+        observed_move_bps=100,
+        reason="spike_down",
+    )
+
+    assert await manager.on_market_update(
+        snapshot(best_bid="0.42"), market_end_at=END_AT
+    ) == []
+    assert await manager.from_strategy_signal(
+        sell, snapshot=snapshot(), market_end_at=END_AT
+    ) is None
+    assert await manager.on_timer(
+        market_end_lookup=lambda market_id: END_AT
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_non_full_liquidation_uses_bounded_default_attempt_size() -> None:
+    state = state_with_position(quantity="2.5", average="0.40")
+    config = AppConfig(
+        bot={"mode": Mode.DRY_RUN},
+        execution={"default_order_size": "1"},
+        position_management={
+            "liquidate_full_position": False,
+            "take_profit_bps": "300",
+        },
+    )
+    manager = PositionExitManager(
+        config=config,
+        state_store=state,
+        snapshots=None,
+        policy=PositionExitPolicy(
+            config.position_management,
+            min_order_size=config.execution.min_order_size,
+            max_data_age_seconds=config.risk.max_data_staleness_seconds,
+        ),
+        now=lambda: NOW,
+    )
+
+    signals = await manager.on_market_update(
+        snapshot(best_bid="0.42"), market_end_at=END_AT
+    )
+
+    assert len(signals) == 1
+    assert signals[0].requested_size == Decimal("1")

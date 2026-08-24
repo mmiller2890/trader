@@ -101,6 +101,7 @@ class DashboardReadModel:
             kill_switch_reason = await state.get_kill_switch_reason()
             lifecycles = await state.get_position_lifecycles()
             closed_lifecycles = await state.get_closed_position_lifecycles()
+            realized_pnl_by_day = await state.get_realized_pnl_by_day()
             ws_manager = getattr(services, "ws_manager", None)
             websocket_connected = bool(
                 ws_manager is not None
@@ -121,7 +122,10 @@ class DashboardReadModel:
             kill_switch = snapshot.kill_switch_active if snapshot else False
             kill_switch_reason = snapshot.kill_switch_reason if snapshot else None
             lifecycles = snapshot.position_lifecycles if snapshot else []
-            closed_lifecycles = []
+            closed_lifecycles = (
+                snapshot.closed_position_lifecycles if snapshot else []
+            )
+            realized_pnl_by_day = snapshot.realized_pnl_by_day if snapshot else {}
             websocket_connected = False
 
         now = self._now()
@@ -269,10 +273,10 @@ class DashboardReadModel:
         ]
         total_exposure = total_marked_exposure(positions)
         total_pnl = sum(
-            (
-                position.realized_pnl + position.unrealized_pnl
-                for position in positions
-            ),
+            realized_pnl_by_day.values(),
+            start=Decimal("0"),
+        ) + sum(
+            (position.unrealized_pnl for position in positions),
             start=Decimal("0"),
         )
         return DashboardState(

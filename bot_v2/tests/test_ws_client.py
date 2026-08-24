@@ -2,10 +2,32 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
 
 import pytest
 
 from clients.ws_client import WebSocketManager
+
+
+def test_ws_client_imports_without_deprecated_websockets_api() -> None:
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-W",
+            "error::DeprecationWarning",
+            "-c",
+            "import clients.ws_client",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 class FakeSocket:
@@ -28,6 +50,18 @@ class FakeSocket:
         if not self._frames:
             raise StopAsyncIteration
         return self._frames.pop(0)
+
+
+class BlockingCloseSocket(FakeSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
+
+    async def close(self) -> None:
+        self.close_started.set()
+        await self.release_close.wait()
+        self.closed = True
 
 
 class FakeConnect:
@@ -60,6 +94,7 @@ def make_manager(
     *,
     socket: FakeSocket,
     on_connect: object | None = None,
+    on_heartbeat: object | None = None,
     asset_ids: list[str] | None = None,
     ping_interval_seconds: float = 10,
 ) -> WebSocketManager:
@@ -68,6 +103,7 @@ def make_manager(
         url="wss://example.invalid/ws",
         on_message=lambda message: asyncio.sleep(0),
         on_connect=on_connect,
+        on_heartbeat=on_heartbeat,
         asset_ids=asset_ids or ["t1", "t2"],
         ping_interval_seconds=ping_interval_seconds,
         sleep=one_shot_sleep(),
@@ -77,11 +113,33 @@ def make_manager(
 
 
 @pytest.mark.asyncio
+async def test_transport_heartbeat_records_connection_and_received_frames() -> None:
+    observed: list[datetime] = []
+
+    async def record(timestamp: datetime) -> None:
+        observed.append(timestamp)
+
+    manager = make_manager(
+        socket=FakeSocket(frames=['{"event_type":"book"}']),
+        on_heartbeat=record,
+    )
+
+    await manager._consume_connection()
+
+    assert len(observed) == 2
+    assert all(timestamp.tzinfo is not None for timestamp in observed)
+
+
+@pytest.mark.asyncio
 async def test_first_sent_frame_is_market_subscription() -> None:
     socket = FakeSocket()
     manager = make_manager(socket=socket)
     await manager._consume_connection()
-    assert socket.sent[0] == json.dumps({"assets_ids": ["t1", "t2"], "type": "market"})
+    assert socket.sent[0] == json.dumps({
+        "assets_ids": ["t1", "t2"],
+        "type": "market",
+        "custom_feature_enabled": True,
+    })
 
 
 @pytest.mark.asyncio
@@ -89,7 +147,11 @@ async def test_application_ping_is_sent_every_interval() -> None:
     socket = FakeSocket(frames=["{}"])
     manager = make_manager(socket=socket, ping_interval_seconds=10)
     await manager._consume_connection()
-    assert socket.sent[0] == json.dumps({"assets_ids": ["t1", "t2"], "type": "market"})
+    assert socket.sent[0] == json.dumps({
+        "assets_ids": ["t1", "t2"],
+        "type": "market",
+        "custom_feature_enabled": True,
+    })
     assert socket.sent[1] == "PING"
 
 
@@ -99,9 +161,14 @@ async def test_subscription_is_resent_on_reconnect() -> None:
     manager = make_manager(socket=socket)
     await manager._consume_connection()
     await manager._consume_connection()
-    assert socket.sent[0] == json.dumps({"assets_ids": ["t1", "t2"], "type": "market"})
+    expected_subscription = json.dumps({
+        "assets_ids": ["t1", "t2"],
+        "type": "market",
+        "custom_feature_enabled": True,
+    })
+    assert socket.sent[0] == expected_subscription
     assert socket.sent[1] == "PING"
-    assert socket.sent[2] == json.dumps({"assets_ids": ["t1", "t2"], "type": "market"})
+    assert socket.sent[2] == expected_subscription
 
 
 def test_empty_asset_list_is_rejected_at_startup() -> None:
@@ -111,3 +178,99 @@ def test_empty_asset_list_is_rejected_at_startup() -> None:
             on_message=lambda message: asyncio.sleep(0),
             asset_ids=[],
         )
+
+
+@pytest.mark.asyncio
+async def test_replace_asset_ids_closes_socket_and_next_connection_uses_new_ids() -> None:
+    first = FakeSocket()
+    second = FakeSocket()
+    manager = make_manager(socket=first, asset_ids=["1", "2"])
+    manager._ws = first
+
+    changed = await manager.replace_asset_ids(["3", "4"])
+    manager._connect_factory = lambda url, **kwargs: FakeConnect(second)
+    await manager._consume_connection()
+
+    assert changed is True
+    assert first.closed is True
+    assert manager.asset_ids == ["3", "4"]
+    assert json.loads(second.sent[0])["assets_ids"] == ["3", "4"]
+
+
+@pytest.mark.asyncio
+async def test_replace_asset_ids_is_noop_for_unchanged_ids() -> None:
+    socket = FakeSocket()
+    manager = make_manager(socket=socket, asset_ids=["1", "2"])
+    manager._ws = socket
+
+    changed = await manager.replace_asset_ids(["1", "2"])
+
+    assert changed is False
+    assert socket.closed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asset_ids", [[], ["1", "1"], ["1", "token-x"]])
+async def test_replace_asset_ids_rejects_invalid_values(asset_ids: list[str]) -> None:
+    manager = make_manager(socket=FakeSocket(), asset_ids=["1", "2"])
+
+    with pytest.raises(ValueError, match="asset"):
+        await manager.replace_asset_ids(asset_ids)
+
+
+@pytest.mark.asyncio
+async def test_replace_asset_ids_rejects_after_stop() -> None:
+    manager = make_manager(socket=FakeSocket(), asset_ids=["1", "2"])
+    await manager.stop()
+
+    with pytest.raises(RuntimeError, match="stopping"):
+        await manager.replace_asset_ids(["3", "4"])
+
+
+@pytest.mark.asyncio
+async def test_stop_wins_when_replacement_is_closing_active_socket() -> None:
+    socket = BlockingCloseSocket()
+    manager = make_manager(socket=socket, asset_ids=["1", "2"])
+    manager._ws = socket
+
+    replace_task = asyncio.create_task(manager.replace_asset_ids(["3", "4"]))
+    await socket.close_started.wait()
+    stop_task = asyncio.create_task(manager.stop())
+    await asyncio.sleep(0)
+    socket.release_close.set()
+
+    with pytest.raises(RuntimeError, match="stopping"):
+        await replace_task
+    await stop_task
+    assert manager.asset_ids == ["1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_run_loop_blocked_in_message_handler() -> None:
+    handler_started = asyncio.Event()
+    release_handler = asyncio.Event()
+
+    async def blocked_handler(message: object) -> None:
+        handler_started.set()
+        await release_handler.wait()
+
+    socket = FakeSocket(frames=["{}"])
+    manager = WebSocketManager(
+        url="wss://example.invalid/ws",
+        on_message=blocked_handler,
+        asset_ids=["1", "2"],
+        sleep=one_shot_sleep(),
+    )
+    manager._connect_factory = lambda url, **kwargs: FakeConnect(socket)
+
+    await manager.start()
+    await handler_started.wait()
+
+    assert manager.is_connected is True
+
+    await asyncio.wait_for(manager.stop(), timeout=0.1)
+
+    assert socket.closed is True
+    assert manager._task is not None
+    assert manager._task.done() is True
+    assert manager.is_connected is False

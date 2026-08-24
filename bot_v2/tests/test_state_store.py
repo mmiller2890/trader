@@ -67,3 +67,18 @@ async def test_state_store_tracks_kill_switch_and_heartbeat() -> None:
 
     assert await state.is_kill_switch_active() is True
     assert await state.is_heartbeat_stale("market_data", max_age_seconds=60) is False
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_activation_is_atomic_and_keeps_first_reason() -> None:
+    state = InMemoryStateStore(mode=Mode.LIVE)
+
+    assert await state.activate_kill_switch("heartbeat_stale") is True
+    assert await state.activate_kill_switch("later_failure") is False
+    assert await state.is_kill_switch_active() is True
+    assert await state.get_kill_switch_reason() == "heartbeat_stale"
+
+    await state.set_kill_switch(False)
+
+    assert await state.is_kill_switch_active() is False
+    assert await state.get_kill_switch_reason() is None

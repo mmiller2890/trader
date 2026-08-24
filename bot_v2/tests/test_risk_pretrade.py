@@ -7,7 +7,7 @@ import pytest
 
 from config.schema import AppConfig, Mode
 from models.market import MarketSnapshot
-from models.position import Position
+from models.position import ExitReason, Position, PositionLifecycle
 from models.signal import SignalSide, SignalType, TradeSignal
 from risk.pretrade import PreTradeRiskEngine
 from state.store import InMemoryStateStore
@@ -117,6 +117,47 @@ async def test_pretrade_rejects_stale_market_data() -> None:
 
     assert not decision.approved
     assert decision.reason.startswith("market_data_stale")
+
+
+@pytest.mark.asyncio
+async def test_pretrade_rejects_buy_while_exit_is_pending() -> None:
+    config = AppConfig(risk={"min_top_of_book_liquidity": "1"})
+    state = InMemoryStateStore(mode=Mode.DRY_RUN)
+    now = datetime.now(tz=UTC)
+    await state.set_position(
+        Position(
+            market_id="m1",
+            token_id="t1",
+            quantity=Decimal("2"),
+            average_entry_price=Decimal("0.40"),
+        )
+    )
+    await state.restore_position_lifecycle(
+        PositionLifecycle(
+            market_id="m1",
+            token_id="t1",
+            opened_at=now,
+            last_fill_at=now,
+        )
+    )
+    await state.reserve_exit(
+        "m1",
+        "t1",
+        client_order_id="exit-order-0001",
+        reason=ExitReason.TAKE_PROFIT,
+        attempted_at=now,
+    )
+    engine = PreTradeRiskEngine(config=config, state_store=state)
+
+    decision = await engine.evaluate(
+        signal=make_signal(),
+        snapshot=fresh_snapshot(),
+        proposed_size=Decimal("1"),
+        proposed_price=Decimal("0.46"),
+    )
+
+    assert decision.approved is False
+    assert decision.reason == "entry_blocked_by_pending_exit:exit-order-0001"
 
 
 @pytest.mark.asyncio

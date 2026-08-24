@@ -40,7 +40,8 @@ def test_geoblock_fails_closed_on_timeout() -> None:
     )
     status = client.check()
     assert status.allowed is False
-    assert "timeout" in status.reason
+    assert status.reason == "geoblock_timeout:TimeoutException"
+    assert "polymarket.com" not in status.reason
 
 
 def test_geoblock_fails_closed_on_malformed_json() -> None:

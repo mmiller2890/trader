@@ -57,6 +57,42 @@ async def test_price_change_deletes_zero_and_upserts_nonzero_levels() -> None:
 
 
 @pytest.mark.asyncio
+async def test_multi_change_book_transition_is_applied_atomically() -> None:
+    state = InMemoryStateStore(mode=Mode.DRY_RUN)
+    published: list[object] = []
+
+    async def on_snapshot(snapshot: object) -> None:
+        published.append(snapshot)
+
+    client = MarketDataClient(state_store=state, on_snapshot=on_snapshot)
+    await client.handle_ws_message({
+        "event_type": "book",
+        "market": "m1",
+        "asset_id": "t1",
+        "bids": [{"price": "0.50", "size": "10"}],
+        "asks": [{"price": "0.52", "size": "8"}],
+        "timestamp": "1757908892351",
+    })
+    await client.handle_ws_message({
+        "event_type": "price_change",
+        "market": "m1",
+        "timestamp": "1757908892352",
+        "price_changes": [
+            {"asset_id": "t1", "price": "0.49", "size": "8", "side": "SELL"},
+            {"asset_id": "t1", "price": "0.50", "size": "0", "side": "BUY"},
+            {"asset_id": "t1", "price": "0.48", "size": "10", "side": "BUY"},
+            {"asset_id": "t1", "price": "0.52", "size": "0", "side": "SELL"},
+        ],
+    })
+
+    snapshot = await state.get_market_snapshot("m1", "t1")
+    assert snapshot is not None
+    assert snapshot.best_bid == Decimal("0.48")
+    assert snapshot.best_ask == Decimal("0.49")
+    assert len(published) == 2
+
+
+@pytest.mark.asyncio
 async def test_snapshot_is_not_published_until_both_sides_exist() -> None:
     state = InMemoryStateStore(mode=Mode.DRY_RUN)
     published: list[object] = []
@@ -124,7 +160,8 @@ async def test_market_resolved_stops_snapshot_routing() -> None:
     await client.handle_ws_message({
         "event_type": "market_resolved",
         "market": "m1",
-        "asset_id": "t1",
+        "assets_ids": ["t1"],
+        "winning_asset_id": "t1",
         "timestamp": "1757908892352",
     })
     await client.handle_ws_message({
