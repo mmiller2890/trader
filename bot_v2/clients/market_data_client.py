@@ -30,9 +30,11 @@ class MarketDataClient:
         *,
         state_store: InMemoryStateStore,
         on_snapshot: MarketUpdateHandler | None = None,
+        on_fallback_snapshot: MarketUpdateHandler | None = None,
     ) -> None:
         self._state_store = state_store
         self._on_snapshot = on_snapshot
+        self._on_fallback_snapshot = on_fallback_snapshot
         self._books: dict[tuple[str, str], LiveBookState] = {}
 
     async def handle_ws_message(self, message: dict | str) -> None:
@@ -186,6 +188,14 @@ class MarketDataClient:
             )
             return
         await self._publish(book)
+
+    async def ingest_fallback_snapshot(self, snapshot: MarketSnapshot) -> None:
+        """Store a REST fallback snapshot for exit/reconciliation only."""
+
+        await self._state_store.update_market_snapshot(snapshot)
+        await self._state_store.update_heartbeat("market_data", snapshot.received_ts)
+        if self._on_fallback_snapshot is not None:
+            await self._on_fallback_snapshot(snapshot)
 
     async def _publish(self, book: LiveBookState) -> None:
         if book.resolved:

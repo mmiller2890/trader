@@ -8,12 +8,26 @@ import logging
 from datetime import UTC, datetime
 from typing import Awaitable, Callable
 
+from pydantic import BaseModel, ConfigDict
 from websockets.asyncio.client import ClientConnection, connect
 
 logger = logging.getLogger(__name__)
 
 MessageHandler = Callable[[dict | str], Awaitable[None]]
 HeartbeatHandler = Callable[[datetime], Awaitable[None]]
+
+
+class WebSocketHealth(BaseModel):
+    """Typed health snapshot for the WebSocket transport."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    connected: bool = False
+    task_running: bool = False
+    last_heartbeat: datetime | None = None
+    disconnected_since: datetime | None = None
+    connection_attempts: int = 0
+    last_error: str | None = None
 
 
 def utc_now() -> datetime:
@@ -59,6 +73,8 @@ class WebSocketManager:
         self._is_connected = False
         self._last_heartbeat: datetime | None = None
         self._connection_attempts = 0
+        self._disconnected_since: datetime | None = None
+        self._last_error: str | None = None
         self._connect_factory = connect
 
     @property
@@ -66,6 +82,26 @@ class WebSocketManager:
         """Timestamp of the last received frame."""
 
         return self._last_heartbeat
+
+    def health(self) -> WebSocketHealth:
+        """Return a typed snapshot distinguishing connected/retrying/dead."""
+
+        return WebSocketHealth(
+            connected=self._is_connected,
+            task_running=(
+                self._task is not None and not self._task.done()
+            ),
+            last_heartbeat=self._last_heartbeat,
+            disconnected_since=self._disconnected_since,
+            connection_attempts=self._connection_attempts,
+            last_error=self._last_error,
+        )
+
+    async def wait_closed(self) -> None:
+        """Await until the internal task finishes."""
+
+        if self._task is not None:
+            await self._task
 
     @property
     def is_connected(self) -> bool:
@@ -136,9 +172,13 @@ class WebSocketManager:
             try:
                 await self._consume_connection()
                 backoff = self._reconnect_initial
+                self._disconnected_since = None
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self._last_error = type(exc).__name__
+                if self._disconnected_since is None:
+                    self._disconnected_since = utc_now()
                 logger.warning(
                     "websocket consume failed",
                     extra={

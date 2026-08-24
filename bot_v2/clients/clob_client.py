@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from clients.auth import ClobCredentials, effective_funder_address
 from config.schema import AppConfig
+from models.market import MarketSnapshot, OrderBookLevel
 from models.order import (
     OrderRequest,
     OrderResult,
@@ -125,6 +126,57 @@ class ClobClientAdapter:
         if raw != "OK":
             raise ClobAdapterError(f"clob healthcheck returned unexpected response: {raw!r}")
         return True
+
+    def get_market_snapshot(self, market_id: str, token_id: str) -> MarketSnapshot:
+        """Fetch and normalize one order book via the explicit V2 method."""
+
+        from decimal import Decimal as D
+
+        try:
+            raw = self._client.get_order_book(token_id)
+        except Exception as exc:
+            raise ClobAdapterError(f"order book read failed: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise ClobAdapterError(f"order book response is not an object: {type(raw).__name__}")
+        bids_raw = raw.get("bids") or raw.get("buy") or []
+        asks_raw = raw.get("asks") or raw.get("sell") or []
+        if not isinstance(bids_raw, list) or not isinstance(asks_raw, list):
+            raise ClobAdapterError("order book levels are not lists")
+        try:
+            bids = [
+                (D(str(row["price"])), D(str(row["size"])))
+                for row in bids_raw
+                if isinstance(row, dict) and D(str(row.get("size", "0"))) > 0
+            ]
+            asks = [
+                (D(str(row["price"])), D(str(row["size"])))
+                for row in asks_raw
+                if isinstance(row, dict) and D(str(row.get("size", "0"))) > 0
+            ]
+        except (KeyError, ValueError) as exc:
+            raise ClobAdapterError(f"order book has invalid price/size: {exc}") from exc
+        if not bids or not asks:
+            raise ClobAdapterError("order book is missing bids or asks")
+        best_bid = max(p for p, _ in bids)
+        best_ask = min(p for p, _ in asks)
+        if best_bid > best_ask:
+            raise ClobAdapterError("crossed book: best bid exceeds best ask")
+        bid_size = max(s for p, s in bids if p == best_bid)
+        ask_size = max(s for p, s in asks if p == best_ask)
+        from datetime import UTC, datetime
+
+        now = datetime.now(tz=UTC)
+        return MarketSnapshot(
+            market_id=market_id,
+            token_id=token_id,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            mid_price=(best_bid + best_ask) / D("2"),
+            top_bid_size=bid_size,
+            top_ask_size=ask_size,
+            source_ts=now,
+            received_ts=now,
+        )
 
     def get_open_orders(self, market_id: str | None = None) -> list[OrderResult]:
         """Fetch open orders through the explicit V2 method."""

@@ -181,6 +181,64 @@ def test_empty_asset_list_is_rejected_at_startup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_health_distinguishes_connected_retrying_and_stopped() -> None:
+    socket = FakeSocket(frames=["{}"])
+    manager = make_manager(socket=socket)
+    assert manager.health().connected is False
+    assert manager.health().task_running is False
+
+    await manager._consume_connection()
+    health = manager.health()
+    assert health.connected is False
+    assert health.task_running is False
+
+    from clients.ws_client import WebSocketManager as WSM
+    live = make_manager(socket=FakeSocket(frames=["{}"]))
+    await live.start()
+    await asyncio.sleep(0.05)
+    health_live = live.health()
+    assert health_live.task_running is True
+    assert health_live.connected is True
+    assert health_live.last_heartbeat is not None
+    await live.stop()
+    assert live.health().task_running is False
+
+
+@pytest.mark.asyncio
+async def test_wait_closed_resolves_after_stop() -> None:
+    socket = FakeSocket()
+    manager = make_manager(socket=socket)
+
+    async def run_supervised() -> None:
+        await manager._consume_connection()
+
+    task = asyncio.create_task(manager._consume_connection())
+    await asyncio.sleep(0.02)
+    await manager.stop()
+    await asyncio.wait_for(manager.wait_closed(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_health_exposes_type_only_error_after_failure() -> None:
+    class ExplodingConnector:
+        async def __aenter__(self) -> FakeSocket:
+            raise ConnectionError("token=secret remote detail")
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    manager = make_manager(socket=FakeSocket())
+    manager._connect_factory = lambda url, **kwargs: ExplodingConnector()
+    try:
+        await manager._consume_connection()
+    except ConnectionError:
+        pass
+    error_text = manager.health().last_error or ""
+    assert "secret" not in error_text
+    assert "ConnectionError" in error_text or "token" not in error_text
+
+
+@pytest.mark.asyncio
 async def test_replace_asset_ids_closes_socket_and_next_connection_uses_new_ids() -> None:
     first = FakeSocket()
     second = FakeSocket()
