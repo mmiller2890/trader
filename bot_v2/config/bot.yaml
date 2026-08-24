@@ -58,6 +58,15 @@ reliability:
   disk_warning_percent: 80
   disk_degraded_percent: 90
   disk_halt_percent: 95
+  retention_interval_seconds: 3600
+  signal_retention_count: 10000
+  signal_retention_hours: 24
+  fill_checkpoint_retention_days: 7
+  realized_pnl_hot_days: 90
+  closed_lifecycle_hot_count: 100
+  journal_rotation_mib: 50
+  journal_retention_days: 14
+  journal_total_limit_mib: 500
 
 notifications:
   telegram_enabled: false

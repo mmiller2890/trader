@@ -214,6 +214,15 @@ class ReliabilityConfig(BaseModel):
     disk_warning_percent: float = Field(default=80, ge=0, le=100)
     disk_degraded_percent: float = Field(default=90, ge=0, le=100)
     disk_halt_percent: float = Field(default=95, ge=0, le=100)
+    retention_interval_seconds: float = Field(default=3600, gt=0)
+    signal_retention_count: int = Field(default=10000, ge=1)
+    signal_retention_hours: float = Field(default=24, gt=0)
+    fill_checkpoint_retention_days: float = Field(default=7, gt=0)
+    realized_pnl_hot_days: int = Field(default=90, ge=1)
+    closed_lifecycle_hot_count: int = Field(default=100, ge=1)
+    journal_rotation_mib: float = Field(default=50, gt=0)
+    journal_retention_days: int = Field(default=14, ge=1)
+    journal_total_limit_mib: float = Field(default=500, gt=0)
 
     @model_validator(mode="after")
     def validate_reliability_bounds(self) -> Self:

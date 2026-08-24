@@ -6,6 +6,7 @@ import asyncio
 import json
 import sqlite3
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from models.operations import (
     OperationalIncident,
     OutboxAlert,
 )
+from models.position import FillCheckpoint, PositionLifecycle
 
 
 def _utc_now() -> datetime:
@@ -83,6 +85,26 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_next_attempt
     ON notification_outbox(next_attempt_at);
+
+CREATE TABLE IF NOT EXISTS archived_fill_checkpoints (
+    order_key TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    archived_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS archived_pnl_days (
+    day TEXT PRIMARY KEY,
+    realized_pnl TEXT NOT NULL,
+    archived_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS archived_position_lifecycles (
+    lifecycle_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_id TEXT NOT NULL,
+    token_id TEXT NOT NULL,
+    opened_at TEXT NOT NULL,
+    closed_at TEXT,
+    payload TEXT NOT NULL,
+    archived_at TEXT NOT NULL
+);
 """
 
 
@@ -554,3 +576,116 @@ class OperationsRepository:
                 connection.close()
 
         return await asyncio.to_thread(_work)
+
+    async def archive_retention(
+        self,
+        *,
+        checkpoints: list[FillCheckpoint],
+        pnl_days: list[tuple[str, Decimal]],
+        lifecycles: list[PositionLifecycle],
+        archived_at: datetime,
+    ) -> None:
+        """Archive retention candidates in one transaction; raises on failure."""
+
+        await self._ensure_schema()
+
+        def _work() -> None:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                for checkpoint in checkpoints:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO archived_fill_checkpoints"
+                        " (order_key, payload, archived_at) VALUES (?, ?, ?)",
+                        (
+                            checkpoint.order_key,
+                            checkpoint.model_dump_json(),
+                            _to_iso(archived_at),
+                        ),
+                    )
+                for day, value in pnl_days:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO archived_pnl_days"
+                        " (day, realized_pnl, archived_at) VALUES (?, ?, ?)",
+                        (day, str(value), _to_iso(archived_at)),
+                    )
+                for lifecycle in lifecycles:
+                    connection.execute(
+                        "INSERT INTO archived_position_lifecycles"
+                        " (market_id, token_id, opened_at, closed_at,"
+                        " payload, archived_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            lifecycle.market_id,
+                            lifecycle.token_id,
+                            _to_iso(lifecycle.opened_at),
+                            _to_iso(lifecycle.closed_at)
+                            if lifecycle.closed_at
+                            else None,
+                            lifecycle.model_dump_json(),
+                            _to_iso(archived_at),
+                        ),
+                    )
+                connection.commit()
+            finally:
+                connection.close()
+
+        await asyncio.to_thread(_work)
+
+    async def archived_checkpoint_order_keys(self) -> list[str]:
+        """Return archived fill-checkpoint order keys oldest-first."""
+
+        await self._ensure_schema()
+
+        def _work() -> list[str]:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    "SELECT order_key FROM archived_fill_checkpoints"
+                    " ORDER BY archived_at ASC, order_key ASC"
+                ).fetchall()
+                return [row["order_key"] for row in rows]
+            finally:
+                connection.close()
+
+        return await asyncio.to_thread(_work)
+
+    async def archived_pnl_days(self) -> dict[str, Decimal]:
+        """Return archived daily realized-P&L values keyed by UTC day."""
+
+        await self._ensure_schema()
+
+        def _work() -> list[dict[str, Any]]:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    "SELECT day, realized_pnl FROM archived_pnl_days"
+                    " ORDER BY day ASC"
+                ).fetchall()
+                return [dict(row) for row in rows]
+            finally:
+                connection.close()
+
+        rows = await asyncio.to_thread(_work)
+        return {row["day"]: Decimal(row["realized_pnl"]) for row in rows}
+
+    async def archived_closed_lifecycles(self) -> list[PositionLifecycle]:
+        """Return every archived closed position lifecycle."""
+
+        await self._ensure_schema()
+
+        def _work() -> list[dict[str, Any]]:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    "SELECT payload FROM archived_position_lifecycles"
+                    " ORDER BY lifecycle_id ASC"
+                ).fetchall()
+                return [dict(row) for row in rows]
+            finally:
+                connection.close()
+
+        rows = await asyncio.to_thread(_work)
+        return [
+            PositionLifecycle.model_validate(json.loads(row["payload"]))
+            for row in rows
+        ]

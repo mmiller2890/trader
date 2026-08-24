@@ -86,6 +86,25 @@ class InMemoryStateStore:
         async with self._lock:
             self._signals[signal.signal_id] = signal
 
+    async def copy_signal_index(self) -> list[tuple[str, datetime]]:
+        """Copy (signal_id, created_at) candidates under the lock."""
+
+        async with self._lock:
+            return [
+                (signal_id, item.created_at)
+                for signal_id, item in self._signals.items()
+            ]
+
+    async def remove_signals(self, signal_ids: list[str]) -> int:
+        """Remove only the named signals; returns how many were removed."""
+
+        async with self._lock:
+            removed = 0
+            for signal_id in signal_ids:
+                if self._signals.pop(signal_id, None) is not None:
+                    removed += 1
+            return removed
+
     async def set_order_status(self, result: OrderResult) -> None:
         """Upsert open order map based on latest order status."""
 
@@ -151,6 +170,38 @@ class InMemoryStateStore:
 
         async with self._lock:
             return self._orderbooks.get((market_id, token_id))
+
+    async def copy_orderbook_keys(self) -> list[MarketTokenKey]:
+        """Copy orderbook key candidates under the lock."""
+
+        async with self._lock:
+            return list(self._orderbooks)
+
+    async def copy_snapshot_keys(self) -> list[MarketTokenKey]:
+        """Copy market-snapshot key candidates under the lock."""
+
+        async with self._lock:
+            return list(self._snapshots)
+
+    async def remove_orderbooks(self, keys: list[MarketTokenKey]) -> int:
+        """Remove only the named orderbooks; returns how many were removed."""
+
+        async with self._lock:
+            removed = 0
+            for key in keys:
+                if self._orderbooks.pop(key, None) is not None:
+                    removed += 1
+            return removed
+
+    async def remove_market_snapshots(self, keys: list[MarketTokenKey]) -> int:
+        """Remove only the named snapshots; returns how many were removed."""
+
+        async with self._lock:
+            removed = 0
+            for key in keys:
+                if self._snapshots.pop(key, None) is not None:
+                    removed += 1
+            return removed
 
     async def get_open_orders(self) -> list[OrderResult]:
         """Return all open orders."""
@@ -495,6 +546,16 @@ class InMemoryStateStore:
         async with self._lock:
             return list(self._fill_checkpoints.values())
 
+    async def remove_fill_checkpoints(self, order_keys: list[str]) -> int:
+        """Remove only the named checkpoints; returns how many were removed."""
+
+        async with self._lock:
+            removed = 0
+            for order_key in order_keys:
+                if self._fill_checkpoints.pop(order_key, None) is not None:
+                    removed += 1
+            return removed
+
     async def restore_fill_checkpoint(self, checkpoint: FillCheckpoint) -> None:
         """Restore one fill checkpoint from a snapshot."""
 
@@ -512,6 +573,22 @@ class InMemoryStateStore:
 
         async with self._lock:
             return list(self._closed_lifecycles)
+
+    async def remove_closed_position_lifecycles(
+        self,
+        lifecycles: list[PositionLifecycle],
+    ) -> int:
+        """Remove only exact closed-lifecycle records; returns count removed."""
+
+        async with self._lock:
+            removed = 0
+            for lifecycle in lifecycles:
+                try:
+                    self._closed_lifecycles.remove(lifecycle)
+                except ValueError:
+                    continue
+                removed += 1
+            return removed
 
     async def get_position_lifecycle(
         self, market_id: str, token_id: str
@@ -542,6 +619,16 @@ class InMemoryStateStore:
 
         async with self._lock:
             return dict(self._realized_pnl_by_day)
+
+    async def remove_realized_pnl_days(self, days: list[str]) -> int:
+        """Remove only the named UTC days; returns how many were removed."""
+
+        async with self._lock:
+            removed = 0
+            for day in days:
+                if self._realized_pnl_by_day.pop(day, None) is not None:
+                    removed += 1
+            return removed
 
     async def get_daily_realized_pnl(
         self,

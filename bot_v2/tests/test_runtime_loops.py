@@ -231,6 +231,64 @@ async def test_snapshot_loop_persists_without_other_work() -> None:
 
 
 @pytest.mark.asyncio
+async def test_snapshot_loop_runs_startup_retention_with_active_markets() -> None:
+    calls: list[set[tuple[str, str]]] = []
+
+    class Rotator:
+        def status(self) -> object:
+            market = SimpleNamespace(
+                condition_id="cond-1",
+                market_id="mkt-1",
+                asset_ids=["tok-a", "tok-b"],
+            )
+            return SimpleNamespace(current_market=market)
+
+    class Retention:
+        def set_reporter(self, reporter: object) -> None:
+            pass
+
+        async def run_once(
+            self,
+            *,
+            state_store: object,
+            active_market_keys: set[tuple[str, str]],
+            now: object,
+        ) -> object:
+            calls.append(set(active_market_keys))
+            return SimpleNamespace()
+
+    services = make_services()
+    services.market_rotator = Rotator()
+    services.retention_manager = Retention()
+    await run_one_cycle(snapshot_loop, services)
+
+    assert len(calls) == 1
+    assert ("cond-1", "tok-a") in calls[0]
+    assert ("mkt-1", "tok-b") in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_loop_reports_persistence_incident_on_retention_failure() -> (
+    None
+):
+    class FailingRetention:
+        def set_reporter(self, reporter: object) -> None:
+            pass
+
+        async def run_once(self, **kwargs: object) -> object:
+            raise RuntimeError("retention exploded")
+
+    services = make_services()
+    services.retention_manager = FailingRetention()
+    await run_one_cycle(snapshot_loop, services)
+
+    categories = [incident.category.value for incident in services.incidents]
+    assert "persistence" in categories
+    reasons = [incident.reason for incident in services.incidents]
+    assert any("RuntimeError" in reason for reason in reasons)
+
+
+@pytest.mark.asyncio
 async def test_notification_delivery_failure_does_not_kill_others() -> None:
     from app.loops import notification_delivery_loop
 

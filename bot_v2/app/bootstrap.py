@@ -36,6 +36,7 @@ from notifications.outbox import (
 from persistence.db import KeyValueSqliteStore
 from persistence.journal import JsonlJournal
 from persistence.operations import OperationsRepository
+from persistence.retention import RetentionManager
 from persistence.snapshots import SnapshotStore
 from portfolio.exit_manager import PositionExitManager
 from portfolio.exit_policy import PositionExitPolicy
@@ -125,6 +126,7 @@ class AppServices:
     operations_repository: OperationsRepository
     alert_service: AlertService
     notification_worker: NotificationWorker
+    retention_manager: RetentionManager
     reconciliation: ReconciliationService
     market_rotator: Btc15mMarketRotator | None = None
 
@@ -330,6 +332,15 @@ async def bootstrap_app(
         telegram_transport,
         config,
     )
+    retention_manager = RetentionManager(
+        repository=operations_repository,
+        config=config.reliability,
+        journal=journal,
+        data_path=data_dir,
+        delivered_outbox_retention_days=(
+            config.notifications.delivered_outbox_retention_days
+        ),
+    )
 
     async def emit_event(event: BotEvent) -> None:
         await journal.append(event)
@@ -476,6 +487,7 @@ async def bootstrap_app(
             operations_repository=operations_repository,
             alert_service=alert_service,
             notification_worker=notification_worker,
+            retention_manager=retention_manager,
             reconciliation=reconciliation,
             market_rotator=market_rotator,
         )

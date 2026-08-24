@@ -238,26 +238,83 @@ async def snapshot_loop(
     heartbeat: Heartbeat,
     report: Report,
 ) -> None:
-    """Persist bounded runtime snapshots without touching other subsystems."""
+    """Persist bounded runtime snapshots and schedule retention passes."""
 
     config = getattr(services, "config", None)
     interval = getattr(getattr(config, "bot", None), "snapshot_interval_seconds", 30)
     snapshots = getattr(services, "snapshots", None)
     state_store = getattr(services, "state_store", None)
+    retention_manager = getattr(services, "retention_manager", None)
+    rotator = getattr(services, "market_rotator", None)
+    reliability = getattr(config, "reliability", None)
+    retention_interval = float(
+        getattr(reliability, "retention_interval_seconds", 3600.0)
+    )
+
+    previous_keys: set[tuple[str, str]] = set()
+    last_retention_at: datetime | None = None
+
+    def current_market_keys() -> set[tuple[str, str]]:
+        if rotator is None:
+            return set()
+        status = rotator.status()
+        current = getattr(status, "current_market", None)
+        if current is None:
+            return set()
+        keys: set[tuple[str, str]] = set()
+        for token_id in getattr(current, "asset_ids", []) or []:
+            condition_id = getattr(current, "condition_id", None)
+            discovered_id = getattr(current, "market_id", None)
+            if condition_id:
+                keys.add((str(condition_id), str(token_id)))
+            if discovered_id:
+                keys.add((str(discovered_id), str(token_id)))
+        return keys
 
     while not stop_event.is_set():
 
         async def work() -> None:
-            if snapshots is None or state_store is None:
+            nonlocal last_retention_at, previous_keys
+            if snapshots is not None and state_store is not None:
+                try:
+                    await snapshots.save_from_state(state_store)
+                except Exception as exc:
+                    incident = _make_incident(
+                        component="snapshots",
+                        category=IncidentCategory.PERSISTENCE,
+                        severity=IncidentSeverity.WARNING,
+                        reason=f"snapshot_write_failed:{type(exc).__name__}",
+                    )
+                    await report(incident)
+
+            if retention_manager is None or state_store is None:
                 return
+            now = _utc_now()
+            if (
+                last_retention_at is not None
+                and (now - last_retention_at).total_seconds()
+                < retention_interval
+            ):
+                return
+            current_keys = current_market_keys()
+            active_keys = previous_keys | current_keys
             try:
-                await snapshots.save_from_state(state_store)
+                set_reporter = getattr(retention_manager, "set_reporter", None)
+                if callable(set_reporter):
+                    set_reporter(report)
+                await retention_manager.run_once(
+                    state_store=state_store,
+                    active_market_keys=active_keys,
+                    now=now,
+                )
+                last_retention_at = now
+                previous_keys = current_keys
             except Exception as exc:
                 incident = _make_incident(
-                    component="snapshots",
+                    component="retention",
                     category=IncidentCategory.PERSISTENCE,
                     severity=IncidentSeverity.WARNING,
-                    reason=f"snapshot_write_failed:{type(exc).__name__}",
+                    reason=f"retention_pass_failed:{type(exc).__name__}",
                 )
                 await report(incident)
 
