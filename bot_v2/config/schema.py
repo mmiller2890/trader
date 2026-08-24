@@ -257,7 +257,7 @@ class SecretsConfig(BaseModel):
     clob_passphrase: SecretStr | None = None
     rpc_url: str | None = None
     telegram_bot_token: SecretStr | None = None
-    telegram_chat_id: str | None = None
+    telegram_chat_id: SecretStr | None = None
 
 
 class AppConfig(BaseModel):

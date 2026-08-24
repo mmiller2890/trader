@@ -28,9 +28,14 @@ from execution.submitter import OrderSubmitter
 from execution.tracker import OrderTracker
 from models.events import BotEvent, EventType
 from notifications.events import EventBus
-from notifications.telegram import TelegramNotifier
+from notifications.outbox import (
+    AlertService,
+    NotificationWorker,
+    TelegramTransport,
+)
 from persistence.db import KeyValueSqliteStore
 from persistence.journal import JsonlJournal
+from persistence.operations import OperationsRepository
 from persistence.snapshots import SnapshotStore
 from portfolio.exit_manager import PositionExitManager
 from portfolio.exit_policy import PositionExitPolicy
@@ -117,7 +122,9 @@ class AppServices:
     snapshots: SnapshotStore
     db: KeyValueSqliteStore
     event_bus: EventBus
-    telegram: TelegramNotifier
+    operations_repository: OperationsRepository
+    alert_service: AlertService
+    notification_worker: NotificationWorker
     reconciliation: ReconciliationService
     market_rotator: Btc15mMarketRotator | None = None
 
@@ -315,12 +322,23 @@ async def bootstrap_app(
         raise
 
     event_bus = EventBus()
-    telegram = TelegramNotifier(config)
-    event_bus.subscribe(telegram.notify_event)
+    operations_repository = OperationsRepository(data_dir / "bot.sqlite3")
+    alert_service = AlertService(operations_repository, config)
+    telegram_transport = TelegramTransport(config)
+    notification_worker = NotificationWorker(
+        operations_repository,
+        telegram_transport,
+        config,
+    )
 
     async def emit_event(event: BotEvent) -> None:
         await journal.append(event)
         await event_bus.publish(event)
+
+    async def durable_alert(event: BotEvent) -> None:
+        await alert_service.enqueue_event(event)
+
+    event_bus.subscribe(durable_alert)
 
     strategy_config = config.spike_strategy
     if config.market_data.automatic_market.enabled:
@@ -455,7 +473,9 @@ async def bootstrap_app(
             snapshots=snapshots,
             db=db,
             event_bus=event_bus,
-            telegram=telegram,
+            operations_repository=operations_repository,
+            alert_service=alert_service,
+            notification_worker=notification_worker,
             reconciliation=reconciliation,
             market_rotator=market_rotator,
         )

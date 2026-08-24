@@ -45,7 +45,7 @@ class TelegramNotifier:
 
         text = self._format_message(event)
         url = f"https://api.telegram.org/bot{token.get_secret_value()}/sendMessage"
-        payload = {"chat_id": chat_id, "text": text}
+        payload = {"chat_id": chat_id.get_secret_value(), "text": text}
 
         retries = self._config.notifications.telegram_send_retries + 1
         async with httpx.AsyncClient(timeout=10.0) as client:

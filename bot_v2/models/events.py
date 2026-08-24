@@ -38,6 +38,14 @@ class EventType(str, Enum):
     POSITION_CLOSED = "position_closed"
     POSITION_DUST = "position_dust"
     POSITION_CONFIRMATION_DEFERRED = "position_confirmation_deferred"
+    RUNTIME_DEGRADED = "runtime_degraded"
+    RUNTIME_RECOVERED = "runtime_recovered"
+    RUNTIME_FAILED = "runtime_failed"
+    LIVE_LEASE_ISSUED = "live_lease_issued"
+    LIVE_LEASE_EXPIRING = "live_lease_expiring"
+    LIVE_LEASE_EXPIRED = "live_lease_expired"
+    AUTO_RESUME_REJECTED = "auto_resume_rejected"
+    DAILY_SUMMARY = "daily_summary"
 
 
 class BotEvent(BaseModel):

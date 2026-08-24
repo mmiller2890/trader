@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 
 from models.events import BotEvent, EventType
+
+logger = logging.getLogger(__name__)
 
 EventHandler = Callable[[BotEvent], Awaitable[None]]
 
@@ -27,9 +30,21 @@ class EventBus:
         self._subscribers[event_type].append(handler)
 
     async def publish(self, event: BotEvent) -> None:
-        """Fan out event to subscribers."""
+        """Fan out event to subscribers; a broken handler never breaks the bus."""
 
         handlers = [*self._all_subscribers, *self._subscribers.get(event.event_type, [])]
         if not handlers:
             return
-        await asyncio.gather(*(handler(event) for handler in handlers))
+        results = await asyncio.gather(
+            *(handler(event) for handler in handlers), return_exceptions=True
+        )
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                logger.warning(
+                    "event handler failed",
+                    extra={
+                        "component": "event_bus",
+                        "event_type": "handler_failed",
+                        "reason": type(result).__name__,
+                    },
+                )
