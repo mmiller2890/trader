@@ -151,6 +151,16 @@ async def test_missing_identity_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_identity_is_rejected() -> None:
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    result = filled_result("0xorder0001", filled="1", price="0.40").model_copy(
+        update={"market_id": ""}
+    )
+    with pytest.raises(PositionAccountingError, match="missing_identity"):
+        await state.apply_confirmed_fill(result, **APPLY_ARGS)
+
+
+@pytest.mark.asyncio
 async def test_missing_fill_price_is_rejected() -> None:
     state = InMemoryStateStore(mode=Mode.LIVE)
     result = filled_result("0xorder0001", filled="1", price="0.40").model_copy(

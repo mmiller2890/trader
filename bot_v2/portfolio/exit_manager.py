@@ -43,6 +43,7 @@ class PositionExitManager:
         self._policy = policy
         self._now = now
         self._on_event = on_event
+        self._dust_notified: set[tuple[str, str]] = set()
 
     def set_clock(self, now: Callable[[], datetime]) -> None:
         """Replace the clock used for retry timing."""
@@ -55,10 +56,15 @@ class PositionExitManager:
         *,
         market_end_at: datetime | None,
     ) -> list[TradeSignal]:
-        """Evaluate the exit policy for every open position on this snapshot."""
+        """Evaluate the exit policy for the position this snapshot belongs to."""
 
         signals: list[TradeSignal] = []
         for position in await self._state_store.get_positions():
+            if (
+                position.market_id,
+                position.token_id,
+            ) != (snapshot.market_id, snapshot.token_id):
+                continue
             lifecycle = await self._state_store.get_position_lifecycle(
                 position.market_id, position.token_id
             )
@@ -71,17 +77,20 @@ class PositionExitManager:
                 now=self._now(),
             )
             if decision.dust:
-                await self._emit_event(
-                    BotEvent(
-                        event_type=EventType.POSITION_DUST,
-                        component="exit_manager",
-                        mode=self._config.bot.mode.value,
-                        message="sub-minimum residual inventory marked as dust",
-                        market_id=position.market_id,
-                        token_id=position.token_id,
-                        quantity=position.quantity,
+                key = (position.market_id, position.token_id)
+                if key not in self._dust_notified:
+                    self._dust_notified.add(key)
+                    await self._emit_event(
+                        BotEvent(
+                            event_type=EventType.POSITION_DUST,
+                            component="exit_manager",
+                            mode=self._config.bot.mode.value,
+                            message="sub-minimum residual inventory marked as dust",
+                            market_id=position.market_id,
+                            token_id=position.token_id,
+                            quantity=position.quantity,
+                        )
                     )
-                )
                 continue
             if not decision.should_exit or decision.reason is None:
                 continue

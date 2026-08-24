@@ -74,9 +74,12 @@ async def housekeeping_loop(services: AppServices, stop_event: asyncio.Event) ->
                 if market_rotator is None:
                     return None
                 current = market_rotator.status().current_market
-                if current is None or current.market_id != market_id:
+                if current is None:
                     return None
-                return current.end_at
+                matches_market = (
+                    market_id in {current.market_id, current.condition_id}
+                )
+                return current.end_at if matches_market else None
 
             for exit_signal in await exit_manager.on_timer(
                 market_end_lookup=market_end_lookup

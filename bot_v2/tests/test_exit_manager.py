@@ -177,6 +177,65 @@ async def test_dust_position_emits_no_exit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dust_event_emits_once_not_per_tick() -> None:
+    state = state_with_position(quantity="0.5", average="0.40")
+    events: list[object] = []
+
+    async def on_event(event: object) -> None:
+        events.append(event)
+
+    config = AppConfig(
+        bot={"mode": Mode.DRY_RUN},
+        position_management={
+            "take_profit_bps": "300",
+            "stop_loss_bps": "200",
+            "max_hold_seconds": 180,
+        },
+    )
+    policy = PositionExitPolicy(
+        config.position_management,
+        min_order_size=config.execution.min_order_size,
+        max_data_age_seconds=config.risk.max_data_staleness_seconds,
+    )
+    manager = PositionExitManager(
+        config=config,
+        state_store=state,
+        snapshots=None,
+        policy=policy,
+        now=lambda: NOW,
+        on_event=on_event,
+    )
+    for _ in range(3):
+        await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
+    dust_events = [event for event in events if event.event_type.value == "position_dust"]
+    assert len(dust_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_position_is_not_evaluated_against_another_tokens_snapshot() -> None:
+    state = state_with_position(quantity="2.5", average="0.40")
+    other_token_snapshot = MarketSnapshot(
+        market_id="m1",
+        token_id="t2",
+        best_bid=Decimal("0.10"),
+        best_ask=Decimal("0.11"),
+        mid_price=Decimal("0.105"),
+        top_bid_size=Decimal("100"),
+        top_ask_size=Decimal("100"),
+        source_ts=NOW,
+        received_ts=NOW,
+    )
+    manager = make_exit_manager(state=state, now=lambda: NOW)
+    signals = await manager.on_market_update(
+        other_token_snapshot, market_end_at=END_AT
+    )
+    assert signals == []
+    lifecycle = await state.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    assert lifecycle.pending_exit_client_order_id is None
+
+
+@pytest.mark.asyncio
 async def test_timer_exit_uses_market_end_lookup() -> None:
     state = state_with_position(quantity="2.5", average="0.40")
     await state.update_market_snapshot(snapshot(best_bid="0.42"))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from decimal import Decimal
 
@@ -17,6 +18,7 @@ from notifications.events import EventBus
 from persistence.journal import JsonlJournal
 from portfolio.sizing import fixed_size
 from risk.pretrade import PreTradeRiskEngine
+from state.reconciliation import ReconciliationReport
 from state.store import InMemoryStateStore
 
 
@@ -34,6 +36,7 @@ class ExecutionRouter:
         tracker: OrderTracker,
         journal: JsonlJournal,
         event_bus: EventBus,
+        post_fill_reconcile: Callable[[], Awaitable[ReconciliationReport]] | None = None,
     ) -> None:
         self._config = config
         self._state_store = state_store
@@ -43,6 +46,7 @@ class ExecutionRouter:
         self._tracker = tracker
         self._journal = journal
         self._event_bus = event_bus
+        self._post_fill_reconcile = post_fill_reconcile
 
     async def route_signal(
         self,
@@ -85,6 +89,7 @@ class ExecutionRouter:
                     size=proposed_size,
                 )
             except ValueError as exc:
+                await self._release_exit_reservation(signal)
                 await self._emit_event(
                     BotEvent(
                         event_type=EventType.RISK_DECISION,
@@ -208,6 +213,8 @@ class ExecutionRouter:
             application = outcome.fill_application
             if signal.reduce_only:
                 await self._release_exit_reservation(signal)
+            if self._post_fill_reconcile is not None:
+                await self._reconcile_after_fill(result)
             if outcome.position_closed:
                 await self._emit_event(
                     BotEvent(
@@ -260,6 +267,52 @@ class ExecutionRouter:
                 latency_ms=result.latency_ms,
             )
         )
+
+    async def _reconcile_after_fill(self, result: object) -> None:
+        if self._post_fill_reconcile is None:
+            return
+        try:
+            report = await self._post_fill_reconcile()
+        except Exception as exc:
+            activated = await self._state_store.activate_kill_switch(
+                f"post_fill_reconciliation_failed:{type(exc).__name__}"
+            )
+            if activated:
+                await self._emit_event(
+                    BotEvent(
+                        event_type=EventType.KILL_SWITCH_TRIPPED,
+                        component="router",
+                        mode=self._config.bot.mode.value,
+                        message="post-fill reconciliation failed",
+                        reason=f"post_fill_reconciliation_failed:{type(exc).__name__}",
+                    )
+                )
+            return
+        if not report.ok:
+            activated = await self._state_store.activate_kill_switch(
+                "post_fill_reconciliation_failed"
+            )
+            if activated:
+                await self._emit_event(
+                    BotEvent(
+                        event_type=EventType.KILL_SWITCH_TRIPPED,
+                        component="router",
+                        mode=self._config.bot.mode.value,
+                        message="post-fill reconciliation failed",
+                        reason="post_fill_reconciliation_failed",
+                    )
+                )
+            return
+        if report.deferred_positions:
+            await self._emit_event(
+                BotEvent(
+                    event_type=EventType.POSITION_CONFIRMATION_DEFERRED,
+                    component="router",
+                    mode=self._config.bot.mode.value,
+                    message="position confirmation deferred during grace period",
+                    reason=",".join(report.deferred_positions),
+                )
+            )
 
     async def _release_exit_reservation(self, signal: TradeSignal) -> None:
         if not signal.reduce_only:

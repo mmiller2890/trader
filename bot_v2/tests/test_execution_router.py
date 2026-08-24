@@ -11,7 +11,8 @@ from execution.router import ExecutionRouter
 from execution.tracker import OrderTracker
 from models.market import MarketSnapshot
 from models.order import OrderRequest, OrderResult, OrderStatus
-from models.signal import SignalSide, TradeSignal
+from models.position import ExitReason, Position, PositionLifecycle
+from models.signal import SignalSide, SignalType, TradeSignal
 from notifications.events import EventBus
 from risk.pretrade import PreTradeRiskEngine
 from state.store import InMemoryStateStore
@@ -159,3 +160,59 @@ async def test_router_does_not_reemit_an_already_latched_kill_switch() -> None:
     ]
     assert halt_events == []
     assert submitter.orders == []
+
+
+@pytest.mark.asyncio
+async def test_builder_failure_releases_exit_reservation() -> None:
+    config = live_config(cap="0.01", max_position="5")
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    await state.set_position(
+        Position(
+            market_id="m1",
+            token_id="t1",
+            quantity=Decimal("2"),
+            average_entry_price=Decimal("0.40"),
+        )
+    )
+    state._lifecycles[("m1", "t1")] = PositionLifecycle(
+        market_id="m1",
+        token_id="t1",
+        opened_at=datetime.now(tz=UTC),
+        last_fill_at=datetime.now(tz=UTC),
+    )
+    reserved = await state.reserve_exit(
+        "m1",
+        "t1",
+        client_order_id="pm-bot-signal12345678",
+        reason=ExitReason.TAKE_PROFIT,
+        attempted_at=datetime.now(tz=UTC),
+    )
+    assert reserved is True
+
+    submitter = RecordingSubmitter()
+    execution_router = ExecutionRouter(
+        config=config,
+        state_store=state,
+        risk_engine=PreTradeRiskEngine(config=config, state_store=state),
+        order_builder=OrderBuilder(config),
+        submitter=submitter,
+        tracker=OrderTracker(state),
+        journal=RecordingJournal(),
+        event_bus=EventBus(),
+    )
+    exit_sell = signal().model_copy(
+        update={
+            "side": SignalSide.SELL,
+            "signal_type": SignalType.POSITION_EXIT,
+            "reduce_only": True,
+            "requested_size": Decimal("2"),
+            "reason": "position_exit:take_profit",
+        }
+    )
+
+    await execution_router.route_signal(exit_sell, snapshot=snapshot())
+
+    assert submitter.orders == []
+    lifecycle = await state.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    assert lifecycle.pending_exit_client_order_id is None

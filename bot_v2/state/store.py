@@ -274,6 +274,8 @@ class InMemoryStateStore:
 
         if result.market_id is None or result.token_id is None or result.side is None:
             raise PositionAccountingError("missing_identity")
+        if not result.market_id or not result.token_id:
+            raise PositionAccountingError("missing_identity")
         if result.filled_size <= 0:
             raise PositionAccountingError("missing_filled_size")
         if result.avg_fill_price is None:

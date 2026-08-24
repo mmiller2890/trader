@@ -130,12 +130,28 @@ async def _rotation_safe(
     market: object,
     config: AppConfig,
 ) -> bool:
-    """Rotation is safe only when no sellable position remains in the ending market."""
+    """Rotation is safe only when no sellable position remains in the ending market.
 
+    Positions carry the CLOB condition identifier from WebSocket data, so match
+    against ``condition_id`` (or outcome-token membership) rather than the
+    discovery-layer ``market_id``.
+    """
+
+    outcome_token_ids = {
+        token_id
+        for token_id in (
+            getattr(getattr(market, "up", None), "token_id", None),
+            getattr(getattr(market, "down", None), "token_id", None),
+        )
+        if token_id
+    }
+    condition_id = getattr(market, "condition_id", None)
     for position in await state_store.get_positions():
-        if position.market_id != market.market_id:
-            continue
-        if position.quantity >= config.execution.min_order_size:
+        in_ending_market = (
+            (condition_id is not None and position.market_id == condition_id)
+            or (bool(outcome_token_ids) and position.token_id in outcome_token_ids)
+        )
+        if in_ending_market and position.quantity >= config.execution.min_order_size:
             return False
     return True
 
