@@ -146,6 +146,8 @@ class ExecutionRouter:
                             reason=risk_decision.reason,
                         )
                     )
+            else:
+                await self._release_exit_reservation(signal)
             return
 
         if current_snapshot is None or order_request is None:
@@ -204,6 +206,8 @@ class ExecutionRouter:
                 )
         elif outcome.fill_applied and outcome.fill_application is not None:
             application = outcome.fill_application
+            if signal.reduce_only:
+                await self._release_exit_reservation(signal)
             if outcome.position_closed:
                 await self._emit_event(
                     BotEvent(
@@ -235,6 +239,8 @@ class ExecutionRouter:
                         price=result.avg_fill_price,
                     )
                 )
+        elif signal.reduce_only and result.status.value in {"rejected", "failed"}:
+            await self._release_exit_reservation(signal)
 
         large_reason = None
         if result.status.value == "simulated" and result.requested_size >= self._config.notifications.large_order_threshold:
@@ -253,6 +259,18 @@ class ExecutionRouter:
                 reason=large_reason or result.message,
                 latency_ms=result.latency_ms,
             )
+        )
+
+    async def _release_exit_reservation(self, signal: TradeSignal) -> None:
+        if not signal.reduce_only:
+            return
+        client_order_id = (
+            f"{self._config.execution.client_order_id_prefix}-{signal.signal_id[:18]}"
+        )
+        await self._state_store.release_exit(
+            signal.market_id,
+            signal.token_id,
+            client_order_id=client_order_id,
         )
 
     async def _emit_event(self, event: BotEvent) -> None:

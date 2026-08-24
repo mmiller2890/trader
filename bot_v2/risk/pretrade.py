@@ -54,8 +54,15 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
         checks.append(self._mode_check())
         checks.append(await self._kill_switch_check())
         checks.append(self._stale_data_check(snapshot))
+        checks.append(self._reduce_only_check(signal))
         checks.append(await self._single_position_check(signal, proposed_size))
-        checks.append(await self._total_exposure_check(proposed_size))
+        checks.append(
+            await self._total_exposure_check(
+                signal,
+                proposed_size,
+                proposed_price,
+            )
+        )
         checks.append(await self._open_orders_check())
         checks.append(await self._duplicate_guard_check(signal))
         checks.append(
@@ -110,13 +117,54 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
             reason="market_data_fresh" if age <= max_age else f"market_data_stale:{age.total_seconds():.2f}s",
         )
 
+    def _reduce_only_check(self, signal: TradeSignal) -> RiskCheckResult:
+        if signal.reduce_only and signal.side.value != "sell":
+            return RiskCheckResult(
+                check_name="reduce_only",
+                passed=False,
+                reason="reduce_only_requires_sell",
+            )
+        return RiskCheckResult(
+            check_name="reduce_only",
+            passed=True,
+            reason="reduce_only_valid",
+        )
+
     async def _single_position_check(
         self,
         signal: TradeSignal,
         proposed_size: Decimal,
     ) -> RiskCheckResult:
         position = await self._state_store.get_position(signal.market_id, signal.token_id)
-        current = abs(position.quantity) if position is not None else Decimal("0")
+        current_quantity = position.quantity if position is not None else Decimal("0")
+        if self._config.bot.mode in {Mode.BACKTEST, Mode.REPLAY}:
+            signed_delta = (
+                -proposed_size if signal.side.value == "sell" else proposed_size
+            )
+            projected = abs(current_quantity + signed_delta)
+            limit = self._config.risk.max_single_position_size
+            return RiskCheckResult(
+                check_name="max_single_position_size",
+                passed=projected <= limit,
+                reason=(
+                    "single_position_within_limit"
+                    if projected <= limit
+                    else f"single_position_limit:{projected}>{limit}"
+                ),
+            )
+        current = max(current_quantity, Decimal("0"))
+        if signal.side.value == "sell":
+            if proposed_size > current:
+                return RiskCheckResult(
+                    check_name="max_single_position_size",
+                    passed=False,
+                    reason=f"insufficient_position_to_sell:{current}<{proposed_size}",
+                )
+            return RiskCheckResult(
+                check_name="max_single_position_size",
+                passed=True,
+                reason="position_reducing_sell",
+            )
         limit = self._config.risk.max_single_position_size
         projected = current + proposed_size
         return RiskCheckResult(
@@ -125,9 +173,39 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
             reason="single_position_within_limit" if projected <= limit else f"single_position_limit:{projected}>{limit}",
         )
 
-    async def _total_exposure_check(self, proposed_size: Decimal) -> RiskCheckResult:
-        current = await self._state_store.total_absolute_exposure()
-        projected = current + proposed_size
+    async def _total_exposure_check(
+        self,
+        signal: TradeSignal,
+        proposed_size: Decimal,
+        proposed_price: Decimal,
+    ) -> RiskCheckResult:
+        current = await self._state_store.total_marked_exposure()
+        proposed_notional = abs(proposed_size * proposed_price)
+        if self._config.bot.mode in {Mode.BACKTEST, Mode.REPLAY}:
+            position = await self._state_store.get_position(
+                signal.market_id, signal.token_id
+            )
+            current_quantity = (
+                position.quantity if position is not None else Decimal("0")
+            )
+            signed_delta = (
+                -proposed_size if signal.side.value == "sell" else proposed_size
+            )
+            projected_quantity = current_quantity + signed_delta
+            current_position_notional = abs(current_quantity * proposed_price)
+            projected_position_notional = abs(
+                projected_quantity * proposed_price
+            )
+            projected = max(
+                Decimal("0"),
+                current - current_position_notional + projected_position_notional,
+            )
+        else:
+            projected = (
+                max(Decimal("0"), current - proposed_notional)
+                if signal.side.value == "sell"
+                else current + proposed_notional
+            )
         limit = self._config.risk.max_total_exposure
         return RiskCheckResult(
             check_name="max_total_exposure",
