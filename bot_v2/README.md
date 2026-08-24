@@ -1,938 +1,376 @@
-# Polymarket Bot v2
+# Polymarket BTC 15-Minute Trading Bot
 
-Production-minded, dry-run-first Polymarket bot built in Python 3.11+ with typed models, async runtime boundaries, structured JSON logging, and a conservative safety posture.
+A dry-run-first Python trading bot for Polymarket's recurring Bitcoin Up/Down 15-minute markets. It includes automatic market discovery, live order routing behind explicit safety gates, position lifecycle and exit management, reconciliation, snapshots, backtesting, and a local operator dashboard.
 
-This `v2` folder is intentionally separate from the first bot. It keeps the same safe-first implementation goals, but the project description and structure are also documented here as an explicit architecture design, inspired by common patterns seen across open-source Polymarket bots, copy-trading bots, market-making bots, arbitrage bots, Hummingbot, and Freqtrade.
+> [!WARNING]
+> This is experimental trading software, not financial advice. Live orders can lose money, fail, partially fill, or remain exposed during exchange, network, or process failures. Start in dry-run mode, use a dedicated low-balance account, and independently verify exchange positions and orders.
 
-## Start Here
+## Current status
 
-This bot starts in **safe `dry_run` mode** by default.
+Implemented today:
 
-- It does **not** place real trades by default
-- It discovers the current public Bitcoin Up/Down 15-minute market and follows both outcome tokens automatically
-- Every order intent must pass through risk before execution
-- Live trading is scaffolded behind a guard
-- You can run the whole app locally without enabling live trading
+- automatic discovery and rotation of active BTC 15-minute markets;
+- WebSocket order-book ingestion with reconnect backoff;
+- spike-strategy signals with liquidity, exposure, slippage, and duplicate guards;
+- simulated dry-run execution and guarded Polymarket CLOB V2 live execution;
+- idempotent confirmed-fill accounting and exchange reconciliation;
+- managed take-profit, stop-loss, maximum-hold, strategy, and pre-expiry exits;
+- persisted positions, fill checkpoints, realized P&L, lifecycle history, and kill-switch state;
+- a loopback-only dashboard for configuration, preflight, start, stop, halt, and cancel-all controls;
+- deterministic historical backtesting.
 
-If you do not care about the architecture yet and just want to run it safely, go straight to:
+Still planned, not yet implemented:
 
-- `## Fastest Setup`
-- `## Run The Bot`
-- `## Common Problems`
+- supervised recovery from every critical background-task failure;
+- safe automatic live resumption after a process restart;
+- durable Telegram alert delivery and bounded notification retries;
+- bounded long-term memory/journal retention and deployment health checks;
+- formal 24-hour and 72-hour unattended qualification.
 
-## Fastest Setup
+See the [multi-day unattended operations design](backtest/docs/superpowers/specs/2026-08-24-multi-day-unattended-operations-design.md) and [implementation plan](backtest/docs/superpowers/plans/2026-08-24-multi-day-unattended-operations.md) for the remaining reliability work. Until that plan is complete and qualified, treat the bot as supervised software.
 
-If you are brand new to this, copy and paste these commands **one at a time** into Terminal after you open the `bot_v2` folder in Terminal:
-
-```bash
-python3 --version
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install --upgrade pip
-python3 -m pip install -e ".[dev]"
-cp .env.example .env
-python3 -m pytest
-python3 -m app.main
-```
-
-What these commands do:
-
-- check that Python is installed
-- create a private Python environment for this project
-- activate that environment
-- install the project and test tools
-- create your local `.env` file
-- run the tests
-- start the bot in safe `dry_run` mode
-
-If any command fails, go to `## Common Problems`.
-
-## What This v2 Tries To Do
-
-The goal is a simple but production-minded Polymarket bot architecture:
-
-- typed configuration
-- typed domain models
-- event-driven market-data pipeline
-- deterministic strategy logic
-- mandatory pre-trade risk checks
-- dry-run execution pipeline
-- structured journaling and snapshots
-- clear module boundaries so live mode can be enabled later without a rewrite
-
-## Architecture Ideas Used
-
-This project is inspired by patterns commonly found in:
-
-- Polymarket spike and market-making bots: real-time monitoring, small focused strategies, liquidity filters, slippage controls, Telegram alerts
-- Polymarket copy-trading bots: clear config for target accounts, retry limits, and persistence of trade state
-- Arbitrage bots: explicit separation of opportunity detection, decision logic, and execution
-- Hummingbot: connector boundary, strategy base classes, config-driven behavior
-- Freqtrade: one codebase with separate runtime modes like live, backtest, replay, and dry-run
-
-The key design choice is to **borrow patterns, not blindly copy code**.
-
-## Final Folder Tree
+## How it works
 
 ```text
-bot_v2/
-├── app/
-│   ├── main.py
-│   ├── bootstrap.py
-│   ├── modes.py
-│   └── shutdown.py
-├── config/
-│   ├── loader.py
-│   ├── schema.py
-│   ├── bot.yaml
-│   ├── risk.yaml
-│   └── strategies/
-│       └── spike.yaml
-├── clients/
-│   ├── clob_client.py
-│   ├── ws_client.py
-│   ├── auth.py
-│   ├── market_data_client.py
-│   └── rate_limiter.py
-├── models/
-│   ├── market.py
-│   ├── signal.py
-│   ├── order.py
-│   ├── position.py
-│   ├── risk.py
-│   └── events.py
-├── state/
-│   ├── store.py
-│   ├── reconciliation.py
-│   └── cache.py
-├── strategies/
-│   ├── base.py
-│   └── spike.py
-├── execution/
-│   ├── order_builder.py
-│   ├── submitter.py
-│   ├── tracker.py
-│   └── router.py
-├── risk/
-│   ├── pretrade.py
-│   ├── runtime.py
-│   ├── policy.py
-│   └── circuit_breaker.py
-├── portfolio/
-│   ├── exposure.py
-│   ├── pnl.py
-│   └── sizing.py
-├── persistence/
-│   ├── journal.py
-│   ├── snapshots.py
-│   └── db.py
-├── notifications/
-│   ├── events.py
-│   └── telegram.py
-├── backtest/
-│   ├── replay.py
-│   └── metrics.py
-├── scripts/
-│   └── healthcheck.py
-├── tests/
-│   ├── test_config.py
-│   ├── test_risk_pretrade.py
-│   ├── test_spike_strategy.py
-│   ├── test_order_builder.py
-│   └── test_state_store.py
-├── .env.example
-├── pyproject.toml
-├── README.md
-└── Dockerfile
+Gamma market discovery
+        │
+        ▼
+Polymarket market WebSocket ──► normalized order book and snapshots
+        │                                      │
+        │                                      ▼
+        │                               spike strategy
+        │                                      │
+        │                                      ▼
+        │                              pre-trade risk checks
+        │                                      │
+        ▼                                      ▼
+position exit policy ─────────────────► execution router
+                                               │
+                              ┌────────────────┴───────────────┐
+                              ▼                                ▼
+                         dry-run fill                    live CLOB order
+                              │                                │
+                              └──────────────┬─────────────────┘
+                                             ▼
+                                  accounting + reconciliation
+                                             │
+                                             ▼
+                                snapshots, journal, dashboard
 ```
 
-## Module Responsibilities
+All order intents go through the same risk and accounting boundaries. Live mode adds credentials and exchange submission; it does not bypass risk checks.
 
-### `config/`
+## Requirements
 
-Responsibilities:
+- Python 3.11 or newer
+- macOS or Linux
+- Internet access for current-market discovery and live market data
+- Polymarket wallet/CLOB credentials only for live trading
 
-- load config from YAML and environment
-- validate ranges, enums, and safety guards
-- keep secrets separate from strategy and risk tuning
+## Quick start
 
-Key files:
-
-- `config/schema.py`: typed Pydantic config models
-- `config/loader.py`: merge YAML fragments + env secrets
-- `config/bot.yaml`: runtime config
-- `config/risk.yaml`: risk limits
-- `config/strategies/spike.yaml`: strategy parameters
-
-How it interacts:
-
-- loaded first by `app/bootstrap.py`
-- passed into clients, strategy, risk, execution, notifications
-
-### `clients/`
-
-Responsibilities:
-
-- isolate Polymarket-specific client logic
-- isolate WebSocket transport and reconnect logic
-- normalize raw exchange payloads into typed internal models
-
-Key files:
-
-- `clients/clob_client.py`: adapter boundary around `py-clob-client`
-- `clients/ws_client.py`: resilient async WS manager
-- `clients/market_data_client.py`: raw transport -> typed market models
-- `clients/auth.py`: typed credentials extraction
-- `clients/rate_limiter.py`: simple async limiter
-
-How it interacts:
-
-- market data flows from `ws_client.py` -> `market_data_client.py` -> `state/` and `strategies/`
-- execution live path will call `clob_client.py`
-
-### `models/`
-
-Responsibilities:
-
-- define all internal typed objects so modules do not pass raw dicts
-
-Key files:
-
-- `market.py`: orderbook and market snapshot types
-- `signal.py`: strategy outputs
-- `order.py`: order request/result types
-- `position.py`: positions and balances
-- `risk.py`: risk decisions and check results
-- `events.py`: internal event payloads
-
-How it interacts:
-
-- every other module depends on these types
-
-### `state/`
-
-Responsibilities:
-
-- keep the latest runtime truth in memory
-- expose async-safe access for strategies, risk, execution, and housekeeping
-- provide startup reconciliation and historical cache helpers
-
-Key files:
-
-- `store.py`: in-memory state store
-- `reconciliation.py`: startup reconciliation boundary
-- `cache.py`: recent snapshot history for strategies
-
-How it interacts:
-
-- market data updates state
-- strategy reads state history
-- risk checks state
-- execution updates orders and heartbeats
-
-### `strategies/`
-
-Responsibilities:
-
-- convert market conditions into typed signals
-- never place orders directly
-
-Key files:
-
-- `base.py`: strategy interface
-- `spike.py`: deterministic spike strategy
-
-How it interacts:
-
-- consumes typed market snapshots
-- emits `TradeSignal`
-- `execution/router.py` handles the rest
-
-### `risk/`
-
-Responsibilities:
-
-- enforce all pre-trade and runtime safety checks
-- act as mandatory gate before execution
-
-Key files:
-
-- `policy.py`: shared risk interfaces
-- `pretrade.py`: order-intent risk checks
-- `runtime.py`: periodic runtime safety checks
-- `circuit_breaker.py`: repeated-failure guard
-
-How it interacts:
-
-- every signal/order intent must pass through pre-trade risk
-- housekeeping loop runs runtime risk checks continuously
-
-### `execution/`
-
-Responsibilities:
-
-- convert approved signals into concrete orders
-- submit in dry-run or live mode
-- track lifecycle updates
-
-Key files:
-
-- `order_builder.py`: deterministic order creation
-- `submitter.py`: dry-run simulation or live submission
-- `tracker.py`: state updates from order results
-- `router.py`: glue between signal, risk, execution, and journaling
-
-How it interacts:
-
-- input: `TradeSignal`
-- output: `OrderRequest`, `OrderResult`, state updates, events, journal entries
-
-### `portfolio/`
-
-Responsibilities:
-
-- small helpers for sizing, exposure, and PnL
-
-Key files:
-
-- `sizing.py`
-- `exposure.py`
-- `pnl.py`
-
-### `persistence/`
-
-Responsibilities:
-
-- record enough runtime state to recover and inspect behavior after crashes
-
-Key files:
-
-- `journal.py`: append-only JSONL event log
-- `snapshots.py`: save/load current state snapshots
-- `db.py`: minimal SQLite adapter
-
-### `notifications/`
-
-Responsibilities:
-
-- internal event pub/sub
-- operator notifications like Telegram
-
-Key files:
-
-- `events.py`
-- `telegram.py`
-
-### `backtest/`
-
-Responsibilities:
-
-- preserve module boundaries for replay/backtest mode
-
-Key files:
-
-- `replay.py`
-- `metrics.py`
-
-### `app/`
-
-Responsibilities:
-
-- bootstrap everything
-- run reconciliation
-- start loops
-- manage shutdown
-
-Key files:
-
-- `bootstrap.py`
-- `main.py`
-- `modes.py`
-- `shutdown.py`
-
-## Runtime Loop Design
-
-### Option 1: Snapshot + Poll
-
-Pros:
-
-- easy to reason about
-- simple for low-frequency bots
-
-Cons:
-
-- slower reaction time
-- more redundant work
-- easier to miss short-lived spikes
-
-### Option 2: WebSocket Streaming + Event-Driven Signals
-
-Pros:
-
-- closer to how Polymarket-specific spike and market-making bots are usually structured
-- lower latency
-- strategies only run when useful market data arrives
-- fits asyncio naturally
-
-Cons:
-
-- requires reconnect logic and stale-data protection
-
-### Option 3: Fixed-Interval Loop Only
-
-Pros:
-
-- simple housekeeping pattern
-
-Cons:
-
-- poor fit for short-lived orderbook moves
-- wastes cycles when nothing changes
-
-### State Machine vs Simple Loop
-
-Explicit state machine:
-
-- useful later for more complex strategies and fill handling
-- helpful for copy-trading, ladder orders, or market-making workflows
-
-Simpler event-driven loop:
-
-- better for v1
-- less code
-- easier to validate safely
-
-### Recommended Design For This Bot
-
-Use:
-
-- **WebSocket-first market data**
-- **event-driven strategy evaluation on market updates**
-- **a small housekeeping loop for runtime risk and snapshots**
-- **simple execution flow instead of a large explicit state machine**
-
-That is what this project implements.
-
-Why:
-
-- it captures the real-time feel of Polymarket spike/market-making bots
-- it keeps execution and safety paths explicit like good arbitrage bots
-- it still preserves clear future extension points for more advanced order-state machines later
-
-## Risk And Safety Layer
-
-The risk layer lives in `risk/` and sits **between strategy and execution**.
-
-Every order intent must pass through `risk/pretrade.py`.
-
-Implemented checks:
-
-- dry-run/live mode guard
-- kill switch
-- stale market data
-- max single position size
-- max total exposure
-- max open orders
-- duplicate signal/order guard
-- min top-of-book liquidity
-- slippage threshold
-
-Runtime checks:
-
-- stale heartbeat
-- daily loss boundary
-- repeated failures via circuit breaker
-
-Circuit breaker behavior:
-
-- tracks failures within a rolling window
-- trips after configured threshold
-- blocks further action until cooldown expires
-
-## Config And UX
-
-### `.env`
-
-Use `.env` for secrets and environment-specific values:
-
-- `PRIVATE_KEY`
-- `POLYMARKET_PROXY_ADDRESS`
-- `CLOB_API_KEY`
-- `CLOB_SECRET`
-- `CLOB_PASSPHRASE`
-- `RPC_URL`
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
-
-For `exchange.signature_type: 0` (EOA), the bot derives the effective funder
-address from `PRIVATE_KEY`, so `POLYMARKET_PROXY_ADDRESS` may remain empty.
-Signature types `1`, `2`, and `3` require the explicit proxy/contract funder.
-
-### YAML
-
-Use YAML for tunable behavior:
-
-- bot mode
-- intervals
-- risk limits
-- strategy thresholds
-- notification behavior
-
-Example keys:
-
-- `bot.mode`
-- `market_data.reconnect_initial_seconds`
-- `market_data.heartbeat_timeout_seconds`
-- `execution.dry_run_force`
-- `execution.allow_live_trading`
-- `risk.max_open_orders`
-- `risk.max_slippage_bps`
-- `spike_strategy.spike_threshold_bps`
-- `spike_strategy.cooldown_seconds`
-
-Loading flow:
-
-1. load `config/bot.yaml`
-2. overlay `config/risk.yaml`
-3. overlay `config/strategies/spike.yaml`
-4. overlay env secrets from `.env` / process env
-5. validate into typed `AppConfig`
-
-## Logging And Monitoring
-
-This project uses structured JSON logging.
-
-Each important log/event should include where relevant:
-
-- `component`
-- `event_type`
-- `market_id`
-- `token_id`
-- `strategy_name`
-- `signal_id`
-- `client_order_id`
-- `mode`
-- `reason`
-- `latency_ms`
-
-Persistence for reconstruction:
-
-- append-only event journal in `data/journal/events.jsonl`
-- runtime snapshot in `data/snapshots/state.json`
-- minimal SQLite metadata store in `data/bot.sqlite3`
-
-Telegram notifier:
-
-- safe no-op if not configured
-- can send `bot_started`, `kill_switch_tripped`, `repeated_failures`, and large simulated-order alerts
-
-## Deployment And Secrets
-
-### Minimal Deployment
-
-Good v1 deployment target:
-
-- one Linux VM
-- Docker
-- one process running the bot
-- process supervision or container restart policy
-- log collection from stdout
-
-### Docker
-
-This repo includes a basic `Dockerfile`.
-
-### systemd
-
-Not implemented here, but a reasonable production pattern would be:
-
-- run from a dedicated Linux user
-- inject env vars from an env file
-- restart on failure
-- send stdout/stderr to journald
-
-### Secrets
-
-For v1:
-
-- `.env` is acceptable
-
-For stronger production hygiene later:
-
-- VM secret store
-- Docker secrets
-- cloud secret manager
-
-## Data Flow
-
-Incoming market data flows like this:
-
-1. `clients/ws_client.py` receives raw messages
-2. `clients/market_data_client.py` normalizes them into typed market models
-3. `state/store.py` stores latest market snapshot/orderbook
-4. `strategies/spike.py` evaluates the new snapshot
-5. strategy emits a `TradeSignal`
-6. `execution/router.py` records the signal and asks `risk/pretrade.py` for a decision
-7. if risk approves, `execution/order_builder.py` creates an `OrderRequest`
-8. `execution/submitter.py` simulates or submits
-9. `execution/tracker.py` updates state
-10. `persistence/journal.py` and `notifications/events.py` record and publish what happened
-
-## Prioritized Implementation Plan
-
-If you wanted the safest possible path to a usable bot, the order should be:
-
-### First
-
-- typed config
-- typed models
-- state store
-- structured logging
-
-### Second
-
-- websocket boundary
-- market-data normalization
-- one deterministic strategy
-
-### Third
-
-- pre-trade risk engine
-- dry-run execution path
-- journaling and snapshots
-
-### Fourth
-
-- app bootstrap
-- graceful shutdown
-- runtime risk
-- tests
-
-### Fifth
-
-- reconciliation hardening
-- live-mode adapter validation with real SDK behavior
-- deeper order-state handling
-- additional strategies like copy-trading, laddering, or end-cycle behavior
-
-## First-Time Setup
-
-### 1. Install Python
-
-Install Python 3.11 or newer from [python.org/downloads](https://www.python.org/downloads/).
-
-Check it:
-
-```bash
-python3 --version
-```
-
-### 2. Open Terminal and go into this folder
-
-```bash
-cd /full/path/to/bot_v2
-```
-
-### 3. Create a virtual environment
+From the `bot_v2` directory:
 
 ```bash
 python3 -m venv .venv
-```
-
-### 4. Activate it
-
-```bash
 source .venv/bin/activate
-```
-
-If this worked, you will usually see `(.venv)` at the beginning of the line in Terminal.
-
-### 5. Install dependencies
-
-```bash
 python3 -m pip install --upgrade pip
 python3 -m pip install -e ".[dev]"
-```
-
-This may take a minute or two the first time.
-
-### 6. Create `.env`
-
-```bash
 cp .env.example .env
+python3 -m pytest -q -p no:cacheprovider
+python3 -m dashboard.main
 ```
 
-For your first dry-run test, you can leave `.env` alone.
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000). The dashboard binds only to loopback by design.
 
-### 7. Confirm safe mode
+The checked-in configuration starts in `dry_run`. No wallet or CLOB credentials are required for public market discovery and simulated execution.
 
-In `config/bot.yaml`, make sure:
+## Run without the dashboard
 
-```yaml
-mode: dry_run
-```
-
-And under `execution`:
-
-```yaml
-dry_run_force: true
-allow_live_trading: false
-```
-
-## Run The Bot
+Start the bot in the configured mode:
 
 ```bash
 python3 -m app.main
 ```
 
-`python3 -m app.main` starts only a `dry_run` configuration. If the saved operator overlay is armed for live mode, the CLI refuses to start unless you also pass the explicit `--live` flag. Live mode additionally requires every preflight check to pass; see [`docs/live-runbook.md`](docs/live-runbook.md) for the staged shadow-to-live rollout gates.
+Press `Ctrl+C` for a graceful shutdown. An armed live configuration is refused unless the process also receives the explicit live flag:
 
-## Run The Operator Dashboard
+```bash
+python3 -m app.main --live
+```
 
-From the `bot_v2` directory with the virtual environment active:
+Do not use `--live` until every item in the live checklist below passes.
+
+## Operator dashboard
+
+Start it with:
 
 ```bash
 python3 -m dashboard.main
 ```
 
-Open <http://127.0.0.1:8000>. The local dashboard provides runtime status, the active BTC 15-minute market and its rotating Up/Down token IDs, heartbeats, readiness gates, portfolio and order state, an event tail, detailed read-only preflight results, dry-run/live start and stop, mode activation, and confirmation-gated emergency controls. Manual token-list editing is locked while `market_data.automatic_market.enabled` is true.
-
-Automatic discovery uses Polymarket's public Gamma API and does not require wallet or CLOB credentials for dry run. It resolves the active window before the WebSocket starts and rotates the subscription near every 15-minute boundary.
-
-The server rejects non-loopback bind addresses. Its mutation API also requires a per-process token and trusted browser origin. Live activation requires a passing preflight no more than five minutes old plus the exact `ENABLE LIVE` confirmation. Live start then requires `START LIVE`, and runtime bootstrap repeats full preflight before starting. `Return to dry run` atomically restores all three safe-mode flags. Never paste credentials into the dashboard or a chat. If credentials have been exposed, revoke and rotate them before any preflight or trading attempt.
-
-## Live Preflight
-
-Before enabling the three live flags, run the read-only preflight command with the safe `dry_run` defaults still configured. It performs authenticated account reads, geographic compliance, balance/allowance checks, and reconciliation through a read-only adapter, and never submits, signs, or cancels orders:
+Optional arguments:
 
 ```bash
-python3 -m scripts.live_preflight --config-dir config
+python3 -m dashboard.main \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --config-dir config
 ```
 
-Exit `0` means every check passed; exit `2` means live startup would be blocked.
+The dashboard provides:
 
-The checked-in first-live execution profile uses FOK intents, a $1 minimum live BUY notional, a $1.01 hard notional cap, and a one-second market-data freshness limit. Live sizing is adjusted to satisfy the exchange minimum and reduced when the cap or visible top-of-book liquidity is smaller; an intent is rejected locally when all constraints cannot be satisfied together. A FOK submission is recorded as filled only after the exchange confirms a complete match; no configuration can guarantee that counterparties remain available long enough to trade.
+- runtime, market rotation, WebSocket, credential, and readiness status;
+- open orders, balances, positions, managed exits, closed positions, and P&L;
+- recent journal events and safety warnings;
+- editable operator-safe settings;
+- read-only preflight checks;
+- explicit Start, Stop, Emergency Halt, and Cancel All controls.
 
-## Position Lifecycle And Exits
+Destructive or live actions require exact confirmation phrases. The API also requires a per-process operator token and a trusted loopback browser origin.
 
-Confirmed fills become immediately tradable inventory through idempotent cumulative-fill accounting. Entry orders use the configured `FOK`; managed exits use internal `IOC`, mapped by the CLOB adapter to exchange `FAK`, so an exit accepts an immediate partial fill and cancels the remainder. Neither order type guarantees counterparties.
+## Configuration
 
-Exits trigger in this priority:
+Configuration is validated with Pydantic and assembled from:
 
-1. `market_expiry` — the BTC 15-minute market is within `exit_before_market_end_seconds` of its end;
-2. `stop_loss` — executable best-bid return is at or below `-stop_loss_bps`;
-3. `take_profit` — executable best-bid return is at or above `take_profit_bps`;
-4. `max_hold` — the position age reaches `max_hold_seconds`;
-5. `strategy_signal` — the spike strategy emits SELL and `exit_on_strategy_sell` is enabled.
+| File | Purpose |
+|---|---|
+| `config/bot.yaml` | Runtime, market data, exchange, execution, position management, and notifications |
+| `config/risk.yaml` | Exposure, loss, liquidity, staleness, and circuit-breaker limits |
+| `config/strategies/spike.yaml` | Spike strategy behavior |
+| `config/operator.yaml` | Dashboard-managed mode and token scope; ignored by Git |
+| `.env` | Credentials and secrets; ignored by Git |
 
-Initial thresholds are `take_profit_bps: 300`, `stop_loss_bps: 200`, and `max_hold_seconds: 180`; they are starting values for the one-dollar BTC 15-minute profile, not proven parameters.
+The safe mode bundle is:
 
-Exit behavior:
+```yaml
+bot:
+  mode: dry_run
+execution:
+  allow_live_trading: false
+  dry_run_force: true
+```
 
-- One exit attempt is reserved at a time; concurrent snapshots cannot create duplicate exits.
-- A partial or cap-limited fill releases the reservation only after the confirmed delta is durably saved, so the next attempt targets exactly the remaining inventory.
-- Definite rejections retry after `exit_retry_interval_seconds` (2s) and at most `max_exit_attempts` (3) times without a reduction; exhaustion latches `exit_attempts_exhausted:<market>:<token>`.
-- Sub-minimum residual inventory is marked as dust and surfaced on the dashboard; it is never rounded upward and oversold.
-- A confirmed live fill stays locally tradable for `position_confirmation_grace_seconds` (30s) while the Data API catches up; a mismatch after the grace period latches `position_confirmation_timeout:<market>:<token>`.
-- Unknown submission outcomes are never retried, keep their exit reservation, and immediately latch `unknown_order_outcome:<client_id>`.
-- An open sellable position at market end latches `position_open_at_market_end` and blocks rotation.
+`config/operator.example.yaml` contains a safe operator overlay example.
 
-After any unknown-outcome or accounting halt, return to dry run and repeat the read-only preflight before considering live trading again.
+## Live trading checklist
 
-## Run A Backtest
+Live mode requires all three guards:
 
-The backtest is fully offline: it never starts the WebSocket, instantiates a CLOB client, or calls the exchange. It replays normalized historical book events through the configured spike strategy, existing pre-trade risk checks, and a deterministic paper exchange that reconstructs full books, consumes depth, produces partial fills, charges fees, and tracks cash, collateral, positions, and equity.
+```yaml
+bot:
+  mode: live
+execution:
+  allow_live_trading: true
+  dry_run_force: false
+```
+
+It also requires environment-backed credentials. Copy `.env.example` to `.env` and populate only your local file:
+
+| Variable | Purpose |
+|---|---|
+| `PRIVATE_KEY` | Wallet signing key |
+| `POLYMARKET_PROXY_ADDRESS` | Effective funded account for proxy/contract signature types |
+| `CLOB_API_KEY` | Polymarket CLOB API key |
+| `CLOB_SECRET` | Polymarket CLOB API secret |
+| `CLOB_PASSPHRASE` | Polymarket CLOB API passphrase |
+| `RPC_URL` | Polygon RPC endpoint when required |
+| `TELEGRAM_BOT_TOKEN` | Optional Telegram notifier token |
+| `TELEGRAM_CHAT_ID` | Optional Telegram destination |
+
+Before enabling live mode:
+
+1. Keep the safe dry-run flags enabled.
+2. Use a dedicated account with only the amount you are prepared to risk.
+3. Verify the configured signature type and effective funder address.
+4. Verify USDC balance and exchange allowance.
+5. Run the read-only preflight:
+
+   ```bash
+   python3 -m scripts.live_preflight --config-dir config
+   ```
+
+6. Require every preflight check to pass. Exit code `0` means pass; `2` means blocked.
+7. Use the dashboard to enable live mode with the exact confirmation.
+8. Start live trading with the exact `START LIVE` confirmation.
+9. Independently confirm the first order, fill, and resulting position on Polymarket.
+
+Runtime bootstrap repeats the full preflight and startup reconciliation before it permits live trading.
+
+> [!IMPORTANT]
+> Credentials previously pasted into chat, logs, screenshots, issues, or source code should be treated as compromised. Revoke and rotate them before funding or running the account.
+
+For detailed operating procedures, see the [live runbook](docs/live-runbook.md).
+
+## Automatic BTC market rotation
+
+With `market_data.automatic_market.enabled: true`, the bot:
+
+1. discovers the active `btc-updown-15m` market through the public Gamma API;
+2. validates that the market is active, open, and order-book enabled;
+3. subscribes to both outcome-token books;
+4. starts exit handling before the current window ends;
+5. rotates the WebSocket subscription to the next market only when the ending market is safe to leave.
+
+If sellable inventory remains at market end, rotation fails closed and activates the kill switch instead of silently abandoning the position.
+
+## Position lifecycle and selling
+
+A confirmed BUY creates or extends a managed position. The exit manager can generate reduce-only SELL orders for:
+
+- strategy sell signals;
+- take-profit thresholds;
+- stop-loss thresholds;
+- maximum holding time;
+- approaching market expiration.
+
+Exit reservations prevent duplicate concurrent sells. Failed exits retry according to configuration, and exhausting the exit-attempt budget activates the persisted kill switch. Confirmed partial and full SELL fills reduce inventory and update realized P&L idempotently.
+
+No software can guarantee a fill. IOC/FOK behavior, price, available liquidity, order size, balance, allowance, exchange validation, and network conditions all affect execution.
+
+## Safety model
+
+Important protections include:
+
+- dry-run mode by default;
+- explicit live-arm flags plus an explicit process/dashboard confirmation;
+- geoblock, credential, balance, allowance, market, and authenticated-account preflight checks;
+- maximum order, position, exposure, open-order, daily-loss, liquidity, slippage, and data-age limits;
+- duplicate-signal and pending-exit entry guards;
+- startup and periodic exchange reconciliation;
+- cumulative fill checkpoints that prevent double accounting;
+- persisted exit reservations and kill-switch state;
+- cancel-all on runtime safety halt and graceful live shutdown;
+- sanitized external error reporting to reduce secret leakage.
+
+Safety failures intentionally require investigation. Do not clear or work around the kill switch until the exchange orders, positions, balances, allowance, and local snapshot agree.
+
+## Testing
+
+Run the complete suite:
+
+```bash
+python3 -m pytest -q -p no:cacheprovider
+```
+
+Compile every package without writing bytecode into the repository:
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/polymarket-bot-pyc \
+python3 -m compileall -q \
+  app backtest clients config dashboard execution models notifications \
+  persistence portfolio risk scripts state strategies tests
+```
+
+Useful focused suites:
+
+```bash
+python3 -m pytest -q tests/test_live_preflight.py
+python3 -m pytest -q tests/test_reconciliation.py tests/test_position_accounting.py
+python3 -m pytest -q tests/test_exit_manager.py tests/test_rotation_gate.py
+python3 -m pytest -q tests/test_dashboard_controller.py tests/test_dashboard_api.py
+```
+
+## Backtesting
+
+Run the included example:
 
 ```bash
 python3 -m backtest.cli \
   --snapshots backtest/example_orderbook_events.json \
-  --output backtest/results/realistic-backtest.json
+  --output backtest/results/example-backtest.json
 ```
 
-For a legacy smoke test, use the included [`backtest/example_snapshots.json`](backtest/example_snapshots.json) file as `--snapshots`; it is automatically converted to one-level book events.
+The backtester supports normalized order-book events and legacy `MarketSnapshot` arrays. It models fees, liquidity consumption, sequence gaps, position/equity changes, and configured risk behavior. Backtest results are simulations, not evidence of future performance or live fill quality.
 
-### Input formats
+## Runtime data
 
-The CLI accepts either a JSON array of legacy `MarketSnapshot` objects (no `event_type` field) or a JSON array of richer `book_snapshot` and `book_delta` events. Legacy objects become one-level full-book snapshots with deterministic sequence IDs. See [`backtest/example_orderbook_events.json`](backtest/example_orderbook_events.json) for the event format:
+Runtime state defaults to `data/` and can be moved with `BOT_DATA_DIR`:
 
-```json
-[
-  {
-    "event_type": "book_snapshot",
-    "market_id": "market-1",
-    "token_id": "token-1",
-    "bids": [{"price": "0.49", "size": "100"}],
-    "asks": [{"price": "0.51", "size": "100"}],
-    "sequence_id": 100,
-    "source_ts": "2025-01-01T00:00:00+00:00",
-    "received_ts": "2025-01-01T00:00:00+00:00"
-  }
-]
+```text
+data/
+├── bot.sqlite3
+├── journal/events.jsonl
+└── snapshots/state.json
 ```
 
-A full snapshot replaces the book for that `(market_id, token_id)`. A delta upserts non-zero levels and deletes zero-size levels. Events are processed deterministically in `(received_ts, source_ts, sequence_id)` order. Out-of-order sequence numbers and crossed books are rejected; sequence gaps are rejected by default and only full snapshots may resynchronize the book.
+These files may contain order, position, balance, and operational metadata. They are ignored by Git and should be backed up and protected like account records.
 
-### Paper-exchange behavior
+## Project layout
 
-- Approved buys consume asks from lowest price upward; approved sells consume bids from highest price downward.
-- The execution limit derives from the current best quote plus `execution.max_slippage_bps`.
-- `FOK` orders fill completely or leave the book and portfolio untouched. `IOC` and `GTC` may partially fill; this version does not model a resting maker queue, so any remainder is reported unfilled.
-- Taker fees are `notional * taker_fee_bps / 10000` and reduce cash and net P&L. Position `realized_pnl` and `unrealized_pnl` remain gross of fees.
-- Signed positions are preserved: a negative position is a synthetic short and reserves `max_payout_per_share` USDC per short share (maximum prediction-market payout liability). Available cash is `cash - reserved_cash`, and a fill is rejected when projected cash falls below projected reserves.
-- After every event, `equity == cash + sum(position.quantity * last_mark_price)` and `net_pnl == equity - starting_cash`.
-
-### Backtest YAML settings
-
-Under `backtest` in `bot.yaml`:
-
-```yaml
-backtest:
-  starting_cash: 1000          # initial USDC balance
-  taker_fee_bps: 10            # taker fee in basis points
-  allow_short_positions: true  # permit synthetic shorts with collateral
-  reject_sequence_gaps: true   # require contiguous delta sequence ids
-  max_payout_per_share: 1      # collateral reserved per short share
+```text
+bot_v2/
+├── app/              # Bootstrap, runtime lifecycle, and shutdown
+├── backtest/         # Historical replay, paper exchange, metrics, and plans/specs
+├── clients/          # Gamma, WebSocket, CLOB, Data API, geoblock, and book adapters
+├── config/           # Typed configuration and safe checked-in defaults
+├── dashboard/        # Local FastAPI operator console
+├── execution/        # Risk routing, order building, submission, and tracking
+├── models/           # Typed domain models
+├── notifications/    # Event bus and Telegram boundary
+├── persistence/      # Journal, SQLite metadata, and snapshots
+├── portfolio/        # Exposure, sizing, and position exits
+├── risk/             # Pre-trade and runtime risk policies
+├── scripts/          # Health and live-preflight commands
+├── state/            # In-memory state and exchange reconciliation
+├── strategies/       # Trading strategy implementations
+└── tests/            # Runtime, exchange-boundary, dashboard, and safety tests
 ```
 
-### Output
+## Documentation
 
-The output file retains `signals`, `order_results`, `positions`, `equity_curve`, and `metrics`, and adds `execution_reports` (individual fills, VWAP, fees, filled size, unfilled remainder, and executable liquidity inside the limit) and `portfolio_snapshots` (cash, reserved/available cash, position value, equity, realized/unrealized/gross/net P&L, fees, and positions per event). Metrics add `starting_cash`, `ending_cash`, `ending_equity`, `reserved_cash`, `fees_paid`, `gross_pnl`, `net_pnl`, `fill_rate`, and maximum drawdown; `total_pnl` remains as an alias for `net_pnl`.
+- [Live trading runbook](docs/live-runbook.md)
+- [Dashboard design](backtest/docs/superpowers/specs/2026-08-24-dashboard-live-control-design.md)
+- [Position lifecycle and exit design](backtest/docs/superpowers/specs/2026-08-24-position-lifecycle-exit-management-design.md)
+- [Lifecycle safety fixes plan](backtest/docs/superpowers/plans/2026-08-24-position-lifecycle-safety-fixes.md)
+- [Multi-day unattended operations design](backtest/docs/superpowers/specs/2026-08-24-multi-day-unattended-operations-design.md)
+- [Multi-day unattended operations implementation plan](backtest/docs/superpowers/plans/2026-08-24-multi-day-unattended-operations.md)
 
-Use `--config-dir /path/to/config` to supply a different `bot.yaml`, `risk.yaml`, or `strategies/spike.yaml`. The command always forces `backtest` mode, then writes signals, accepted/rejected orders, final positions, metrics, and an equity curve to the output file.
+## Troubleshooting
 
-### Modeling limitations
+### The dashboard says a fresh preflight is required
 
-This is a conservative taker simulator, not an execution-quality estimate:
+Preflight results expire after five minutes and are invalidated by configuration changes or failed live startup. Return to safe dry-run flags, run preflight again, resolve every failed check, then re-enable live mode.
 
-- no maker queue or resting-order model; unfilled remainder is cancelled
-- no latency model
-- fixed configurable taker fee rather than market-specific Polymarket fee curves
-- synthetic shorts reserve full payout collateral but do not emulate token minting
-- no settlement/resolution event yet
+### The bot is running but does not trade
 
-Future work (maker queues, latency, settlement, parameter sweeps, market-specific fee curves) is intentionally out of scope until the taker simulator above is verified.
+Check:
 
-## What Should Happen
+- strategy target scope and automatic-market health;
+- whether the market snapshot is fresh;
+- top-of-book liquidity and configured minimums;
+- cooldown and duplicate-signal windows;
+- position, exposure, open-order, and daily-loss limits;
+- pending exit reservations and the kill switch;
+- journaled risk-decision reasons.
 
-If the bot starts correctly:
+A quiet bot can be correct behavior: risk rejection is preferable to forcing a low-quality trade.
 
-- it runs in `dry_run` mode
-- it does not place real trades
-- it creates a `data/` folder if needed
-- it starts writing runtime files
+### An order receives HTTP 400
 
-The main files it writes are:
+Inspect the sanitized journal reason and verify token ID, side, price precision, tick size, minimum order/notional, time in force, balance, allowance, signature type, funder address, and whether the market is still accepting orders. Do not retry malformed orders blindly.
 
-- `data/journal/events.jsonl`
-- `data/snapshots/state.json`
-- `data/bot.sqlite3`
+### WebSocket data stops
 
-## How To Stop The Bot
+The manager reconnects with capped backoff. If transport or market-data heartbeats remain stale, runtime risk activates the kill switch. Verify network access and the active market before restarting.
 
-Press:
+### Live trading halted
 
-```bash
-Ctrl+C
-```
+Treat the persisted halt reason as an intervention request. Check Polymarket orders and positions first, preserve `data/snapshots/state.json` and `data/journal/events.jsonl`, then follow the live runbook. Restarting the process does not intentionally erase the persisted kill switch.
 
-The bot should stop cleanly and save a snapshot before exiting.
+## Security
 
-## Run The Tests
+- Never commit `.env`, `config/operator.yaml`, `data/`, private keys, CLOB credentials, bot tokens, or funded account details.
+- Keep the dashboard bound to loopback; use SSH tunneling rather than exposing it directly.
+- Use a dedicated low-balance wallet and the smallest practical live order cap.
+- Rotate any credential that may have been exposed.
+- Review staged changes before every push:
 
-```bash
-python3 -m pytest
-```
+  ```bash
+  git diff --cached --check
+  git status --short
+  ```
 
-## Runtime Files
+## Development workflow
 
-By default, the bot writes:
-
-- `data/journal/events.jsonl`
-- `data/snapshots/state.json`
-- `data/bot.sqlite3`
-
-You can override the base directory with:
-
-```bash
-export BOT_DATA_DIR=/path/to/data
-```
-
-## Common Problems
-
-### `python3: command not found`
-
-Python is not installed yet, or macOS cannot find it.
-
-Install Python 3.11 or newer from [python.org/downloads](https://www.python.org/downloads/) and then run:
-
-```bash
-python3 --version
-```
-
-### `No module named pytest`
-
-The test tools are not installed yet.
-
-Run:
-
-```bash
-source .venv/bin/activate
-python3 -m pip install -e ".[dev]"
-```
-
-Then try:
-
-```bash
-python3 -m pytest
-```
-
-### `No module named pydantic` or another package name
-
-The project dependencies are not installed yet, or the virtual environment is not active.
-
-Run:
-
-```bash
-source .venv/bin/activate
-python3 -m pip install -e ".[dev]"
-```
-
-### `source .venv/bin/activate` says file not found
-
-You have not created the virtual environment yet.
-
-Run:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### The bot starts but seems quiet
-
-That can be normal in early dry-run usage.
-
-This version is mainly for:
-
-- validating startup
-- validating config loading
-- validating risk and execution flow
-- validating journaling and snapshots
-- validating the runtime architecture
-
-### I want to start over
-
-Stop the bot first with `Ctrl+C`, then run:
-
-```bash
-rm -rf .venv
-rm -rf data
-```
-
-Then repeat the steps in `## Fastest Setup`.
-
-## Important Live-Mode Note
-
-`live` mode is intentionally scaffolded but guarded.
-
-This project does **not** guess unsupported Polymarket SDK hosts, methods, or auth flows. Exchange behavior is isolated in `clients/clob_client.py`; live startup remains fail-closed behind current market discovery, authenticated reads, geoblock, collateral/allowance, reconciliation, and runtime risk checks.
+Changes to live execution, reconciliation, accounting, exits, runtime controls, or persistence should include regression tests that fail before the fix and pass afterward. Keep exchange SDK interaction inside client adapters, preserve typed boundaries, and prefer fail-closed behavior when exchange truth is unavailable.
