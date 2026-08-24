@@ -97,3 +97,12 @@ class FillApplication(BaseModel):
     delta_notional: Decimal = Field(ge=0)
     duplicate: bool
     position: Position | None = None
+
+
+class PositionMergeResult(BaseModel):
+    """Outcome of merging remote positions into local confirmed state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    deferred_keys: list[str] = Field(default_factory=list)
+    expired_keys: list[str] = Field(default_factory=list)

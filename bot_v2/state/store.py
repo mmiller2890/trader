@@ -16,6 +16,7 @@ from models.position import (
     FillCheckpoint,
     Position,
     PositionLifecycle,
+    PositionMergeResult,
 )
 from models.signal import TradeSignal
 from portfolio.exposure import total_marked_exposure
@@ -177,6 +178,60 @@ class InMemoryStateStore:
                 (position.market_id, position.token_id): position
                 for position in positions
             }
+
+    async def merge_authoritative_positions(
+        self,
+        remote: list[Position],
+        *,
+        now: datetime,
+    ) -> PositionMergeResult:
+        """Merge remote truth while preserving pending confirmed local fills."""
+
+        async with self._lock:
+            remote_map = {
+                (position.market_id, position.token_id): position
+                for position in remote
+            }
+            keys = set(self._positions) | set(remote_map) | set(self._lifecycles)
+            deferred: list[str] = []
+            expired: list[str] = []
+            for key in sorted(keys):
+                local = self._positions.get(key)
+                remote_position = remote_map.get(key)
+                local_quantity = local.quantity if local is not None else Decimal("0")
+                remote_quantity = (
+                    remote_position.quantity
+                    if remote_position is not None
+                    else Decimal("0")
+                )
+                if local_quantity == remote_quantity:
+                    lifecycle = self._lifecycles.get(key)
+                    if lifecycle is not None and lifecycle.confirmation_deadline is not None:
+                        self._lifecycles[key] = lifecycle.model_copy(
+                            update={"confirmation_deadline": None}
+                        )
+                    if remote_position is not None:
+                        self._positions[key] = remote_position
+                    else:
+                        self._positions.pop(key, None)
+                    continue
+                lifecycle = self._lifecycles.get(key)
+                if lifecycle is not None and lifecycle.confirmation_deadline is not None:
+                    if now < lifecycle.confirmation_deadline:
+                        deferred.append(f"{key[0]}:{key[1]}")
+                        continue
+                    expired.append(f"{key[0]}:{key[1]}")
+                    self._lifecycles[key] = lifecycle.model_copy(
+                        update={"confirmation_deadline": None}
+                    )
+                if remote_position is not None:
+                    self._positions[key] = remote_position
+                else:
+                    self._positions.pop(key, None)
+            return PositionMergeResult(
+                deferred_keys=deferred,
+                expired_keys=expired,
+            )
 
     async def get_position(self, market_id: str, token_id: str) -> Position | None:
         """Get position by market token."""

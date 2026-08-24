@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Protocol
 
 from config.schema import Mode
-from models.order import OrderResult
+from models.order import OrderResult, OrderStatus
 from models.position import Position
 from pydantic import BaseModel, ConfigDict, Field
 from state.store import InMemoryStateStore
@@ -35,6 +37,15 @@ class PositionsReader(Protocol):
         """Return current positions for a user address."""
 
 
+class PositionMergeResult(BaseModel):
+    """Outcome of merging remote positions into local confirmed state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    deferred_keys: list[str] = Field(default_factory=list)
+    expired_keys: list[str] = Field(default_factory=list)
+
+
 class ReconciliationReport(BaseModel):
     """Startup reconciliation result."""
 
@@ -47,6 +58,7 @@ class ReconciliationReport(BaseModel):
     remote_open_orders: int = Field(ge=0)
     missing_on_remote: list[str] = Field(default_factory=list)
     missing_locally: list[str] = Field(default_factory=list)
+    deferred_positions: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
 
@@ -61,18 +73,35 @@ class ReconciliationService:
         open_orders_reader: OpenOrdersReader | None = None,
         positions_reader: PositionsReader | None = None,
         funder_address: str | None = None,
+        now: Callable[[], datetime] = utc_now,
     ) -> None:
         self._state_store = state_store
         self._mode = mode
         self._open_orders_reader = open_orders_reader
         self._positions_reader = positions_reader
         self._funder_address = funder_address
+        self._now = now
 
     async def reconcile_startup(self) -> ReconciliationReport:
         """Run conservative startup reconciliation."""
 
+        return await self._reconcile(authoritative_positions=False)
+
+    async def reconcile_runtime(self) -> ReconciliationReport:
+        """Refresh mutable account state while conservatively resolving orders."""
+
+        return await self._reconcile(authoritative_positions=True)
+
+    async def _reconcile(
+        self,
+        *,
+        authoritative_positions: bool,
+    ) -> ReconciliationReport:
+        """Reconcile local state against current exchange reads."""
+
         local = await self._state_store.get_open_orders()
-        local_ids = {item.client_order_id for item in local}
+        local_by_identity = {_order_identity(item): item for item in local}
+        local_ids = set(local_by_identity)
 
         remote: list[OrderResult] = []
         errors: list[str] = []
@@ -80,27 +109,89 @@ class ReconciliationService:
             errors.append("open_orders_reader_not_configured")
         else:
             try:
-                remote = self._open_orders_reader.get_open_orders()
+                remote = await asyncio.to_thread(
+                    self._open_orders_reader.get_open_orders
+                )
             except Exception as exc:
-                errors.append(f"remote_open_orders_fetch_failed:{exc}")
+                errors.append(
+                    f"remote_open_orders_fetch_failed:{type(exc).__name__}"
+                )
 
-        remote_ids = {item.client_order_id for item in remote}
+        remote_ids = {_order_identity(item) for item in remote}
         missing_on_remote = sorted(local_ids - remote_ids)
         missing_locally = sorted(remote_ids - local_ids)
 
-        for remote_order in remote:
-            await self._state_store.set_order_status(remote_order)
-
-        if self._positions_reader is not None:
+        unresolved_missing: list[str] = []
+        get_order = getattr(self._open_orders_reader, "get_order", None)
+        for order_id in missing_on_remote:
+            local_order = local_by_identity[order_id]
+            if not callable(get_order):
+                unresolved_missing.append(order_id)
+                continue
             try:
-                remote_positions = self._positions_reader.get_positions(
-                    self._funder_address or ""
+                latest = await asyncio.to_thread(
+                    get_order,
+                    order_id,
+                    client_order_id=local_order.client_order_id,
                 )
             except Exception as exc:
-                errors.append(f"remote_positions_fetch_failed:{exc}")
+                errors.append(
+                    f"remote_order_fetch_failed:{order_id}:{type(exc).__name__}"
+                )
+                unresolved_missing.append(order_id)
+                continue
+            if latest.status in {
+                OrderStatus.CANCELLED,
+                OrderStatus.FILLED,
+                OrderStatus.REJECTED,
+                OrderStatus.FAILED,
+            }:
+                await self._state_store.set_order_status(latest)
+            else:
+                unresolved_missing.append(order_id)
+        missing_on_remote = unresolved_missing
+
+        for remote_order in remote:
+            identity = _order_identity(remote_order)
+            local_order = local_by_identity.get(identity)
+            reconciled_order = (
+                remote_order.model_copy(
+                    update={"client_order_id": local_order.client_order_id}
+                )
+                if local_order is not None
+                else remote_order
+            )
+            await self._state_store.set_order_status(reconciled_order)
+
+        deferred_positions: list[str] = []
+        if self._positions_reader is not None:
+            positions_fetch_succeeded = False
+            try:
+                remote_positions = await asyncio.to_thread(
+                    self._positions_reader.get_positions,
+                    self._funder_address or "",
+                )
+                positions_fetch_succeeded = True
+            except Exception as exc:
+                errors.append(
+                    f"remote_positions_fetch_failed:{type(exc).__name__}"
+                )
                 remote_positions = []
             local_positions = await self._state_store.get_positions()
-            if not self._positions_match(local_positions, remote_positions):
+            if positions_fetch_succeeded and authoritative_positions:
+                merge = await self._state_store.merge_authoritative_positions(
+                    remote_positions,
+                    now=self._now(),
+                )
+                deferred_positions = merge.deferred_keys
+                for key in merge.expired_keys:
+                    errors.append(f"position_confirmation_timeout:{key}")
+            elif positions_fetch_succeeded and not local_positions:
+                await self._state_store.replace_positions(remote_positions)
+            elif positions_fetch_succeeded and not self._positions_match(
+                local_positions,
+                remote_positions,
+            ):
                 errors.append("position_mismatch")
 
         ok = not errors and not missing_on_remote
@@ -132,6 +223,7 @@ class ReconciliationService:
             remote_open_orders=len(remote),
             missing_on_remote=missing_on_remote,
             missing_locally=missing_locally,
+            deferred_positions=deferred_positions,
             errors=errors,
         )
 
@@ -149,3 +241,9 @@ class ReconciliationService:
             for position in remote
         }
         return local_map == remote_map
+
+
+def _order_identity(order: OrderResult) -> str:
+    """Use the exchange identifier when one has been assigned."""
+
+    return order.exchange_order_id or order.client_order_id
