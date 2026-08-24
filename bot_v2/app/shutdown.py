@@ -49,15 +49,33 @@ async def shutdown_app(services: AppServices, tasks: Iterable[asyncio.Task[objec
             )
             await _persist_cancel_failure(services, "cancel_all_timeout")
         except Exception as exc:
+            reason = f"cancel_all_failed:{type(exc).__name__}"
             logger.critical(
                 "cancel-all failed during shutdown",
                 extra={
                     "component": "shutdown",
                     "event_type": "cancel_all_failed",
-                    "reason": str(exc),
+                    "reason": reason,
                 },
             )
-            await _persist_cancel_failure(services, f"cancel_all_failed:{exc}")
+            await _persist_cancel_failure(services, reason)
 
-    await services.snapshots.save_from_state(services.state_store)
-    await services.ws_manager.stop()
+    cleanup_failures: list[str] = []
+    try:
+        await services.snapshots.save_from_state(services.state_store)
+    except Exception as exc:
+        cleanup_failures.append(f"snapshot:{type(exc).__name__}")
+    market_rotator = getattr(services, "market_rotator", None)
+    if market_rotator is not None:
+        try:
+            await market_rotator.stop()
+        except Exception as exc:
+            cleanup_failures.append(f"market_rotator:{type(exc).__name__}")
+    try:
+        await services.ws_manager.stop()
+    except Exception as exc:
+        cleanup_failures.append(f"websocket:{type(exc).__name__}")
+    if cleanup_failures:
+        raise RuntimeError(
+            "shutdown_cleanup_failed:" + ",".join(cleanup_failures)
+        )
