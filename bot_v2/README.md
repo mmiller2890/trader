@@ -9,6 +9,7 @@ This `v2` folder is intentionally separate from the first bot. It keeps the same
 This bot starts in **safe `dry_run` mode** by default.
 
 - It does **not** place real trades by default
+- It discovers the current public Bitcoin Up/Down 15-minute market and follows both outcome tokens automatically
 - Every order intent must pass through risk before execution
 - Live trading is scaffolded behind a guard
 - You can run the whole app locally without enabling live trading
@@ -463,6 +464,10 @@ Use `.env` for secrets and environment-specific values:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 
+For `exchange.signature_type: 0` (EOA), the bot derives the effective funder
+address from `PRIVATE_KEY`, so `POLYMARKET_PROXY_ADDRESS` may remain empty.
+Signature types `1`, `2`, and `3` require the explicit proxy/contract funder.
+
 ### YAML
 
 Use YAML for tunable behavior:
@@ -680,17 +685,59 @@ allow_live_trading: false
 python3 -m app.main
 ```
 
-`python3 -m app.main` uses `dry_run` until the final operator gate. Live mode additionally requires every preflight check to pass; see [`docs/live-runbook.md`](docs/live-runbook.md) for the staged shadow-to-live rollout gates.
+`python3 -m app.main` starts only a `dry_run` configuration. If the saved operator overlay is armed for live mode, the CLI refuses to start unless you also pass the explicit `--live` flag. Live mode additionally requires every preflight check to pass; see [`docs/live-runbook.md`](docs/live-runbook.md) for the staged shadow-to-live rollout gates.
+
+## Run The Operator Dashboard
+
+From the `bot_v2` directory with the virtual environment active:
+
+```bash
+python3 -m dashboard.main
+```
+
+Open <http://127.0.0.1:8000>. The local dashboard provides runtime status, the active BTC 15-minute market and its rotating Up/Down token IDs, heartbeats, readiness gates, portfolio and order state, an event tail, detailed read-only preflight results, dry-run/live start and stop, mode activation, and confirmation-gated emergency controls. Manual token-list editing is locked while `market_data.automatic_market.enabled` is true.
+
+Automatic discovery uses Polymarket's public Gamma API and does not require wallet or CLOB credentials for dry run. It resolves the active window before the WebSocket starts and rotates the subscription near every 15-minute boundary.
+
+The server rejects non-loopback bind addresses. Its mutation API also requires a per-process token and trusted browser origin. Live activation requires a passing preflight no more than five minutes old plus the exact `ENABLE LIVE` confirmation. Live start then requires `START LIVE`, and runtime bootstrap repeats full preflight before starting. `Return to dry run` atomically restores all three safe-mode flags. Never paste credentials into the dashboard or a chat. If credentials have been exposed, revoke and rotate them before any preflight or trading attempt.
 
 ## Live Preflight
 
-Before any live startup, run the read-only preflight command. It performs authenticated account reads, geographic compliance, balance/allowance checks, and reconciliation, and never submits, signs, or cancels orders:
+Before enabling the three live flags, run the read-only preflight command with the safe `dry_run` defaults still configured. It performs authenticated account reads, geographic compliance, balance/allowance checks, and reconciliation through a read-only adapter, and never submits, signs, or cancels orders:
 
 ```bash
 python3 -m scripts.live_preflight --config-dir config
 ```
 
 Exit `0` means every check passed; exit `2` means live startup would be blocked.
+
+The checked-in first-live execution profile uses FOK intents, a $1 minimum live BUY notional, a $1.01 hard notional cap, and a one-second market-data freshness limit. Live sizing is adjusted to satisfy the exchange minimum and reduced when the cap or visible top-of-book liquidity is smaller; an intent is rejected locally when all constraints cannot be satisfied together. A FOK submission is recorded as filled only after the exchange confirms a complete match; no configuration can guarantee that counterparties remain available long enough to trade.
+
+## Position Lifecycle And Exits
+
+Confirmed fills become immediately tradable inventory through idempotent cumulative-fill accounting. Entry orders use the configured `FOK`; managed exits use internal `IOC`, mapped by the CLOB adapter to exchange `FAK`, so an exit accepts an immediate partial fill and cancels the remainder. Neither order type guarantees counterparties.
+
+Exits trigger in this priority:
+
+1. `market_expiry` — the BTC 15-minute market is within `exit_before_market_end_seconds` of its end;
+2. `stop_loss` — executable best-bid return is at or below `-stop_loss_bps`;
+3. `take_profit` — executable best-bid return is at or above `take_profit_bps`;
+4. `max_hold` — the position age reaches `max_hold_seconds`;
+5. `strategy_signal` — the spike strategy emits SELL and `exit_on_strategy_sell` is enabled.
+
+Initial thresholds are `take_profit_bps: 300`, `stop_loss_bps: 200`, and `max_hold_seconds: 180`; they are starting values for the one-dollar BTC 15-minute profile, not proven parameters.
+
+Exit behavior:
+
+- One exit attempt is reserved at a time; concurrent snapshots cannot create duplicate exits.
+- A partial or cap-limited fill releases the reservation only after the confirmed delta is durably saved, so the next attempt targets exactly the remaining inventory.
+- Definite rejections retry after `exit_retry_interval_seconds` (2s) and at most `max_exit_attempts` (3) times without a reduction; exhaustion latches `exit_attempts_exhausted:<market>:<token>`.
+- Sub-minimum residual inventory is marked as dust and surfaced on the dashboard; it is never rounded upward and oversold.
+- A confirmed live fill stays locally tradable for `position_confirmation_grace_seconds` (30s) while the Data API catches up; a mismatch after the grace period latches `position_confirmation_timeout:<market>:<token>`.
+- Unknown submission outcomes are never retried, keep their exit reservation, and immediately latch `unknown_order_outcome:<client_id>`.
+- An open sellable position at market end latches `position_open_at_market_end` and blocks rotation.
+
+After any unknown-outcome or accounting halt, return to dry run and repeat the read-only preflight before considering live trading again.
 
 ## Run A Backtest
 
@@ -888,4 +935,4 @@ Then repeat the steps in `## Fastest Setup`.
 
 `live` mode is intentionally scaffolded but guarded.
 
-This project does **not** guess unsupported Polymarket SDK hosts, methods, or auth flows. Any uncertainty is isolated in `clients/clob_client.py`, and live startup remains blocked until that adapter is explicitly validated against the official SDK behavior you plan to use.
+This project does **not** guess unsupported Polymarket SDK hosts, methods, or auth flows. Exchange behavior is isolated in `clients/clob_client.py`; live startup remains fail-closed behind current market discovery, authenticated reads, geoblock, collateral/allowance, reconciliation, and runtime risk checks.
