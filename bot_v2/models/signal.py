@@ -5,9 +5,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
+from typing import Self
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from models.order import OrderTimeInForce
 
 
 def utc_now() -> datetime:
@@ -33,6 +36,7 @@ class SignalType(str, Enum):
     """Signal class for bookkeeping and analytics."""
 
     PRICE_SPIKE = "price_spike"
+    POSITION_EXIT = "position_exit"
 
 
 class TradeSignal(BaseModel):
@@ -51,3 +55,14 @@ class TradeSignal(BaseModel):
     observed_move_bps: float = Field(ge=0.0)
     created_at: datetime = Field(default_factory=utc_now)
     reason: str = Field(min_length=1)
+    requested_size: Decimal | None = Field(default=None, gt=Decimal("0"))
+    reduce_only: bool = False
+    time_in_force: OrderTimeInForce | None = None
+
+    @model_validator(mode="after")
+    def validate_exit_intent(self) -> Self:
+        if self.signal_type == SignalType.POSITION_EXIT and not self.reduce_only:
+            raise ValueError("position_exit signals require reduce_only=true")
+        if self.reduce_only and self.side != SignalSide.SELL:
+            raise ValueError("reduce_only signals require side=sell")
+        return self

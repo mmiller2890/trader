@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from enum import Enum
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
@@ -50,6 +50,22 @@ class BotConfig(BaseModel):
     kill_switch_on_startup: bool = False
 
 
+class AutomaticMarketConfig(BaseModel):
+    """Public recurring-market discovery settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    asset: Literal["btc"] = "btc"
+    duration_minutes: Literal[15] = 15
+    gamma_api_url: Literal["https://gamma-api.polymarket.com"] = (
+        "https://gamma-api.polymarket.com"
+    )
+    slug_prefix: Literal["btc-updown-15m"] = "btc-updown-15m"
+    refresh_lead_seconds: float = Field(default=10, ge=1, le=60)
+    request_timeout_seconds: float = Field(default=5, ge=1, le=30)
+
+
 class MarketDataConfig(BaseModel):
     """Market data ingest config."""
 
@@ -59,9 +75,12 @@ class MarketDataConfig(BaseModel):
     reconnect_initial_seconds: float = Field(default=1.0, ge=0.1, le=60.0)
     reconnect_max_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
     stale_after_seconds: float = Field(default=10.0, ge=1.0, le=600.0)
-    heartbeat_timeout_seconds: float = Field(default=15.0, ge=1.0, le=600.0)
+    heartbeat_timeout_seconds: float = Field(default=30.0, ge=1.0, le=600.0)
     subscribed_market_ids: list[str] = Field(default_factory=list)
     subscribed_token_ids: list[str] = Field(default_factory=list)
+    automatic_market: AutomaticMarketConfig = Field(
+        default_factory=AutomaticMarketConfig
+    )
 
     @model_validator(mode="after")
     def validate_backoff_range(self) -> Self:
@@ -85,6 +104,7 @@ class ExecutionConfig(BaseModel):
     time_in_force: TimeInForce = TimeInForce.GTC
     client_order_id_prefix: str = Field(default="pm-bot", min_length=1, max_length=24)
     large_order_notional: Decimal = Field(default=Decimal("100"), gt=Decimal("0"))
+    min_live_buy_notional: Decimal = Field(default=Decimal("1"), gt=Decimal("0"))
     max_live_order_notional: Decimal = Field(default=Decimal("1"), gt=Decimal("0"))
 
     @model_validator(mode="after")
@@ -93,6 +113,10 @@ class ExecutionConfig(BaseModel):
             raise ValueError("min_order_size must be <= default_order_size")
         if self.default_order_size > self.max_order_size:
             raise ValueError("default_order_size must be <= max_order_size")
+        if self.min_live_buy_notional > self.max_live_order_notional:
+            raise ValueError(
+                "min_live_buy_notional must be <= max_live_order_notional"
+            )
         return self
 
 
@@ -122,6 +146,24 @@ class ExchangeConfig(BaseModel):
     compliance_timeout_seconds: float = Field(default=5, gt=0, le=30)
 
 
+class PositionManagementConfig(BaseModel):
+    """Position lifecycle and exit policy settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    take_profit_bps: Decimal = Field(default=Decimal("300"), gt=0)
+    stop_loss_bps: Decimal = Field(default=Decimal("200"), gt=0)
+    max_hold_seconds: float = Field(default=180, gt=0)
+    exit_before_market_end_seconds: float = Field(default=60, gt=0)
+    exit_retry_interval_seconds: float = Field(default=2, gt=0)
+    max_exit_attempts: int = Field(default=3, ge=1)
+    position_confirmation_grace_seconds: float = Field(default=30, gt=0)
+    exit_time_in_force: TimeInForce = TimeInForce.IOC
+    exit_on_strategy_sell: bool = True
+    liquidate_full_position: bool = True
+
+
 class RiskConfig(BaseModel):
     """Risk configuration used by pre-trade and runtime guards."""
 
@@ -138,14 +180,6 @@ class RiskConfig(BaseModel):
     circuit_breaker_failures: int = Field(default=5, ge=1, le=1000)
     circuit_breaker_window_seconds: float = Field(default=60.0, ge=1.0, le=3600.0)
     circuit_breaker_cooldown_seconds: float = Field(default=120.0, ge=1.0, le=86400.0)
-
-    @model_validator(mode="after")
-    def validate_position_vs_exposure(self) -> Self:
-        if self.max_single_position_size > self.max_total_exposure:
-            msg = "max_single_position_size must be <= max_total_exposure"
-            raise ValueError(msg)
-        return self
-
 
 class SpikeStrategyConfig(BaseModel):
     """Single-strategy configuration for deterministic spike signals."""
@@ -200,6 +234,9 @@ class AppConfig(BaseModel):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     exchange: ExchangeConfig = Field(default_factory=ExchangeConfig)
+    position_management: PositionManagementConfig = Field(
+        default_factory=PositionManagementConfig
+    )
     spike_strategy: SpikeStrategyConfig = Field(default_factory=SpikeStrategyConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     secrets: SecretsConfig = Field(default_factory=SecretsConfig)

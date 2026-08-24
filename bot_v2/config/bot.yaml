@@ -13,27 +13,34 @@ market_data:
   reconnect_initial_seconds: 1
   reconnect_max_seconds: 30
   stale_after_seconds: 10
-  heartbeat_timeout_seconds: 15
+  heartbeat_timeout_seconds: 30
   subscribed_market_ids: []
   subscribed_token_ids: []
+  automatic_market:
+    enabled: true
+    asset: btc
+    duration_minutes: 15
+    refresh_lead_seconds: 10
+    request_timeout_seconds: 5
 
 execution:
   dry_run_force: true
   allow_live_trading: false
-  default_order_size: 5
+  default_order_size: 1
   max_order_size: 25
   min_order_size: 1
   max_slippage_bps: 20
-  time_in_force: GTC
+  time_in_force: FOK
   client_order_id_prefix: pm-bot
   large_order_notional: 100
-  max_live_order_notional: 1
+  min_live_buy_notional: 1
+  max_live_order_notional: 1.01
 
 exchange:
   clob_host: https://clob.polymarket.com
   data_api_host: https://data-api.polymarket.com
   chain_id: 137
-  signature_type: 3
+  signature_type: 1
   geoblock_url: https://polymarket.com/api/geoblock
   ws_ping_interval_seconds: 10
   compliance_timeout_seconds: 5
@@ -44,6 +51,19 @@ backtest:
   allow_short_positions: true
   reject_sequence_gaps: true
   max_payout_per_share: 1
+
+position_management:
+  enabled: true
+  take_profit_bps: 300
+  stop_loss_bps: 200
+  max_hold_seconds: 180
+  exit_before_market_end_seconds: 60
+  exit_retry_interval_seconds: 2
+  max_exit_attempts: 3
+  position_confirmation_grace_seconds: 30
+  exit_time_in_force: IOC
+  exit_on_strategy_sell: true
+  liquidate_full_position: true
 
 notifications:
   telegram_enabled: false

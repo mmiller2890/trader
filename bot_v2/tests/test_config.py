@@ -7,12 +7,44 @@ import pytest
 from pydantic import ValidationError
 
 from config.loader import ConfigError, load_config
-from config.schema import AppConfig
+from config.schema import AppConfig, TimeInForce
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def test_production_position_management_defaults() -> None:
+    config = load_config(PROJECT_ROOT / "config")
+    policy = config.position_management
+    assert policy.take_profit_bps == Decimal("300")
+    assert policy.stop_loss_bps == Decimal("200")
+    assert policy.max_hold_seconds == 180
+    assert policy.exit_before_market_end_seconds == 60
+    assert policy.exit_retry_interval_seconds == 2
+    assert policy.max_exit_attempts == 3
+    assert policy.position_confirmation_grace_seconds == 30
+    assert policy.exit_time_in_force == TimeInForce.IOC
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("take_profit_bps", "0"),
+        ("stop_loss_bps", "0"),
+        ("max_hold_seconds", 0),
+        ("exit_before_market_end_seconds", 0),
+        ("exit_retry_interval_seconds", 0),
+        ("max_exit_attempts", 0),
+        ("position_confirmation_grace_seconds", 0),
+    ],
+)
+def test_position_management_rejects_non_positive_values(field: str, value: object) -> None:
+    with pytest.raises(ValidationError):
+        AppConfig(position_management={field: value})
 
 
 def test_exchange_defaults_are_production_v2_and_live_stays_off() -> None:
@@ -28,9 +60,36 @@ def test_exchange_defaults_are_production_v2_and_live_stays_off() -> None:
     assert config.execution.dry_run_force is True
 
 
+def test_production_yaml_uses_minimal_fok_execution() -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "config")
+
+    assert config.execution.default_order_size == Decimal("1")
+    assert config.execution.time_in_force == TimeInForce.FOK
+    assert config.execution.min_live_buy_notional == Decimal("1")
+    assert config.execution.max_live_order_notional == Decimal("1.01")
+    assert config.risk.max_data_staleness_seconds == 1
+    assert config.market_data.heartbeat_timeout_seconds == 30
+    assert config.market_data.automatic_market.enabled is True
+    assert config.market_data.automatic_market.asset == "btc"
+    assert config.market_data.automatic_market.duration_minutes == 15
+    assert config.exchange.signature_type == 1
+
+
 def test_live_notional_cap_must_not_exceed_large_order_threshold() -> None:
     with pytest.raises(ValidationError):
         AppConfig(execution={"max_live_order_notional": "101"})
+
+
+def test_share_limit_is_independent_from_marked_notional_limit() -> None:
+    config = AppConfig(
+        risk={
+            "max_single_position_size": "100",
+            "max_total_exposure": "10",
+        }
+    )
+
+    assert config.risk.max_single_position_size == Decimal("100")
+    assert config.risk.max_total_exposure == Decimal("10")
 
 
 def test_load_config_merges_yaml_and_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
