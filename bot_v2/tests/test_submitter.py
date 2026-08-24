@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from decimal import Decimal
 
 import pytest
@@ -94,6 +95,36 @@ async def test_live_order_above_notional_cap_is_rejected_before_adapter_call() -
 
 
 @pytest.mark.asyncio
+async def test_dry_run_returns_simulated_confirmed_fill() -> None:
+    adapter = RecordingAdapter()
+    config = AppConfig(bot={"mode": Mode.DRY_RUN})
+    submitter = OrderSubmitter(config=config, clob_client=adapter)
+
+    result = await submitter.submit(buy_request(size="2", price="0.45"))
+
+    assert result.status == OrderStatus.SIMULATED
+    assert result.accepted is True
+    assert result.filled_size == Decimal("2")
+    assert result.avg_fill_price == Decimal("0.45")
+
+
+@pytest.mark.asyncio
+async def test_dry_run_order_above_live_cap_is_still_simulated() -> None:
+    adapter = RecordingAdapter()
+    config = AppConfig(
+        bot={"mode": Mode.DRY_RUN},
+        execution={"max_live_order_notional": "1"},
+    )
+    submitter = OrderSubmitter(config=config, clob_client=adapter)
+
+    result = await submitter.submit(buy_request(size="5", price="0.50"))
+
+    assert result.status == OrderStatus.SIMULATED
+    assert result.accepted is True
+    assert adapter.submitted == []
+
+
+@pytest.mark.asyncio
 async def test_uncertain_submit_outcome_is_not_retried() -> None:
     adapter = TimeoutAdapter()
     submitter = make_submitter(adapter)
@@ -118,6 +149,27 @@ async def test_successful_live_submit_reaches_adapter_once() -> None:
     assert result.accepted is True
     assert len(adapter.submitted) == 1
     assert adapter.submitted[0].client_order_id == "test-order-0001"
+
+
+@pytest.mark.asyncio
+async def test_live_sdk_submission_runs_outside_event_loop_thread() -> None:
+    main_thread_id = threading.get_ident()
+
+    class ThreadRecordingAdapter(RecordingAdapter):
+        submission_thread_id: int | None = None
+
+        def submit_order(self, order: OrderRequest) -> OrderResult:
+            self.submission_thread_id = threading.get_ident()
+            return super().submit_order(order)
+
+    adapter = ThreadRecordingAdapter()
+    submitter = make_submitter(adapter)
+
+    result = await submitter.submit(buy_request())
+
+    assert result.accepted is True
+    assert adapter.submission_thread_id is not None
+    assert adapter.submission_thread_id != main_thread_id
 
 
 @pytest.mark.asyncio

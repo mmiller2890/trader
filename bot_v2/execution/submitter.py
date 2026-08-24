@@ -53,8 +53,12 @@ class OrderSubmitter:
                 requested_size=order.size,
             )
 
+        live_trading_enabled = is_live_trading_enabled(self._config)
         notional = order.price * order.size
-        if notional > self._config.execution.max_live_order_notional:
+        if (
+            live_trading_enabled
+            and notional > self._config.execution.max_live_order_notional
+        ):
             if self._circuit_breaker is not None:
                 self._circuit_breaker.record_failure()
             return OrderResult(
@@ -89,7 +93,7 @@ class OrderSubmitter:
             },
         )
 
-        if self._config.bot.mode == Mode.DRY_RUN or not is_live_trading_enabled(self._config):
+        if self._config.bot.mode == Mode.DRY_RUN or not live_trading_enabled:
             latency_ms = int((datetime.now(tz=UTC) - started).total_seconds() * 1000)
             if self._circuit_breaker is not None:
                 self._circuit_breaker.record_success()
@@ -104,11 +108,13 @@ class OrderSubmitter:
                 signal_id=order.signal_id,
                 strategy_name=order.strategy_name,
                 requested_size=order.size,
+                filled_size=order.size,
+                avg_fill_price=order.price,
                 latency_ms=latency_ms,
             )
 
         try:
-            result = self._clob_client.submit_order(order)
+            result = await asyncio.to_thread(self._clob_client.submit_order, order)
         except ClobUncertainOutcomeError as exc:
             latency_ms = int((datetime.now(tz=UTC) - started).total_seconds() * 1000)
             if self._circuit_breaker is not None:

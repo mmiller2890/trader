@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from enum import Enum
 from uuid import uuid4
 
@@ -32,6 +33,11 @@ class EventType(str, Enum):
     KILL_SWITCH_TRIPPED = "kill_switch_tripped"
     BOT_STARTED = "bot_started"
     REPEATED_FAILURES = "repeated_failures"
+    POSITION_UPDATED = "position_updated"
+    EXIT_TRIGGERED = "exit_triggered"
+    POSITION_CLOSED = "position_closed"
+    POSITION_DUST = "position_dust"
+    POSITION_CONFIRMATION_DEFERRED = "position_confirmation_deferred"
 
 
 class BotEvent(BaseModel):
@@ -51,4 +57,7 @@ class BotEvent(BaseModel):
     client_order_id: str | None = None
     reason: str | None = None
     latency_ms: int | None = Field(default=None, ge=0)
+    quantity: Decimal | None = None
+    price: Decimal | None = None
+    pnl: Decimal | None = None
     created_at: datetime = Field(default_factory=utc_now)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 
 from config.schema import AppConfig
@@ -48,6 +49,7 @@ class ExecutionRouter:
         signal: TradeSignal,
         *,
         snapshot: MarketSnapshot | None = None,
+        market_end_at: datetime | None = None,
     ) -> None:
         """Process one strategy signal through the full safe pipeline."""
 
@@ -73,11 +75,43 @@ class ExecutionRouter:
             else current_snapshot.best_bid if current_snapshot
             else Decimal("0")
         )
+        order_request = None
+        executable_liquidity = None
+        if current_snapshot is not None:
+            try:
+                order_request = self._order_builder.build(
+                    signal=signal,
+                    snapshot=current_snapshot,
+                    size=proposed_size,
+                )
+            except ValueError as exc:
+                await self._emit_event(
+                    BotEvent(
+                        event_type=EventType.RISK_DECISION,
+                        component="execution_planner",
+                        mode=self._config.bot.mode.value,
+                        message="execution plan rejected",
+                        market_id=signal.market_id,
+                        token_id=signal.token_id,
+                        strategy_name=signal.strategy_name,
+                        signal_id=signal.signal_id,
+                        reason=str(exc),
+                    )
+                )
+                return
+            proposed_size = order_request.size
+            proposed_price = order_request.price
+            executable_liquidity = (
+                current_snapshot.top_ask_size
+                if signal.side.value == "buy"
+                else current_snapshot.top_bid_size
+            )
         risk_decision = await self._risk_engine.evaluate(
             signal=signal,
             snapshot=current_snapshot,
             proposed_size=proposed_size,
             proposed_price=proposed_price,
+            executable_liquidity=executable_liquidity,
         )
         await self._emit_event(
             BotEvent(
@@ -95,30 +129,27 @@ class ExecutionRouter:
 
         if not risk_decision.approved:
             if risk_decision.action == RiskAction.HALT:
-                await self._state_store.set_kill_switch(True)
-                await self._emit_event(
-                    BotEvent(
-                        event_type=EventType.KILL_SWITCH_TRIPPED,
-                        component="router",
-                        mode=self._config.bot.mode.value,
-                        message="kill switch activated from risk halt",
-                        market_id=signal.market_id,
-                        token_id=signal.token_id,
-                        strategy_name=signal.strategy_name,
-                        signal_id=signal.signal_id,
-                        reason=risk_decision.reason,
-                    )
+                activated = await self._state_store.activate_kill_switch(
+                    risk_decision.reason
                 )
+                if activated:
+                    await self._emit_event(
+                        BotEvent(
+                            event_type=EventType.KILL_SWITCH_TRIPPED,
+                            component="router",
+                            mode=self._config.bot.mode.value,
+                            message="kill switch activated from risk halt",
+                            market_id=signal.market_id,
+                            token_id=signal.token_id,
+                            strategy_name=signal.strategy_name,
+                            signal_id=signal.signal_id,
+                            reason=risk_decision.reason,
+                        )
+                    )
             return
 
-        if current_snapshot is None:
+        if current_snapshot is None or order_request is None:
             return
-
-        order_request = self._order_builder.build(
-            signal=signal,
-            snapshot=current_snapshot,
-            size=proposed_size,
-        )
         await self._emit_event(
             BotEvent(
                 event_type=EventType.ORDER_SUBMITTED,
@@ -133,7 +164,77 @@ class ExecutionRouter:
             )
         )
         result = await self._submitter.submit(order_request)
-        await self._tracker.handle_order_result(result)
+        outcome = await self._tracker.handle_order_result(
+            result, market_end_at=market_end_at
+        )
+
+        if outcome.unknown_outcome:
+            activated = await self._state_store.activate_kill_switch(
+                f"unknown_order_outcome:{result.client_order_id}"
+            )
+            if activated:
+                await self._emit_event(
+                    BotEvent(
+                        event_type=EventType.KILL_SWITCH_TRIPPED,
+                        component="router",
+                        mode=self._config.bot.mode.value,
+                        message="unknown order outcome latched kill switch",
+                        market_id=result.market_id,
+                        token_id=result.token_id,
+                        client_order_id=result.client_order_id,
+                        reason=f"unknown_order_outcome:{result.client_order_id}",
+                    )
+                )
+        elif outcome.accounting_error is not None:
+            activated = await self._state_store.activate_kill_switch(
+                f"position_accounting_error:{outcome.accounting_error}"
+            )
+            if activated:
+                await self._emit_event(
+                    BotEvent(
+                        event_type=EventType.KILL_SWITCH_TRIPPED,
+                        component="router",
+                        mode=self._config.bot.mode.value,
+                        message="position accounting error latched kill switch",
+                        market_id=result.market_id,
+                        token_id=result.token_id,
+                        client_order_id=result.client_order_id,
+                        reason=f"position_accounting_error:{outcome.accounting_error}",
+                    )
+                )
+        elif outcome.fill_applied and outcome.fill_application is not None:
+            application = outcome.fill_application
+            if outcome.position_closed:
+                await self._emit_event(
+                    BotEvent(
+                        event_type=EventType.POSITION_CLOSED,
+                        component="tracker",
+                        mode=self._config.bot.mode.value,
+                        message="position closed",
+                        market_id=result.market_id,
+                        token_id=result.token_id,
+                        quantity=Decimal("0"),
+                        price=result.avg_fill_price,
+                        pnl=application.position.realized_pnl
+                        if application.position is not None
+                        else None,
+                    )
+                )
+            else:
+                await self._emit_event(
+                    BotEvent(
+                        event_type=EventType.POSITION_UPDATED,
+                        component="tracker",
+                        mode=self._config.bot.mode.value,
+                        message="position updated from confirmed fill",
+                        market_id=result.market_id,
+                        token_id=result.token_id,
+                        quantity=application.position.quantity
+                        if application.position is not None
+                        else None,
+                        price=result.avg_fill_price,
+                    )
+                )
 
         large_reason = None
         if result.status.value == "simulated" and result.requested_size >= self._config.notifications.large_order_threshold:
