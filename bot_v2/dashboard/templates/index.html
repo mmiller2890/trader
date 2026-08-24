@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Polymarket Operator Console</title>
+    <link rel="stylesheet" href="/static/dashboard.css">
+    <script src="/static/dashboard.js" defer></script>
+  </head>
+  <body data-operator-token="{{ operator_token }}">
+    <a class="skip-link" href="#main-content">Skip to dashboard</a>
+
+    <header class="topbar">
+      <div class="brand-block">
+        <span class="brand-mark" aria-hidden="true">P</span>
+        <div>
+          <p class="eyebrow">LOCAL CONTROL PLANE</p>
+          <h1>Operator Console</h1>
+        </div>
+      </div>
+      <div class="connection-state" id="connection-state" role="status" aria-live="polite">
+        <span class="status-dot status-warn" aria-hidden="true"></span>
+        <span>Connecting</span>
+      </div>
+    </header>
+
+    <aside id="safety-rail" class="safety-rail" aria-label="Current safety state">
+      <div class="rail-cell">
+        <span class="rail-label">Mode</span>
+        <strong id="mode-value">—</strong>
+      </div>
+      <div class="rail-cell">
+        <span class="rail-label">Runtime</span>
+        <strong id="phase-value">—</strong>
+      </div>
+      <div class="rail-cell">
+        <span class="rail-label">Kill switch</span>
+        <strong id="kill-value">—</strong>
+      </div>
+      <div class="rail-cell">
+        <span class="rail-label">State source</span>
+        <strong id="source-value">—</strong>
+      </div>
+      <div class="rail-cell rail-updated">
+        <span class="rail-label">Updated</span>
+        <strong id="updated-value">—</strong>
+      </div>
+    </aside>
+
+    <main id="main-content" class="dashboard-shell">
+      <section id="runtime-controls" class="panel control-panel" aria-labelledby="controls-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">RUNTIME</p>
+            <h2 id="controls-title">Bot controls</h2>
+          </div>
+          <p id="control-message" class="section-note" aria-live="polite">Bot is stopped.</p>
+        </div>
+        <div class="control-grid">
+          <button id="start-button" class="button button-primary" type="button">
+            <span class="button-icon" aria-hidden="true">▶</span>
+            <span id="start-button-label">Start dry run</span>
+          </button>
+          <button id="stop-button" class="button button-secondary" type="button" disabled>
+            <span class="button-icon" aria-hidden="true">■</span>
+            Graceful stop
+          </button>
+          <button id="preflight-button" class="button button-secondary" type="button">
+            <span class="button-icon" aria-hidden="true">✓</span>
+            Run preflight
+          </button>
+          <button id="enable-live-button" class="button button-danger-outline" type="button" disabled>
+            Enable live mode
+          </button>
+          <button id="dry-run-button" class="button button-secondary" type="button" disabled>
+            Return to dry run
+          </button>
+          <button id="halt-button" class="button button-danger" type="button" disabled>
+            <span class="button-icon" aria-hidden="true">!</span>
+            Emergency halt
+          </button>
+          <button id="cancel-button" class="button button-danger-outline" type="button" disabled>
+            Cancel all orders
+          </button>
+        </div>
+        <div id="live-warning" class="warning-banner" role="note">
+          <strong id="live-warning-title">Live mode requires preflight.</strong>
+          <span id="live-warning-copy">Run the read-only checks before enabling live mode.</span>
+        </div>
+      </section>
+
+      <section id="readiness-panel" class="panel" aria-labelledby="readiness-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">GATES</p>
+            <h2 id="readiness-title">Launch readiness</h2>
+          </div>
+          <span id="readiness-count" class="count-pill">—</span>
+        </div>
+        <ul id="readiness-list" class="readiness-list" aria-live="polite"></ul>
+        <div id="preflight-result" class="preflight-result" aria-live="polite">
+          Preflight has not run in this dashboard session.
+        </div>
+        <ul id="preflight-checks" class="preflight-checks" aria-label="Preflight checks" aria-live="polite"></ul>
+      </section>
+
+      <section id="health-panel" class="panel panel-wide" aria-labelledby="health-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">TELEMETRY</p>
+            <h2 id="health-title">System health</h2>
+          </div>
+          <span id="websocket-state" class="count-pill">WebSocket —</span>
+        </div>
+        <div id="heartbeat-grid" class="metric-grid"></div>
+      </section>
+
+      <section id="market-rotation-panel" class="panel panel-wide" aria-labelledby="market-rotation-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">AUTOMATIC SCOPE</p>
+            <h2 id="market-rotation-title">Active BTC 15m market</h2>
+          </div>
+          <span id="market-rotation-state" class="count-pill">—</span>
+        </div>
+        <p id="market-rotation-title-value" class="market-title">Waiting for market discovery.</p>
+        <div class="market-grid">
+          <article class="market-detail">
+            <span>Market slug</span>
+            <strong id="market-rotation-slug" class="mono">—</strong>
+          </article>
+          <article class="market-detail">
+            <span>UTC window</span>
+            <strong id="market-rotation-window" class="mono">—</strong>
+          </article>
+          <article class="market-detail">
+            <span>Up token</span>
+            <strong id="market-rotation-up" class="mono">—</strong>
+          </article>
+          <article class="market-detail">
+            <span>Down token</span>
+            <strong id="market-rotation-down" class="mono">—</strong>
+          </article>
+        </div>
+        <p id="market-rotation-reason" class="field-help">Token IDs rotate automatically every 15 minutes. Dry run does not use trading credentials.</p>
+      </section>
+
+      <section id="portfolio-panel" class="panel panel-wide" aria-labelledby="portfolio-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">ACCOUNT</p>
+            <h2 id="portfolio-title">Portfolio snapshot</h2>
+          </div>
+          <span class="section-note">Reported values may be historical.</span>
+        </div>
+        <div class="metric-grid portfolio-grid">
+          <article class="metric-card">
+            <span>Open orders</span>
+            <strong id="metric-orders">0</strong>
+          </article>
+          <article class="metric-card">
+            <span>Positions</span>
+            <strong id="metric-positions">0</strong>
+          </article>
+          <article class="metric-card">
+            <span>Marked exposure</span>
+            <strong id="metric-exposure">0</strong>
+          </article>
+          <article class="metric-card">
+            <span>Reported PnL</span>
+            <strong id="metric-pnl">0</strong>
+          </article>
+        </div>
+      </section>
+
+      <section id="orders-panel" class="panel panel-wide" aria-labelledby="orders-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">EXECUTION</p>
+            <h2 id="orders-title">Open orders</h2>
+          </div>
+          <span id="orders-count" class="count-pill">0</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <caption class="sr-only">Current open orders</caption>
+            <thead><tr><th>Status</th><th>Side</th><th>Market / token</th><th>Requested</th><th>Filled</th><th>Order ID</th></tr></thead>
+            <tbody id="orders-body"></tbody>
+          </table>
+        </div>
+        <p id="orders-empty" class="empty-state">No open orders.</p>
+      </section>
+
+      <section id="positions-panel" class="panel panel-wide" aria-labelledby="positions-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">HOLDINGS</p>
+            <h2 id="positions-title">Positions</h2>
+          </div>
+          <span id="positions-count" class="count-pill">0</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <caption class="sr-only">Current positions</caption>
+            <thead><tr><th>Market / token</th><th>Quantity</th><th>Average</th><th>Mark</th><th>Return</th><th>Held</th><th>Deadline</th><th>Exit</th></tr></thead>
+            <tbody id="managed-positions-body"></tbody>
+          </table>
+        </div>
+        <p id="positions-empty" class="empty-state">No positions reported.</p>
+        <div class="table-wrap">
+          <table>
+            <caption class="sr-only">Recently closed positions</caption>
+            <thead><tr><th>Market / token</th><th>Opened</th><th>Closed</th><th>Exit price</th><th>Realized</th><th>Reason</th></tr></thead>
+            <tbody id="closed-positions-body"></tbody>
+          </table>
+        </div>
+        <p id="closed-positions-empty" class="empty-state">No closed positions recorded.</p>
+      </section>
+
+      <section id="config-panel" class="panel" aria-labelledby="config-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">SAFE EDITOR</p>
+            <h2 id="config-title">Market scope</h2>
+          </div>
+          <span class="lock-note">Stopped only</span>
+        </div>
+        <form id="config-form">
+          <label for="subscribed-tokens">Subscribed token IDs</label>
+          <textarea id="subscribed-tokens" rows="4" spellcheck="false" placeholder="One decimal token ID per line" disabled></textarea>
+          <label for="target-tokens">Strategy target token IDs</label>
+          <textarea id="target-tokens" rows="4" spellcheck="false" placeholder="One decimal token ID per line" disabled></textarea>
+          <p id="config-scope-help" class="field-help">Only these lists are editable. Live flags, sizing, risk, and credentials stay locked.</p>
+          <button id="save-config-button" class="button button-secondary" type="submit" disabled>Save market scope</button>
+        </form>
+      </section>
+
+      <section id="events-panel" class="panel" aria-labelledby="events-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">AUDIT TRAIL</p>
+            <h2 id="events-title">Recent events</h2>
+          </div>
+          <label class="filter-label" for="event-filter">Filter
+            <select id="event-filter">
+              <option value="all">All events</option>
+              <option value="risk_decision">Risk</option>
+              <option value="order_result">Orders</option>
+              <option value="kill_switch_tripped">Halts</option>
+            </select>
+          </label>
+        </div>
+        <ol id="events-list" class="event-list"></ol>
+        <p id="events-empty" class="empty-state">No events recorded.</p>
+      </section>
+    </main>
+
+    <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+      <form method="dialog" id="confirm-form">
+        <p class="eyebrow">DESTRUCTIVE CONTROL</p>
+        <h2 id="confirm-title">Confirm action</h2>
+        <p id="confirm-description">Enter the confirmation phrase to continue.</p>
+        <label for="confirmation-input">Confirmation phrase</label>
+        <input id="confirmation-input" autocomplete="off" spellcheck="false">
+        <div class="dialog-actions">
+          <button id="dialog-cancel" class="button button-secondary" value="cancel">Cancel</button>
+          <button id="dialog-confirm" class="button button-danger" value="confirm">Confirm</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>
