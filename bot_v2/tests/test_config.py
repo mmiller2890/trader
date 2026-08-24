@@ -142,3 +142,39 @@ execution:
 
     with pytest.raises(ConfigError):
         load_config(tmp_path)
+
+
+def test_reliability_defaults_match_unattended_operations_spec() -> None:
+    config = AppConfig()
+    reliability = config.reliability
+    assert reliability.live_lease_hours == 72
+    assert reliability.task_restart_limit == 3
+    assert reliability.task_restart_window_seconds == 600
+    assert reliability.degraded_alert_after_seconds == 120
+    assert reliability.authoritative_state_halt_after_seconds == 300
+    assert reliability.rest_fallback_after_seconds == 30
+    assert reliability.retry_initial_seconds == 1
+    assert reliability.retry_max_seconds == 30
+    assert reliability.retry_jitter_ratio == 0.20
+    assert reliability.disk_warning_percent == 80
+    assert reliability.disk_degraded_percent == 90
+    assert reliability.disk_halt_percent == 95
+    assert config.notifications.durable_outbox_enabled is True
+    assert config.notifications.telegram_deduplication_seconds == 900
+    assert config.notifications.alert_retry_max_seconds == 300
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"live_lease_hours": 0},
+        {"live_lease_hours": 169},
+        {"retry_initial_seconds": 31, "retry_max_seconds": 30},
+        {"retry_jitter_ratio": 1.01},
+        {"disk_warning_percent": 91, "disk_degraded_percent": 90},
+        {"disk_degraded_percent": 96, "disk_halt_percent": 95},
+    ],
+)
+def test_reliability_rejects_unsafe_bounds(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        AppConfig(reliability=payload)

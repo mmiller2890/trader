@@ -45,6 +45,32 @@ exchange:
   ws_ping_interval_seconds: 10
   compliance_timeout_seconds: 5
 
+reliability:
+  live_lease_hours: 72
+  task_restart_limit: 3
+  task_restart_window_seconds: 600
+  degraded_alert_after_seconds: 120
+  authoritative_state_halt_after_seconds: 300
+  rest_fallback_after_seconds: 30
+  retry_initial_seconds: 1
+  retry_max_seconds: 30
+  retry_jitter_ratio: 0.20
+  disk_warning_percent: 80
+  disk_degraded_percent: 90
+  disk_halt_percent: 95
+
+notifications:
+  telegram_enabled: false
+  telegram_send_retries: 2
+  repeated_failure_alert_threshold: 3
+  large_order_threshold: 100
+  durable_outbox_enabled: true
+  telegram_deduplication_seconds: 900
+  alert_retry_initial_seconds: 2
+  alert_retry_max_seconds: 300
+  delivered_outbox_retention_days: 30
+  daily_summary_hour_utc: 0
+
 backtest:
   starting_cash: 1000
   taker_fee_bps: 10
@@ -64,9 +90,3 @@ position_management:
   exit_time_in_force: IOC
   exit_on_strategy_sell: true
   liquidate_full_position: true
-
-notifications:
-  telegram_enabled: false
-  telegram_send_retries: 2
-  repeated_failure_alert_threshold: 3
-  large_order_threshold: 100

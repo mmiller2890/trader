@@ -197,6 +197,37 @@ class SpikeStrategyConfig(BaseModel):
     target_token_ids: list[str] = Field(default_factory=list)
 
 
+class ReliabilityConfig(BaseModel):
+    """Multi-day unattended operations reliability settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    live_lease_hours: float = Field(default=72, gt=0, le=168)
+    task_restart_limit: int = Field(default=3, ge=1)
+    task_restart_window_seconds: float = Field(default=600, gt=0)
+    degraded_alert_after_seconds: float = Field(default=120, gt=0)
+    authoritative_state_halt_after_seconds: float = Field(default=300, gt=0)
+    rest_fallback_after_seconds: float = Field(default=30, gt=0)
+    retry_initial_seconds: float = Field(default=1, gt=0)
+    retry_max_seconds: float = Field(default=30, gt=0)
+    retry_jitter_ratio: float = Field(default=0.20, ge=0, le=1)
+    disk_warning_percent: float = Field(default=80, ge=0, le=100)
+    disk_degraded_percent: float = Field(default=90, ge=0, le=100)
+    disk_halt_percent: float = Field(default=95, ge=0, le=100)
+
+    @model_validator(mode="after")
+    def validate_reliability_bounds(self) -> Self:
+        if self.retry_max_seconds < self.retry_initial_seconds:
+            raise ValueError("retry_max_seconds must be >= retry_initial_seconds")
+        if not (
+            self.disk_warning_percent
+            < self.disk_degraded_percent
+            < self.disk_halt_percent
+        ):
+            raise ValueError("disk thresholds must be strictly increasing")
+        return self
+
+
 class NotificationsConfig(BaseModel):
     """Alerting and operator notifications config."""
 
@@ -206,6 +237,12 @@ class NotificationsConfig(BaseModel):
     telegram_send_retries: int = Field(default=2, ge=0, le=10)
     repeated_failure_alert_threshold: int = Field(default=3, ge=1, le=100)
     large_order_threshold: Decimal = Field(default=Decimal("100"), gt=Decimal("0"))
+    durable_outbox_enabled: bool = True
+    telegram_deduplication_seconds: int = Field(default=900, ge=0)
+    alert_retry_initial_seconds: float = Field(default=2, gt=0)
+    alert_retry_max_seconds: float = Field(default=300, gt=0)
+    delivered_outbox_retention_days: int = Field(default=30, ge=1)
+    daily_summary_hour_utc: int = Field(default=0, ge=0, le=23)
 
 
 class SecretsConfig(BaseModel):
@@ -234,6 +271,7 @@ class AppConfig(BaseModel):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     exchange: ExchangeConfig = Field(default_factory=ExchangeConfig)
+    reliability: ReliabilityConfig = Field(default_factory=ReliabilityConfig)
     position_management: PositionManagementConfig = Field(
         default_factory=PositionManagementConfig
     )
