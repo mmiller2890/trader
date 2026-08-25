@@ -69,11 +69,13 @@ class DashboardController:
         preflight: Any | None = None,
         now: Callable[[], datetime] | None = None,
         preflight_ttl_seconds: float = 300,
+        recovery: Any | None = None,
     ) -> None:
         self.runtime = runtime
         self._config_dir = Path(config_dir)
         self._data_dir = Path(data_dir)
         self._config_loader = config_loader
+        self._recovery = recovery
         self._editor = OperatorConfigEditor(
             self._config_dir / "operator.yaml",
             is_running=lambda: self.runtime.status().phase
@@ -179,6 +181,82 @@ class DashboardController:
         if confirmation != "HALT":
             raise ConfirmationError("confirmation must be exactly HALT")
         return await self.runtime.emergency_halt(confirmation)
+
+    def _recovery_service(self) -> Any:
+        import shutil
+
+        from persistence.operations import OperationsRepository
+        from persistence.snapshots import SnapshotStore
+        from reliability.recovery import InterventionRecoveryService
+
+        if self._recovery is not None:
+            return self._recovery
+
+        snapshot_store = SnapshotStore(
+            self._data_dir / "snapshots" / "state.json"
+        )
+        repository = OperationsRepository(self._data_dir / "bot.sqlite3")
+
+        async def open_orders_reader() -> list[object]:
+            services = self.runtime.services
+            if services is not None:
+                return await services.state_store.get_open_orders()
+            snapshot = await snapshot_store.load()
+            return list(snapshot.open_orders) if snapshot else []
+
+        async def position_safety_reader() -> tuple[list[object], dict[tuple[str, str], object]]:
+            services = self.runtime.services
+            if services is not None:
+                positions = await services.state_store.get_positions()
+                lifecycles = await services.state_store.get_position_lifecycles()
+            else:
+                snapshot = await snapshot_store.load()
+                positions = list(snapshot.positions) if snapshot else []
+                lifecycles = (
+                    list(snapshot.position_lifecycles) if snapshot else []
+                )
+            return positions, {
+                (lifecycle.market_id, lifecycle.token_id): lifecycle
+                for lifecycle in lifecycles
+            }
+
+        async def reconcile_ok() -> bool:
+            services = self.runtime.services
+            reconciliation = getattr(services, "reconciliation", None)
+            if reconciliation is None:
+                return False
+            report = await reconciliation.reconcile_runtime()
+            return bool(getattr(report, "ok", False))
+
+        def disk_percent() -> float:
+            total, _, free = shutil.disk_usage(self._data_dir)
+            if total <= 0:
+                return 0.0
+            return (total - free) / total * 100.0
+
+        return InterventionRecoveryService(
+            snapshot_store=snapshot_store,
+            repository=repository,
+            preflight_ok=self._preflight_is_fresh,
+            reconcile_ok=reconcile_ok,
+            disk_percent=disk_percent,
+            open_orders_reader=open_orders_reader,
+            position_safety_reader=position_safety_reader,
+            invalidate_preflight=lambda: self._invalidate_preflight(
+                "preflight_used_for_clear_halt"
+            ),
+            max_disk_percent=self.config().reliability.disk_warning_percent,
+            now=self._now,
+        )
+
+    async def clear_halt(self, incident_id: str, confirmation: str) -> Any:
+        service = self._recovery_service()
+        result = await service.clear_halt(
+            incident_id=incident_id, confirmation=confirmation
+        )
+        if bool(getattr(result, "cleared", False)):
+            self._invalidate_preflight("preflight_used_for_clear_halt")
+        return result
 
     async def cancel_all(self, confirmation: str) -> ControlResult:
         if confirmation != "CANCEL ALL":

@@ -366,3 +366,66 @@ async def test_health_endpoints_never_expose_operator_token() -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
         response = await client.get("/api/health/live")
     assert "test-token" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_clear_halt_requires_operator_guard() -> None:
+    app = health_app(None)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        response = await client.post(
+            "/api/control/clear-halt",
+            json={"incident_id": "inc-12345678abcd", "confirmation": "CLEAR HALT 5678abcd"},
+        )
+    assert response.status_code == 403
+
+
+class RecoveryController(ApiController):
+    def __init__(self) -> None:
+        super().__init__()
+        self.clear_calls: list[dict[str, str]] = []
+
+    async def clear_halt(self, incident_id: str, confirmation: str):  # type: ignore[no-untyped-def]
+        from reliability.recovery import RecoveryResult
+
+        self.clear_calls.append(
+            {"incident_id": incident_id, "confirmation": confirmation}
+        )
+        return RecoveryResult(
+            cleared=True,
+            incident_id=incident_id,
+            checks=[],
+            reason="halt_cleared",
+        )
+
+
+@pytest.mark.asyncio
+async def test_clear_halt_endpoint_returns_recovery_result() -> None:
+    recovery_controller = RecoveryController()
+    app = create_app(
+        controller=recovery_controller,
+        operator_token="test-token",
+        trusted_origins={"http://127.0.0.1:8000"},
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        response = await client.post(
+            "/api/control/clear-halt",
+            headers={
+                "Origin": "http://127.0.0.1:8000",
+                "X-Operator-Token": "test-token",
+            },
+            json={
+                "incident_id": "inc-12345678abcd",
+                "confirmation": "CLEAR HALT 5678abcd",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["cleared"] is True
+    assert payload["reason"] == "halt_cleared"
+    assert recovery_controller.clear_calls == [
+        {
+            "incident_id": "inc-12345678abcd",
+            "confirmation": "CLEAR HALT 5678abcd",
+        }
+    ]

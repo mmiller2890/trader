@@ -148,3 +148,33 @@ async def test_dashboard_javascript_renders_operational_health_safely() -> None:
     ):
         assert reference in javascript.text
     assert "innerHTML" not in javascript.text
+
+
+@pytest.mark.asyncio
+async def test_dashboard_page_exposes_clear_halt_control() -> None:
+    app = create_app(controller=object(), operator_token="ui-test-token")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/")
+
+    assert response.status_code == 200
+    page = response.text
+    assert 'id="clear-halt-button"' in page
+    assert "Clear halt" in page
+
+
+@pytest.mark.asyncio
+async def test_dashboard_javascript_wires_guarded_clear_halt() -> None:
+    app = create_app(controller=object(), operator_token="ui-test-token")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        javascript = await client.get("/static/dashboard.js")
+
+    assert javascript.status_code == 200
+    for reference in (
+        "state.active_halt_incident_suffix",
+        "CLEAR HALT",
+        "/api/control/clear-halt",
+    ):
+        assert reference in javascript.text
+    assert "innerHTML" not in javascript.text

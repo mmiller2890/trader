@@ -171,3 +171,4 @@ class DashboardState(BaseModel):
     lease_remaining_seconds: float | None = None
     auto_resume_eligible: bool = False
     open_urgent_incidents: int = 0
+    active_halt_incident_suffix: str | None = None

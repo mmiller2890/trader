@@ -402,3 +402,44 @@ def test_controller_rejects_manual_scope_when_automatic_market_enabled(
         current.save_config(
             {"subscribed_token_ids": ["123"], "target_token_ids": ["123"]}
         )
+
+
+# --- guarded intervention recovery -------------------------------------------
+
+
+class FakeRecoveryService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, str]] = []
+
+    async def clear_halt(self, *, incident_id: str, confirmation: str):
+        from reliability.recovery import RecoveryResult
+
+        self.calls.append(
+            {"incident_id": incident_id, "confirmation": confirmation}
+        )
+        return RecoveryResult(
+            cleared=True,
+            incident_id=incident_id,
+            checks=[],
+            reason="halt_cleared",
+        )
+
+
+def test_clear_halt_delegates_and_invalidates_preflight(tmp_path: Path) -> None:
+    current = controller(tmp_path)
+    fresh_at = datetime.now(tz=UTC) - timedelta(seconds=30)
+    mark_preflight_passed(current, fresh_at)
+    assert current._preflight_is_fresh() is True
+
+    incident_id = "inc-12345678abcd"
+    confirmation = f"CLEAR HALT {incident_id[-8:]}"
+    service = FakeRecoveryService()
+    current._recovery = service
+    result = asyncio.run(current.clear_halt(incident_id, confirmation))
+
+    assert result.cleared is True
+    assert service.calls == [
+        {"incident_id": incident_id, "confirmation": confirmation}
+    ]
+    assert current._preflight_is_fresh() is False
+    assert current.runtime.status().phase != RuntimePhase.RUNNING

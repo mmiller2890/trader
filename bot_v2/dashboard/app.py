@@ -46,6 +46,13 @@ class ModeRequest(BaseModel):
     confirmation: str | None = None
 
 
+class ClearHaltRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    incident_id: str
+    confirmation: str
+
+
 def create_app(
     *,
     controller: DashboardController,
@@ -196,6 +203,10 @@ def create_app(
     @app.post("/api/control/halt", dependencies=[OperatorGuard])
     async def halt(payload: ConfirmationRequest):  # type: ignore[no-untyped-def]
         return await call_control(lambda: controller.halt(payload.confirmation))
+
+    @app.post("/api/control/clear-halt", dependencies=[OperatorGuard])
+    async def clear_halt(payload: ClearHaltRequest):  # type: ignore[no-untyped-def]
+        return await controller.clear_halt(payload.incident_id, payload.confirmation)
 
     @app.post("/api/control/cancel-all", dependencies=[OperatorGuard])
     async def cancel_all(payload: ConfirmationRequest):  # type: ignore[no-untyped-def]

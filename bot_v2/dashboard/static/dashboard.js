@@ -395,6 +395,9 @@
     byId("dry-run-button").disabled = !stopped || !liveMode;
     byId("halt-button").disabled = !running || state.runtime.phase === "halted";
     byId("cancel-button").disabled = !running || !liveMode;
+    byId("clear-halt-button").disabled =
+      !(state.runtime.phase === "halted" || state.runtime.phase === "failed")
+      || !state.active_halt_incident_suffix;
     byId("save-config-button").disabled = !stopped || automaticScope;
     byId("subscribed-tokens").disabled = !stopped || automaticScope;
     byId("target-tokens").disabled = !stopped || automaticScope;
@@ -539,6 +542,20 @@
   });
   byId("halt-button").addEventListener("click", () => openConfirmation("Emergency halt", "HALT", "/api/control/halt"));
   byId("cancel-button").addEventListener("click", () => openConfirmation("Cancel all orders", "CANCEL ALL", "/api/control/cancel-all"));
+  byId("clear-halt-button").addEventListener("click", () => {
+    const suffix = currentState && currentState.active_halt_incident_suffix;
+    if (!suffix) {
+      showToast("No active halt incident is available to clear.");
+      return;
+    }
+    openConfirmation(
+      "Clear halt",
+      `CLEAR HALT ${suffix}`,
+      "/api/control/clear-halt",
+      "POST",
+      { incident_id_suffix: suffix },
+    );
+  });
   byId("event-filter").addEventListener("change", renderEvents);
 
   byId("confirm-form").addEventListener("submit", async (event) => {

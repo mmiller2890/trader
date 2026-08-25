@@ -336,6 +336,25 @@ class OperationsRepository:
         rows = await asyncio.to_thread(_work)
         return [self._incident_from_row(row) for row in rows]
 
+    async def get_incident(self, incident_id: str) -> OperationalIncident | None:
+        await self._ensure_schema()
+
+        def _work() -> dict[str, Any] | None:
+            connection = self._connect()
+            try:
+                row = connection.execute(
+                    "SELECT * FROM operational_incidents WHERE incident_id = ?",
+                    (incident_id,),
+                ).fetchone()
+                return dict(row) if row is not None else None
+            finally:
+                connection.close()
+
+        row = await asyncio.to_thread(_work)
+        if row is None:
+            return None
+        return self._incident_from_row(row)
+
     async def resolve_incident(
         self, incident_id: str, *, resolved_at: datetime
     ) -> OperationalIncident:

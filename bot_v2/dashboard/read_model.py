@@ -21,7 +21,13 @@ from dashboard.models import (
     ReadinessItem,
 )
 from models.events import BotEvent
-from models.operations import OperationalState, TaskHealth
+from models.operations import (
+    IncidentCategory,
+    IncidentSeverity,
+    OperationalState,
+    TaskHealth,
+)
+from reliability.recovery import HaltCategories
 from models.position import Position, PositionLifecycle
 from persistence.health import HealthSnapshotStore, RuntimeHealthSnapshot
 from persistence.snapshots import SnapshotStore
@@ -101,6 +107,7 @@ class DashboardReadModel:
         lease_expires_at: datetime | None = None
         last_reconciliation_at: datetime | None = None
         auto_resume_eligible = False
+        active_halt_incident_suffix: str | None = None
 
         if services is not None:
             state = services.state_store
@@ -146,6 +153,22 @@ class DashboardReadModel:
                     outbox_pending = 0
                     oldest_outbox_age_seconds = None
                     lease_expires_at = None
+                try:
+                    candidates = [
+                        incident
+                        for incident in await repository.recent_incidents(limit=50)
+                        if incident.resolved_at is None
+                        and incident.severity == IncidentSeverity.URGENT
+                        and incident.category in HaltCategories
+                    ]
+                    if candidates:
+                        newest_halt = max(
+                            candidates, key=lambda item: item.last_seen_at
+                        )
+                        active_halt_incident_suffix = newest_halt.incident_id[-8:]
+                except Exception:
+                    active_halt_incident_suffix = None
+                    active_halt_incident_suffix = None
             reconciliation_ts = await state.get_heartbeat("reconciliation")
             if reconciliation_ts is None:
                 reconciliation_ts = await state.get_heartbeat("app")
@@ -372,6 +395,7 @@ class DashboardReadModel:
             lease_expires_at=lease_expires_at,
             lease_remaining_seconds=lease_remaining_seconds,
             auto_resume_eligible=auto_resume_eligible,
+            active_halt_incident_suffix=active_halt_incident_suffix,
         )
 
     def _fallback_source(self) -> str:
