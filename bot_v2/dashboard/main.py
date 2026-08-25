@@ -9,7 +9,9 @@ from typing import Sequence
 
 import uvicorn
 
+from app.process_services import build_process_reliability_services
 from app.runtime import BotRuntime
+from config.loader import load_config
 from dashboard.app import create_app
 from dashboard.controller import DashboardController
 
@@ -37,13 +39,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     host = validate_host(args.host)
     data_dir = Path(os.getenv("BOT_DATA_DIR", "data"))
+    config = load_config(args.config_dir)
+    process_services = build_process_reliability_services(
+        config=config,
+        data_dir=data_dir,
+    )
     controller = DashboardController(
-        runtime=BotRuntime(),
+        runtime=BotRuntime(process_services=process_services),
         config_dir=args.config_dir,
         data_dir=data_dir,
+        process_services=process_services,
     )
     app = create_app(
         controller=controller,
+        process_services=process_services,
         trusted_origins={
             browser_origin(host, args.port),
             f"http://localhost:{args.port}",

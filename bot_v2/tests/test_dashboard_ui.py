@@ -178,3 +178,34 @@ async def test_dashboard_javascript_wires_guarded_clear_halt() -> None:
     ):
         assert reference in javascript.text
     assert "innerHTML" not in javascript.text
+
+
+@pytest.mark.asyncio
+async def test_page_exposes_the_telegram_controls() -> None:
+    """
+    Regression: live start is gated on a delivered Telegram test, but the
+    endpoint existed with no way to reach it from the UI, so the gate was
+    unclearable without hand-crafting an API call.
+    """
+
+    app = create_app(controller=object(), operator_token="ui-test-token")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        page = (await client.get("/")).text
+
+    assert 'id="telegram-test-button"' in page
+    assert 'id="telegram-enabled"' in page
+    assert 'id="telegram-message"' in page
+
+
+@pytest.mark.asyncio
+async def test_script_wires_the_telegram_controls_to_their_endpoints() -> None:
+    app = create_app(controller=object(), operator_token="ui-test-token")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        script = (await client.get("/static/dashboard.js")).text
+
+    assert "/api/notifications/test" in script
+    assert '"SEND TEST"' in script
+    # Every config write must carry the switch, or a scope save clears it.
+    assert "telegram_enabled" in script

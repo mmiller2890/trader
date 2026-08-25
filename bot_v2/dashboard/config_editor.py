@@ -19,6 +19,11 @@ class EditableConfig(BaseModel):
 
     subscribed_token_ids: list[str] = Field(default_factory=list, max_length=20)
     target_token_ids: list[str] = Field(default_factory=list, max_length=20)
+    # Live start is gated on a delivered Telegram test, so the operator needs
+    # to be able to turn the channel on without hand-editing YAML. Only the
+    # switch is exposed -- the bot token and chat id stay in .env, which the
+    # dashboard neither reads nor writes.
+    telegram_enabled: bool = False
 
     @field_validator("subscribed_token_ids", "target_token_ids")
     @classmethod
@@ -50,9 +55,11 @@ class OperatorConfigEditor:
         raw = self._load_payload()
         market_data = raw.get("market_data", {}) if isinstance(raw, dict) else {}
         strategy = raw.get("spike_strategy", {}) if isinstance(raw, dict) else {}
+        notifications = raw.get("notifications", {}) if isinstance(raw, dict) else {}
         return EditableConfig(
             subscribed_token_ids=market_data.get("subscribed_token_ids", []),
             target_token_ids=strategy.get("target_token_ids", []),
+            telegram_enabled=bool(notifications.get("telegram_enabled", False)),
         )
 
     def save(self, config: EditableConfig) -> EditableConfig:
@@ -65,6 +72,9 @@ class OperatorConfigEditor:
         }
         payload["spike_strategy"] = {
             "target_token_ids": normalized.target_token_ids,
+        }
+        payload["notifications"] = {
+            "telegram_enabled": normalized.telegram_enabled,
         }
         self._write_payload(payload)
         return normalized

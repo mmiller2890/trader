@@ -242,3 +242,64 @@ async def test_non_durables_events_are_not_enqueued(tmp_path: Path) -> None:
         message="tick",
     )
     assert await service.enqueue_event(market_event) is None
+
+
+@pytest.mark.asyncio
+async def test_telegram_test_can_be_sent_repeatedly(tmp_path: Path) -> None:
+    """
+    Regression: the second press of "Send Telegram test" returned a 500.
+
+    The alert id was a fixed constant, and deduplication only collapses alerts
+    that are still undelivered. Once the first test delivered, the next press
+    was a genuine insert of a row whose primary key already existed, so every
+    attempt after the first failed -- leaving the live-start gate permanently
+    unclearable.
+    """
+
+    repository = OperationsRepository(tmp_path / "bot.sqlite3")
+    service = AlertService(repository, config(), now=lambda: NOW)
+    worker = NotificationWorker(
+        repository, FakeTelegram([None, None, None]), config(), now=lambda: NOW
+    )
+
+    ids = []
+    for _ in range(3):
+        alert = await service.enqueue_test(now=NOW)
+        ids.append(alert.alert_id)
+        assert await worker.deliver_alert_now(alert.alert_id) is True
+
+    assert len(set(ids)) == 3, "each attempt needs its own primary key"
+
+
+@pytest.mark.asyncio
+async def test_repeated_tests_keep_a_stable_gate_fingerprint(tmp_path: Path) -> None:
+    """The live-start gate looks up delivery by fingerprint, not by id."""
+
+    repository = OperationsRepository(tmp_path / "bot.sqlite3")
+    service = AlertService(repository, config(), now=lambda: NOW)
+    worker = NotificationWorker(
+        repository, FakeTelegram([None, None]), config(), now=lambda: NOW
+    )
+
+    first = await service.enqueue_test(now=NOW)
+    await worker.deliver_alert_now(first.alert_id)
+    later = NOW + timedelta(minutes=10)
+    second = await service.enqueue_test(now=later)
+    await worker.deliver_alert_now(second.alert_id)
+
+    assert first.incident_fingerprint == second.incident_fingerprint == "telegram:test"
+    assert await repository.last_delivered_at("telegram:test") is not None
+
+
+@pytest.mark.asyncio
+async def test_an_undelivered_test_still_dedupes(tmp_path: Path) -> None:
+    """Rapid presses must not pile up queued duplicates."""
+
+    repository = OperationsRepository(tmp_path / "bot.sqlite3")
+    service = AlertService(repository, config(), now=lambda: NOW)
+
+    await service.enqueue_test(now=NOW)
+    await service.enqueue_test(now=NOW)
+
+    queued = await repository.due_alerts(now=NOW, limit=20)
+    assert len(queued) == 1

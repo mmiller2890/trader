@@ -47,7 +47,7 @@ class ApiController:
     def get_config(self) -> EditableConfig:
         return EditableConfig()
 
-    def save_config(self, payload: EditableConfig) -> EditableConfig:
+    async def save_config(self, payload: EditableConfig) -> EditableConfig:
         self.calls.append(("save", payload))
         return payload
 
@@ -55,12 +55,22 @@ class ApiController:
         self.calls.append(("start", confirmation))
         return RuntimeStatus(phase=RuntimePhase.RUNNING, mode=Mode.DRY_RUN)
 
-    def set_mode(self, mode: Mode, confirmation: str | None = None) -> Mode:
+    async def set_mode(
+        self, mode: Mode, confirmation: str | None = None
+    ) -> Mode:
         self.calls.append(("mode", mode, confirmation))
         return mode
 
     async def stop(self) -> RuntimeStatus:
         self.calls.append("stop")
+        return RuntimeStatus(phase=RuntimePhase.STOPPED, mode=Mode.DRY_RUN)
+
+    async def resume_on_startup(self) -> RuntimeStatus:
+        self.calls.append("resume_on_startup")
+        return RuntimeStatus(phase=RuntimePhase.STOPPED, mode=Mode.DRY_RUN)
+
+    async def shutdown_process(self) -> RuntimeStatus:
+        self.calls.append("shutdown_process")
         return RuntimeStatus(phase=RuntimePhase.STOPPED, mode=Mode.DRY_RUN)
 
     async def halt(self, confirmation: str) -> RuntimeStatus:
@@ -75,6 +85,25 @@ class ApiController:
         self.calls.append("preflight")
         return PreflightView(ok=False, status="failed", reason="credentials_incomplete")
 
+    async def send_telegram_test(self, confirmation: str) -> ControlResult:
+        self.calls.append(("telegram_test", confirmation))
+        return ControlResult(
+            ok=True,
+            action="telegram_test",
+            reason="telegram_test_delivered",
+        )
+
+
+class ApiProcessServices:
+    def __init__(self, calls: list[object]) -> None:
+        self._calls = calls
+
+    async def start(self) -> None:
+        self._calls.append("process_start")
+
+    async def close(self) -> None:
+        self._calls.append("process_close")
+
 
 @pytest.fixture
 def api() -> tuple[object, ApiController]:
@@ -82,6 +111,7 @@ def api() -> tuple[object, ApiController]:
     return (
         create_app(
             controller=controller,
+            process_services=ApiProcessServices(controller.calls),
             operator_token="test-token",
             trusted_origins={"http://127.0.0.1:8000"},
         ),
@@ -191,13 +221,20 @@ async def test_mode_route_rejects_non_operator_runtime_modes(
 
 
 @pytest.mark.asyncio
-async def test_app_shutdown_stops_owned_runtime(api: tuple[object, ApiController]) -> None:
+async def test_app_lifespan_resumes_then_uses_process_shutdown(
+    api: tuple[object, ApiController],
+) -> None:
     app, controller = api
 
     async with app.router.lifespan_context(app):
         pass
 
-    assert controller.calls == ["stop"]
+    assert controller.calls == [
+        "process_start",
+        "resume_on_startup",
+        "shutdown_process",
+        "process_close",
+    ]
 
 
 @pytest.mark.asyncio
@@ -226,6 +263,25 @@ async def test_confirmed_controls_and_preflight_reach_controller(api: tuple[obje
         ("cancel_all", "CANCEL ALL"),
         "preflight",
     ]
+
+
+@pytest.mark.asyncio
+async def test_telegram_test_route_is_operator_guarded_and_confirmed(
+    api: tuple[object, ApiController],
+) -> None:
+    app, controller = api
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/api/notifications/test",
+            headers=mutation_headers(),
+            json={"confirmation": "SEND TEST"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["reason"] == "telegram_test_delivered"
+    assert controller.calls == [("telegram_test", "SEND TEST")]
 
 
 @pytest.mark.asyncio

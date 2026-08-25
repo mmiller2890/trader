@@ -86,7 +86,20 @@
           <button id="clear-halt-button" class="button button-secondary" type="button" disabled>
             Clear halt
           </button>
+          <button id="telegram-test-button" class="button button-secondary" type="button">
+            <span class="button-icon" aria-hidden="true">✉</span>
+            Send Telegram test
+          </button>
         </div>
+        <div class="control-grid">
+          <label id="telegram-toggle-label" class="toggle-row" for="telegram-enabled">
+            <input id="telegram-enabled" type="checkbox" />
+            <span>Telegram alerts enabled</span>
+          </label>
+        </div>
+        <p id="telegram-message" class="section-note" aria-live="polite">
+          Live start requires a Telegram test delivered in the last 5 minutes.
+        </p>
         <div id="live-warning" class="warning-banner" role="note">
           <strong id="live-warning-title">Live mode requires preflight.</strong>
           <span id="live-warning-copy">Run the read-only checks before enabling live mode.</span>

@@ -6,6 +6,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import httpx
 
@@ -80,6 +81,7 @@ _DURABLE_EVENT_TYPES = {
 }
 
 _URGENT_EVENT_TYPES = {
+    EventType.AUTO_RESUME_REJECTED,
     EventType.KILL_SWITCH_TRIPPED,
     EventType.REPEATED_FAILURES,
     EventType.RUNTIME_FAILED,
@@ -158,9 +160,19 @@ class AlertService:
         )
 
     async def enqueue_test(self, *, now: datetime) -> OutboxAlert:
+        """
+        Queue one operator Telegram test.
+
+        The id must be unique per attempt. Deduplication only collapses alerts
+        that are still *undelivered*, so once a test has been delivered the
+        next one is a genuine insert -- and a fixed id would collide on its
+        primary key, failing every attempt after the first. The fingerprint
+        stays stable because the live-start gate looks up delivery by it.
+        """
+
         return await self._repository.enqueue_alert(
             OutboxAlert(
-                alert_id="alert-telegram-test",
+                alert_id=f"alert-telegram-test-{uuid4().hex}",
                 incident_fingerprint="telegram:test",
                 severity=IncidentSeverity.INFO,
                 text="Telegram test alert. If you can read this, delivery works.",

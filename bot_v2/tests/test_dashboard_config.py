@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from config.loader import ConfigError, load_config
@@ -131,4 +132,74 @@ def test_loader_rejects_partial_live_operator_bundle(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ConfigError, match="complete mode bundle"):
+        load_config(tmp_path)
+
+
+def test_telegram_switch_round_trips_through_the_overlay(tmp_path: Path) -> None:
+    editor = OperatorConfigEditor(tmp_path / "operator.yaml", is_running=lambda: False)
+
+    editor.save(EditableConfig(telegram_enabled=True))
+
+    assert editor.load().telegram_enabled is True
+    payload = yaml.safe_load((tmp_path / "operator.yaml").read_text())
+    assert payload["notifications"] == {"telegram_enabled": True}
+
+
+def test_saving_market_scope_does_not_clear_the_telegram_switch(tmp_path: Path) -> None:
+    """The overlay is written whole, so every save must carry the switch."""
+
+    editor = OperatorConfigEditor(tmp_path / "operator.yaml", is_running=lambda: False)
+    editor.save(EditableConfig(telegram_enabled=True))
+
+    current = editor.load()
+    editor.save(
+        EditableConfig(
+            subscribed_token_ids=["123"],
+            target_token_ids=["123"],
+            telegram_enabled=current.telegram_enabled,
+        )
+    )
+
+    assert editor.load().telegram_enabled is True
+
+
+def test_telegram_switch_cannot_be_changed_while_running(tmp_path: Path) -> None:
+    editor = OperatorConfigEditor(tmp_path / "operator.yaml", is_running=lambda: True)
+
+    with pytest.raises(RuntimeError, match="bot_must_be_stopped"):
+        editor.save(EditableConfig(telegram_enabled=True))
+
+
+def test_overlay_with_the_telegram_switch_still_loads(tmp_path: Path) -> None:
+    """The loader allowlist must admit the section the editor now writes."""
+
+    (tmp_path / "bot.yaml").write_text(
+        "bot:\n  mode: dry_run\nexecution:\n"
+        "  dry_run_force: true\n  allow_live_trading: false\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "operator.yaml").write_text(
+        "notifications:\n  telegram_enabled: true\n", encoding="utf-8"
+    )
+
+    config = load_config(tmp_path)
+
+    assert config.notifications.telegram_enabled is True
+
+
+def test_operator_overlay_still_refuses_telegram_credentials(tmp_path: Path) -> None:
+    """Secrets must never be writable from, or readable by, the dashboard."""
+
+    (tmp_path / "bot.yaml").write_text(
+        "bot:\n  mode: dry_run\nexecution:\n"
+        "  dry_run_force: true\n  allow_live_trading: false\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "operator.yaml").write_text(
+        "notifications:\n  telegram_enabled: true\n"
+        "  telegram_bot_token: leaked\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="forbidden keys"):
         load_config(tmp_path)

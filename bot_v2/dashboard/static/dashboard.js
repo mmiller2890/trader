@@ -398,6 +398,11 @@
     byId("clear-halt-button").disabled =
       !(state.runtime.phase === "halted" || state.runtime.phase === "failed")
       || !state.active_halt_incident_suffix;
+    // The config overlay is only writable while stopped, so the toggle has to
+    // follow the same rule or it would silently fail. The test button does
+    // not: it needs to work right before a live start, which is when the bot
+    // is stopped anyway, and after one too.
+    byId("telegram-enabled").disabled = !stopped;
     byId("save-config-button").disabled = !stopped || automaticScope;
     byId("subscribed-tokens").disabled = !stopped || automaticScope;
     byId("target-tokens").disabled = !stopped || automaticScope;
@@ -458,6 +463,7 @@
     const config = await request("/api/config");
     byId("subscribed-tokens").value = config.subscribed_token_ids.join("\n");
     byId("target-tokens").value = config.target_token_ids.join("\n");
+    byId("telegram-enabled").checked = Boolean(config.telegram_enabled);
   };
 
   const loadEvents = async () => {
@@ -540,6 +546,44 @@
       showToast(error.message);
     }
   });
+  byId("telegram-test-button").addEventListener("click", async () => {
+    setText("telegram-message", "Sending Telegram test…");
+    try {
+      // The confirmation phrase is fixed by the controller, not typed here:
+      // sending a test alert to your own channel is not a destructive action.
+      const result = await request("/api/notifications/test", {
+        method: "POST",
+        body: JSON.stringify({ confirmation: "SEND TEST" }),
+      });
+      const delivered = result.ok;
+      setText(
+        "telegram-message",
+        delivered
+          ? "Telegram test delivered. Live start is unlocked for 5 minutes."
+          : `Telegram test not delivered: ${result.reason}.`,
+      );
+      await poll();
+      showToast(delivered ? "Telegram test delivered." : `Not delivered: ${result.reason}`);
+    } catch (error) {
+      setText("telegram-message", error.message);
+      showToast(error.message);
+    }
+  });
+  byId("telegram-enabled").addEventListener("change", async (event) => {
+    const enabled = event.target.checked;
+    try {
+      const current = await request("/api/config");
+      await request("/api/config", {
+        method: "PUT",
+        body: JSON.stringify({ ...current, telegram_enabled: enabled }),
+      });
+      showToast(`Telegram alerts ${enabled ? "enabled" : "disabled"}. Restart to apply.`);
+    } catch (error) {
+      // Put the checkbox back so it never claims a state that was not saved.
+      event.target.checked = !enabled;
+      showToast(error.message);
+    }
+  });
   byId("halt-button").addEventListener("click", () => openConfirmation("Emergency halt", "HALT", "/api/control/halt"));
   byId("cancel-button").addEventListener("click", () => openConfirmation("Cancel all orders", "CANCEL ALL", "/api/control/cancel-all"));
   byId("clear-halt-button").addEventListener("click", () => {
@@ -589,6 +633,9 @@
     const payload = {
       subscribed_token_ids: parseTokens("subscribed-tokens"),
       target_token_ids: parseTokens("target-tokens"),
+      // Carry the current switch through: the overlay is written whole, so
+      // omitting this would silently turn Telegram off on every scope save.
+      telegram_enabled: byId("telegram-enabled").checked,
     };
     if ([...payload.subscribed_token_ids, ...payload.target_token_ids].some((item) => !/^\d+$/.test(item))) {
       showToast("Token IDs must contain decimal digits only.");

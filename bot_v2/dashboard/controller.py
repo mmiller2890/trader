@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from app.process_services import ProcessReliabilityServices
 from app.runtime import BotRuntime, ControlResult, RuntimePhase, RuntimeStatus
 from clients.auth import build_clob_credentials, is_live_trading_enabled
 from config.loader import load_config
@@ -24,6 +25,11 @@ from dashboard.models import (
 )
 from dashboard.preflight import PreflightRunner
 from dashboard.read_model import DashboardReadModel, tail_events
+from models.events import BotEvent, EventType
+from notifications.outbox import AlertService
+from persistence.operations import OperationsRepository
+from persistence.snapshots import SnapshotStore
+from reliability.lease import LiveLeaseService, LiveResumeRejected
 
 
 class ConfirmationError(ValueError):
@@ -70,12 +76,37 @@ class DashboardController:
         now: Callable[[], datetime] | None = None,
         preflight_ttl_seconds: float = 300,
         recovery: Any | None = None,
+        lease_service: Any | None = None,
+        process_services: ProcessReliabilityServices | None = None,
     ) -> None:
         self.runtime = runtime
         self._config_dir = Path(config_dir)
         self._data_dir = Path(data_dir)
         self._config_loader = config_loader
         self._recovery = recovery
+        config = self._config_loader(self._config_dir)
+        if process_services is None:
+            self._operations_repository = OperationsRepository(
+                self._data_dir / "bot.sqlite3"
+            )
+            self._lease_service = lease_service or LiveLeaseService(
+                self._operations_repository,
+                live_lease_hours=config.reliability.live_lease_hours,
+            )
+            self._alert_service = AlertService(
+                self._operations_repository,
+                config,
+                now=now or (lambda: datetime.now(tz=UTC)),
+            )
+            self._notification_worker = None
+        else:
+            self._operations_repository = process_services.repository
+            self._lease_service = process_services.leases
+            self._alert_service = process_services.alerts
+            self._notification_worker = process_services.notification_worker
+        self._snapshot_store = SnapshotStore(
+            self._data_dir / "snapshots" / "state.json"
+        )
         self._editor = OperatorConfigEditor(
             self._config_dir / "operator.yaml",
             is_running=lambda: self.runtime.status().phase
@@ -83,7 +114,7 @@ class DashboardController:
         )
         self._preflight = preflight or PreflightRunner(
             self._config_dir,
-            redactions=secret_redactions(self._config_loader(self._config_dir)),
+            redactions=secret_redactions(config),
         )
         self._preflight_lock = asyncio.Lock()
         self._now = now or (lambda: datetime.now(tz=UTC))
@@ -162,6 +193,20 @@ class DashboardController:
                 raise RuntimeConflictError("fresh_preflight_required")
             if confirmation != "START LIVE":
                 raise ConfirmationError("confirmation must be exactly START LIVE")
+            delivered_at = await self._operations_repository.last_delivered_at(
+                "telegram:test"
+            )
+            age_seconds = (
+                (self._now() - delivered_at).total_seconds()
+                if delivered_at is not None
+                else None
+            )
+            if (
+                age_seconds is None
+                or age_seconds < 0
+                or age_seconds > 300
+            ):
+                raise RuntimeConflictError("recent_telegram_test_required")
         try:
             status = await self.runtime.start(self._config_dir, allow_live=allow_live)
         except Exception:
@@ -172,10 +217,112 @@ class DashboardController:
             if allow_live:
                 self._invalidate_preflight_from_runtime(status.reason)
             raise RuntimeConflictError(status.reason or "bot_start_failed")
+        if allow_live:
+            try:
+                await self._lease_service.issue(config, now=self._now())
+            except Exception as exc:
+                self._invalidate_preflight("live_lease_issue_failed")
+                try:
+                    await self.runtime.emergency_halt("HALT")
+                except Exception:
+                    await self.runtime.stop()
+                raise RuntimeConflictError("live_lease_issue_failed") from exc
+            await self._enqueue_operational_event(
+                EventType.LIVE_LEASE_ISSUED,
+                message="live operating lease issued",
+                reason="manual_live_start",
+            )
         return status
 
     async def stop(self) -> RuntimeStatus:
+        await self._lease_service.revoke("operator_stop", now=self._now())
         return await self.runtime.stop()
+
+    async def shutdown_process(self) -> RuntimeStatus:
+        """Stop for host/process shutdown without revoking authorization."""
+
+        shutdown = getattr(self.runtime, "shutdown_process", None)
+        if callable(shutdown):
+            return await shutdown()
+        return await self.runtime.stop()
+
+    async def resume_on_startup(self) -> RuntimeStatus:
+        """Resume only an already-authorized live configuration."""
+
+        config = self.config()
+        if config.bot.mode != Mode.LIVE:
+            return self.runtime.status()
+        try:
+            snapshot = await self._snapshot_store.load()
+            if snapshot is not None and snapshot.kill_switch_active:
+                raise LiveResumeRejected("kill_switch_latched")
+            await self._lease_service.validate_for_resume(config, now=self._now())
+            status = await self.runtime.start(self._config_dir, allow_live=True)
+            if status.phase == RuntimePhase.FAILED:
+                reason = status.reason or "runtime_start_failed"
+                await self._lease_service.revoke(reason, now=self._now())
+                await self.runtime.stop()
+                await self._enqueue_operational_event(
+                    EventType.AUTO_RESUME_REJECTED,
+                    message="automatic live resume rejected",
+                    reason=reason,
+                )
+                return self.runtime.status()
+            return status
+        except LiveResumeRejected as exc:
+            await self._lease_service.revoke(exc.reason, now=self._now())
+            await self._enqueue_operational_event(
+                EventType.AUTO_RESUME_REJECTED,
+                message="automatic live resume rejected",
+                reason=exc.reason,
+            )
+            return self.runtime.status()
+
+    async def _enqueue_operational_event(
+        self,
+        event_type: EventType,
+        *,
+        message: str,
+        reason: str,
+    ) -> None:
+        try:
+            await self._alert_service.enqueue_event(
+                BotEvent(
+                    event_type=event_type,
+                    component="dashboard",
+                    mode=self.config().bot.mode.value,
+                    message=message,
+                    reason=reason,
+                    created_at=self._now(),
+                )
+            )
+        except Exception:
+            return
+
+    async def send_telegram_test(self, confirmation: str) -> ControlResult:
+        """Queue and immediately attempt the operator's Telegram test."""
+
+        if confirmation != "SEND TEST":
+            raise ConfirmationError("confirmation must be exactly SEND TEST")
+        if self._notification_worker is None:
+            return ControlResult(
+                ok=False,
+                action="telegram_test",
+                reason="notification_worker_unavailable",
+            )
+        alert = await self._alert_service.enqueue_test(now=self._now())
+        delivered = await self._notification_worker.deliver_alert_now(
+            alert.alert_id
+        )
+        return ControlResult(
+            ok=delivered,
+            action="telegram_test",
+            reason=(
+                "telegram_test_delivered"
+                if delivered
+                else "telegram_test_queued_for_retry"
+            ),
+        )
 
     async def halt(self, confirmation: str) -> RuntimeStatus:
         if confirmation != "HALT":
@@ -300,13 +447,19 @@ class DashboardController:
             self._preflight_fingerprint = fingerprint if result.ok else None
             return self.last_preflight
 
-    def set_mode(self, mode: Mode, confirmation: str | None = None) -> Mode:
+    async def set_mode(
+        self, mode: Mode, confirmation: str | None = None
+    ) -> Mode:
+        self._ensure_config_editable()
         selected = Mode(mode)
         if selected == Mode.LIVE:
             if not self._preflight_is_fresh():
                 raise RuntimeConflictError("fresh_preflight_required")
             if confirmation != "ENABLE LIVE":
                 raise ConfirmationError("confirmation must be exactly ENABLE LIVE")
+        await self._lease_service.revoke(
+            "live_configuration_changed", now=self._now()
+        )
         return self._editor.set_mode(selected)
 
     def _preflight_is_fresh(self) -> bool:
@@ -328,6 +481,13 @@ class DashboardController:
         except Exception:
             return False
         return fingerprint_matches and 0 <= age <= self._preflight_ttl_seconds
+
+    def _ensure_config_editable(self) -> None:
+        if self.runtime.status().phase not in {
+            RuntimePhase.STOPPED,
+            RuntimePhase.FAILED,
+        }:
+            raise RuntimeError("bot_must_be_stopped")
 
     def _config_fingerprint(self) -> str:
         """Hash preflight-relevant config, including secrets, without exposing it."""
@@ -400,13 +560,19 @@ class DashboardController:
             target_token_ids=config.spike_strategy.target_token_ids,
         )
 
-    def save_config(self, payload: EditableConfig | dict[str, object]) -> EditableConfig:
+    async def save_config(
+        self, payload: EditableConfig | dict[str, object]
+    ) -> EditableConfig:
+        self._ensure_config_editable()
         if self.config().market_data.automatic_market.enabled:
             raise RuntimeError("automatic_market_owns_token_scope")
         editable = (
             payload
             if isinstance(payload, EditableConfig)
             else EditableConfig.model_validate(payload)
+        )
+        await self._lease_service.revoke(
+            "live_configuration_changed", now=self._now()
         )
         self._config_generation += 1
         self._invalidate_preflight("preflight_invalidated_by_config_change")

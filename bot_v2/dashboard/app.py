@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict
 
+from app.process_services import ProcessReliabilityServices
 from config.schema import Mode
 from dashboard.config_editor import EditableConfig
 from dashboard.controller import (
@@ -56,6 +57,7 @@ class ClearHaltRequest(BaseModel):
 def create_app(
     *,
     controller: DashboardController,
+    process_services: ProcessReliabilityServices | None = None,
     operator_token: str | None = None,
     trusted_origins: set[str] | None = None,
     health_store: HealthSnapshotStore | None = None,
@@ -64,10 +66,17 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):  # type: ignore[no-untyped-def]
+        if process_services is not None:
+            await process_services.start()
         try:
+            await controller.resume_on_startup()
             yield
         finally:
-            await controller.stop()
+            try:
+                await controller.shutdown_process()
+            finally:
+                if process_services is not None:
+                    await process_services.close()
 
     token = operator_token or secrets.token_urlsafe(32)
     origins = trusted_origins or {
@@ -192,7 +201,9 @@ def create_app(
     @app.put("/api/mode", dependencies=[OperatorGuard])
     async def set_mode(payload: ModeRequest):  # type: ignore[no-untyped-def]
         async def operation():  # type: ignore[no-untyped-def]
-            return controller.set_mode(Mode(payload.mode), payload.confirmation)
+            return await controller.set_mode(
+                Mode(payload.mode), payload.confirmation
+            )
 
         return await call_control(operation)
 
@@ -216,10 +227,18 @@ def create_app(
     async def preflight():  # type: ignore[no-untyped-def]
         return await call_control(controller.run_preflight)
 
+    @app.post("/api/notifications/test", dependencies=[OperatorGuard])
+    async def telegram_test(  # type: ignore[no-untyped-def]
+        payload: ConfirmationRequest,
+    ):
+        return await call_control(
+            lambda: controller.send_telegram_test(payload.confirmation)
+        )
+
     @app.put("/api/config", dependencies=[OperatorGuard])
     async def save_config(payload: EditableConfig):  # type: ignore[no-untyped-def]
         try:
-            return controller.save_config(payload)
+            return await controller.save_config(payload)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
