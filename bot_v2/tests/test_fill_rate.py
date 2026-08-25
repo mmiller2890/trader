@@ -83,3 +83,42 @@ def test_summary_states_it_is_an_upper_bound() -> None:
 
 def test_empty_input_does_not_divide_by_zero() -> None:
     assert summarize_fills([])["quotes"] == 0
+
+
+def test_a_sell_fills_when_the_book_trades_up_to_it() -> None:
+    series = [book(0, "0.49", "0.51"), book(5, "0.53", "0.55"), book(10, "0.56", "0.58")]
+
+    outcome = simulate_quote(
+        series, index=0, side="sell", offset_ticks=1,
+        ttl_seconds=30, tick_size=Decimal("0.01"),
+    )
+
+    # Sell rests one tick above the ask, at 0.52; the book reaches it by t=5.
+    assert outcome.filled is True
+    assert outcome.seconds_to_fill == 5
+
+
+def test_a_sell_does_not_fill_when_the_market_walks_away() -> None:
+    series = [book(0, "0.49", "0.51"), book(5, "0.40", "0.42"), book(10, "0.35", "0.37")]
+
+    outcome = simulate_quote(
+        series, index=0, side="sell", offset_ticks=1,
+        ttl_seconds=30, tick_size=Decimal("0.01"),
+    )
+
+    assert outcome.filled is False
+
+
+def test_a_quote_fills_at_the_exact_ttl_boundary() -> None:
+    # The boundary check is future.at > deadline, so a fill at exactly the deadline counts as filled.
+    # This tests that the boundary is inclusive by choice.
+    series = [book(0, "0.49", "0.51"), book(30, "0.48", "0.50")]
+
+    outcome = simulate_quote(
+        series, index=0, side="buy", offset_ticks=1,
+        ttl_seconds=30, tick_size=Decimal("0.01"),
+    )
+
+    # Price reaches the quote at exactly t=30, which equals the deadline.
+    assert outcome.filled is True
+    assert outcome.seconds_to_fill == 30

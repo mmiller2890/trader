@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
-from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
@@ -36,6 +35,7 @@ class QuoteOutcome:
 
     filled: bool
     seconds_to_fill: float | None
+    side: Literal["buy", "sell"] | None = None
 
 
 def simulate_quote(
@@ -66,8 +66,9 @@ def simulate_quote(
             return QuoteOutcome(
                 filled=True,
                 seconds_to_fill=(future.at - start.at).total_seconds(),
+                side=side,
             )
-    return QuoteOutcome(filled=False, seconds_to_fill=None)
+    return QuoteOutcome(filled=False, seconds_to_fill=None, side=side)
 
 
 def summarize_fills(outcomes: list[QuoteOutcome]) -> dict[str, object]:
@@ -75,13 +76,16 @@ def summarize_fills(outcomes: list[QuoteOutcome]) -> dict[str, object]:
 
     caveat = (
         "queue position is ignored, so this is an upper bound on fill rate; "
-        "a real quote fills less often"
+        "a real quote fills less often. --sample-every spaces quotes by observation "
+        "count while TTL is a duration, so on uneven cadence sampled windows can "
+        "overlap and become autocorrelated"
     )
     if not outcomes:
         return {"quotes": 0, "caveat": caveat}
     filled = [o for o in outcomes if o.filled]
     latencies = [o.seconds_to_fill for o in filled if o.seconds_to_fill is not None]
-    return {
+
+    result = {
         "quotes": len(outcomes),
         "fill_rate": round(len(filled) / len(outcomes), 4),
         "median_seconds_to_fill": (
@@ -89,6 +93,21 @@ def summarize_fills(outcomes: list[QuoteOutcome]) -> dict[str, object]:
         ),
         "caveat": caveat,
     }
+
+    # Add per-side fill rates if side information is available
+    if outcomes and outcomes[0].side is not None:
+        buy_outcomes = [o for o in outcomes if o.side == "buy"]
+        sell_outcomes = [o for o in outcomes if o.side == "sell"]
+
+        if buy_outcomes:
+            buy_filled = len([o for o in buy_outcomes if o.filled])
+            result["fill_rate_buy"] = round(buy_filled / len(buy_outcomes), 4)
+
+        if sell_outcomes:
+            sell_filled = len([o for o in sell_outcomes if o.filled])
+            result["fill_rate_sell"] = round(sell_filled / len(sell_outcomes), 4)
+
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
