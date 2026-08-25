@@ -1,0 +1,29 @@
+[Unit]
+Description=Polymarket BTC 15m operator dashboard (lease-based auto-resume)
+After=network-online.target
+Wants=network-online.target
+# A latched safety state or revoked lease must never be overridden by a
+# restart loop: only a nonzero fatal exit triggers a restart, and the burst
+# limits prevent a tight crash cycle.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket-bot
+EnvironmentFile=/opt/polymarket-bot/deploy/polymarket-bot.env
+Environment=BOT_DATA_DIR=/var/lib/polymarket-bot/data
+ExecStart=/opt/polymarket-bot/.venv/bin/python -m dashboard.main --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+# Final order cancellation and snapshot persistence must finish cleanly.
+TimeoutStopSec=60
+KillSignal=SIGINT
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/polymarket-bot
+
+[Install]
+WantedBy=multi-user.target

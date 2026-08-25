@@ -358,6 +358,29 @@ The manager reconnects with capped backoff. If transport or market-data heartbea
 
 Treat the persisted halt reason as an intervention request. Check Polymarket orders and positions first, preserve `data/snapshots/state.json` and `data/journal/events.jsonl`, then follow the live runbook. Restarting the process does not intentionally erase the persisted kill switch.
 
+## Deployment supervision
+
+For multi-day unattended operation, run the operator dashboard under a
+process supervisor. Reference files:
+
+- `Dockerfile` — liveness `HEALTHCHECK` over the atomic runtime health file.
+- `docker-compose.example.yml` — `restart: unless-stopped`, persistent
+  `/data` volume, env-file injection, log-size limits.
+- `deploy/polymarket-bot.service` — systemd unit with `Restart=on-failure`,
+  `RestartSec=5`, burst limits, dedicated environment file, non-root user,
+  and a `TimeoutStopSec` longer than bot shutdown so final cancel/snapshot
+  work completes.
+
+Both entry points run `python -m dashboard.main`: startup performs the full
+lease-based auto-resume gate (fresh preflight + reconciliation). The
+command line never grants fresh live authorization; `--live` remains an
+explicit interactive choice and `--resume-live` only validates a persisted
+lease. A fatal supervised failure exits nonzero so the supervisor restarts;
+a safe `HALTED` state keeps the dashboard alive for operator inspection and
+must not enter a restart loop. Copy `deploy/polymarket-bot.env.example`,
+fill it locally, and never commit it. See
+`docs/unattended-operations-runbook.md` for per-alert playbooks.
+
 ## Security
 
 - Never commit `.env`, `config/operator.yaml`, `data/`, private keys, CLOB credentials, bot tokens, or funded account details.

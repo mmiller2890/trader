@@ -18,6 +18,13 @@ python -m scripts.healthcheck
 
 `python -m app.main` refuses an armed live configuration unless the operator also supplies `--live`. Run the preflight command while the safe defaults are still enabled. It constructs a read-only exchange adapter and never submits, signs, or cancels orders; live startup still requires all three live flags after the operator gates pass.
 
+For multi-day unattended operation (72-hour live lease, durable Telegram
+alerts, auto-resume gates, guarded `CLEAR HALT <suffix>` recovery), see
+[unattended-operations-runbook.md](unattended-operations-runbook.md). The
+healthcheck command now defaults to liveness over the runtime health file;
+use `python -m scripts.healthcheck --kind trading` for the legacy
+market-data freshness checks with exit codes 0/2.
+
 `python -m dashboard.main` opens the loopback-only operator console at `http://127.0.0.1:8000`. It starts/stops dry-run and live runtimes, inspects the active BTC 15-minute market, and shows every read-only preflight check. With automatic market discovery enabled, the bot owns both rotating outcome token IDs and the manual token editor stays locked. Live activation requires a passing preflight from the last five minutes and the exact `ENABLE LIVE` phrase; live start requires `START LIVE` and repeats full preflight in runtime bootstrap. `Return to dry run` atomically restores the safe mode bundle. Emergency halt and cancel-all retain their exact confirmations.
 
 The checked-in dry-run profile discovers market metadata through the public Gamma API before opening the market WebSocket. No private key or CLOB credentials are needed for this path. If discovery cannot validate the current active, open, order-book-enabled market, startup fails closed instead of subscribing to stale IDs.
