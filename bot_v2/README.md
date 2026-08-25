@@ -360,6 +360,30 @@ Treat the persisted halt reason as an intervention request. Check Polymarket ord
 
 ## Deployment supervision
 
+### Reliability qualification
+
+Before any unattended live authorization, run the automated gates:
+
+```bash
+BOT_DATA_DIR=data .venv/bin/python -m scripts.reliability_soak \
+  --mode accelerated --markets 500 --inject-faults --output-dir data/qualification
+```
+
+The accelerated run drives a deterministic dry-run pipeline through 500
+market cycles while injecting every required fault family and writes a
+machine-readable JSON report (`passed: true` required). Wall-clock
+qualification runs are operator-controlled:
+
+```bash
+.venv/bin/python -m scripts.reliability_soak \
+  --mode wall-clock --duration-hours 24 --inject-faults --output-dir data/qualification
+# then the 72-hour release gate at --duration-hours 72
+```
+
+Wall-clock progress is written atomically after each market so a host
+restart can resume without erasing evidence. The runner refuses
+`bot.mode=live`. Reports are evidence: preserve them, never commit them.
+
 For multi-day unattended operation, run the operator dashboard under a
 process supervisor. Reference files:
 

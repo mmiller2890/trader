@@ -119,6 +119,20 @@ no trading action needed. Resolution: oldest pending age drops to zero.
 
 ## Standard operations
 
+### Qualification before unattended live use
+
+Unattended live leases are blocked until the dry-run gates pass:
+
+1. Accelerated: 500 virtual markets with injected faults
+   (`scripts.reliability_soak --mode accelerated --markets 500 --inject-faults`).
+2. Continuous 24-hour dry run (`--mode wall-clock --duration-hours 24`),
+   including at least one process restart, WebSocket outage, Data-API
+   outage, Gamma delay, and Telegram outage.
+3. Continuous 72-hour dry run (`--duration-hours 72`, ≥288 markets).
+
+Preserve every JSON report under `data/qualification/`. If any acceptance
+field fails, fix the cause and restart the gate from a new run id.
+
 ### Start (first time or after clean stop)
 
 ```bash
