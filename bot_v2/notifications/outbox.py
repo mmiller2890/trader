@@ -136,6 +136,8 @@ class AlertService:
             else IncidentSeverity.INFO
         )
         fingerprint = f"event:{event.event_type.value}:{event.component}"
+        if event.event_type == EventType.DAILY_SUMMARY and event.reason:
+            fingerprint = event.reason.strip()
         raw = event.message + (f" reason={event.reason}" if event.reason else "")
         text = _redact(_sanitize(raw), self._config)
         return await self._repository.enqueue_alert(

@@ -336,23 +336,35 @@ async def notification_delivery_loop(
     """Deliver due outbox alerts; failures never terminate other loops."""
 
     worker = getattr(services, "notification_worker", None)
+    daily_summary = getattr(services, "daily_summary_emitter", None)
 
     while not stop_event.is_set():
 
         async def work() -> None:
-            if worker is None:
-                return
-            try:
-                await worker.deliver_due_once()
-            except Exception as exc:
-                logger.warning(
-                    "notification delivery failed",
-                    extra={
-                        "component": "notification_worker",
-                        "event_type": "delivery_failed",
-                        "reason": type(exc).__name__,
-                    },
-                )
+            if worker is not None:
+                try:
+                    await worker.deliver_due_once()
+                except Exception as exc:
+                    logger.warning(
+                        "notification delivery failed",
+                        extra={
+                            "component": "notification_worker",
+                            "event_type": "delivery_failed",
+                            "reason": type(exc).__name__,
+                        },
+                    )
+            if daily_summary is not None:
+                try:
+                    await daily_summary.maybe_emit()
+                except Exception as exc:
+                    logger.warning(
+                        "daily summary emission failed",
+                        extra={
+                            "component": "notification_worker",
+                            "event_type": "daily_summary_failed",
+                            "reason": type(exc).__name__,
+                        },
+                    )
 
         await _cycle(
             interval_seconds=5.0,

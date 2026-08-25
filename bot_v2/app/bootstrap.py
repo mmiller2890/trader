@@ -9,6 +9,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 from app.modes import is_live_mode
@@ -39,6 +40,7 @@ from persistence.journal import JsonlJournal
 from persistence.operations import OperationsRepository
 from persistence.retention import RetentionManager
 from persistence.snapshots import SnapshotStore
+from reliability.metrics import DailySummaryEmitter, OperationalMetrics
 from portfolio.exit_manager import PositionExitManager
 from portfolio.exit_policy import PositionExitPolicy
 from risk.circuit_breaker import CircuitBreaker
@@ -129,6 +131,8 @@ class AppServices:
     notification_worker: NotificationWorker
     retention_manager: RetentionManager
     health_store: HealthSnapshotStore
+    operational_metrics: OperationalMetrics
+    daily_summary_emitter: DailySummaryEmitter
     reconciliation: ReconciliationService
     market_rotator: Btc15mMarketRotator | None = None
 
@@ -345,6 +349,56 @@ async def bootstrap_app(
     )
     health_store = HealthSnapshotStore(data_dir / "health" / "runtime.json")
 
+    import shutil
+
+    def _disk_percent() -> float:
+        total, _used, free = shutil.disk_usage(data_dir)
+        if total <= 0:
+            return 0.0
+        return (total - free) / total * 100.0
+
+    async def _authoritative_pnl() -> tuple[Decimal, Decimal]:
+        realized = sum(
+            (await state_store.get_realized_pnl_by_day()).values(),
+            start=Decimal("0"),
+        )
+        unrealized = sum(
+            (position.unrealized_pnl for position in await state_store.get_positions()),
+            start=Decimal("0"),
+        )
+        return realized, unrealized
+
+    async def _operational_state() -> str:
+        state, _reason = await state_store.get_operational_state()
+        return state.value
+
+    async def _pending_alerts() -> int:
+        depth, _age = await operations_repository.outbox_stats(
+            now=datetime.now(tz=UTC)
+        )
+        return int(depth)
+
+    async def _lease_remaining() -> float | None:
+        lease = await operations_repository.get_active_lease()
+        if lease is None:
+            return None
+        return max(0.0, (lease.expires_at - datetime.now(tz=UTC)).total_seconds())
+
+    operational_metrics = OperationalMetrics(
+        repository=operations_repository,
+        pnl_provider=_authoritative_pnl,
+        state_provider=_operational_state,
+        outbox_pending_provider=_pending_alerts,
+        disk_percent_provider=_disk_percent,
+        lease_remaining_seconds_provider=_lease_remaining,
+    )
+    daily_summary_emitter = DailySummaryEmitter(
+        metrics=operational_metrics,
+        alert_service=alert_service,
+        repository=operations_repository,
+        hour_utc=config.notifications.daily_summary_hour_utc,
+    )
+
     async def emit_event(event: BotEvent) -> None:
         await journal.append(event)
         await event_bus.publish(event)
@@ -353,6 +407,7 @@ async def bootstrap_app(
         await alert_service.enqueue_event(event)
 
     event_bus.subscribe(durable_alert)
+    event_bus.subscribe(operational_metrics.record_event)
 
     strategy_config = config.spike_strategy
     if config.market_data.automatic_market.enabled:
@@ -492,6 +547,8 @@ async def bootstrap_app(
             notification_worker=notification_worker,
             retention_manager=retention_manager,
             health_store=health_store,
+            operational_metrics=operational_metrics,
+            daily_summary_emitter=daily_summary_emitter,
             reconciliation=reconciliation,
             market_rotator=market_rotator,
         )

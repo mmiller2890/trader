@@ -105,6 +105,22 @@ CREATE TABLE IF NOT EXISTS archived_position_lifecycles (
     payload TEXT NOT NULL,
     archived_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS daily_operational_metrics (
+    day TEXT PRIMARY KEY,
+    orders_submitted INTEGER NOT NULL DEFAULT 0,
+    fills_accounted INTEGER NOT NULL DEFAULT 0,
+    orders_rejected INTEGER NOT NULL DEFAULT 0,
+    markets_rotated INTEGER NOT NULL DEFAULT 0,
+    recoveries INTEGER NOT NULL DEFAULT 0,
+    degraded_seconds REAL NOT NULL DEFAULT 0,
+    started_at TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS metric_idempotency_keys (
+    key TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -708,3 +724,109 @@ class OperationsRepository:
             PositionLifecycle.model_validate(json.loads(row["payload"]))
             for row in rows
         ]
+
+    async def bump_daily_metrics(
+        self,
+        *,
+        day: str,
+        key: str,
+        counters: dict[str, int] | None = None,
+        degraded_seconds: float = 0.0,
+        started_at: datetime | None = None,
+        at: datetime,
+    ) -> bool:
+        """Apply one idempotent counter increment; False when key was seen."""
+
+        await self._ensure_schema()
+        updates = dict(counters or {})
+
+        def _work() -> bool:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO metric_idempotency_keys"
+                    " (key, created_at) VALUES (?, ?)",
+                    (key, _to_iso(at)),
+                )
+                if cursor.rowcount == 0:
+                    connection.commit()
+                    return False
+                connection.execute(
+                    "INSERT OR IGNORE INTO daily_operational_metrics"
+                    " (day, updated_at) VALUES (?, ?)",
+                    (day, _to_iso(at)),
+                )
+                assignments: list[str] = ["updated_at = ?"]
+                params: list[Any] = [_to_iso(_utc_now())]
+                for column, delta in updates.items():
+                    if column not in _METRIC_COUNTER_COLUMNS:
+                        continue
+                    assignments.append(f"{column} = {column} + ?")
+                    params.append(int(delta))
+                if degraded_seconds:
+                    assignments.append("degraded_seconds = degraded_seconds + ?")
+                    params.append(float(degraded_seconds))
+                if started_at is not None:
+                    assignments.append(
+                        "started_at = COALESCE(started_at, ?)"
+                    )
+                    params.append(_to_iso(started_at))
+                params.append(day)
+                connection.execute(
+                    "UPDATE daily_operational_metrics SET "
+                    + ", ".join(assignments)
+                    + " WHERE day = ?",
+                    params,
+                )
+                connection.commit()
+                return True
+            finally:
+                connection.close()
+
+        return await asyncio.to_thread(_work)
+
+    async def claim_metric_key(self, key: str, *, at: datetime) -> bool:
+        """Atomically reserve an idempotency key; True when newly claimed."""
+
+        await self._ensure_schema()
+
+        def _work() -> bool:
+            connection = self._connect()
+            try:
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO metric_idempotency_keys"
+                    " (key, created_at) VALUES (?, ?)",
+                    (key, _to_iso(at)),
+                )
+                connection.commit()
+                return cursor.rowcount > 0
+            finally:
+                connection.close()
+
+        return await asyncio.to_thread(_work)
+
+    async def daily_metrics_row(self, day: str) -> dict[str, Any] | None:
+        await self._ensure_schema()
+
+        def _work() -> dict[str, Any] | None:
+            connection = self._connect()
+            try:
+                row = connection.execute(
+                    "SELECT * FROM daily_operational_metrics WHERE day = ?",
+                    (day,),
+                ).fetchone()
+                return dict(row) if row is not None else None
+            finally:
+                connection.close()
+
+        return await asyncio.to_thread(_work)
+
+
+_METRIC_COUNTER_COLUMNS = {
+    "orders_submitted",
+    "fills_accounted",
+    "orders_rejected",
+    "markets_rotated",
+    "recoveries",
+}
