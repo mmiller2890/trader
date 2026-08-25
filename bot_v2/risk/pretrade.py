@@ -464,6 +464,27 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
             return RiskCheckResult(
                 check_name="edge_gate", passed=True, reason="edge_gate_disabled"
             )
+        if signal.reduce_only:
+            # This gate prices a round trip; an exit has already half-paid
+            # it by entering. Refusing an exit because it "isn't profitable
+            # enough" strands the position into resolution -- on a market
+            # with a fixed settlement time that leaves the full notional on
+            # a coin flip, which is strictly worse than any cost this gate
+            # protects against. Matches _entry_spread_check's reduce_only
+            # exemption for the same reason.
+            return RiskCheckResult(
+                check_name="edge_gate", passed=True, reason="exit_not_cost_gated"
+            )
+        if signal.observed_move_bps == 0:
+            # Zero directional edge means this is a liquidity-provision
+            # quote, not a directional bet (see strategies/market_maker.py,
+            # which always sets observed_move_bps=0.0) -- the round-trip
+            # cost model doesn't describe its economics. Maker entries that
+            # DO carry a move size (e.g. a post-only spike entry) stay
+            # gated below.
+            return RiskCheckResult(
+                check_name="edge_gate", passed=True, reason="no_directional_claim"
+            )
         if snapshot is None:
             return RiskCheckResult(
                 check_name="edge_gate", passed=False, reason="market_snapshot_missing"

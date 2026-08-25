@@ -653,6 +653,7 @@ async def test_exit_retry_is_not_blocked_as_a_duplicate() -> None:
     )
     assert guard.passed is True
     assert guard.reason == "exit_retry_exempt"
+    assert decision.approved is True
 
 
 @pytest.mark.asyncio
@@ -777,6 +778,7 @@ async def test_exits_are_never_blocked_by_a_wide_book() -> None:
         check for check in decision.checks if check.check_name == "entry_spread"
     )
     assert spread.passed is True
+    assert decision.approved is True
 
 
 @pytest.mark.asyncio

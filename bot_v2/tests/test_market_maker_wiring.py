@@ -45,11 +45,6 @@ risk:
   max_total_exposure: 200
   max_open_orders: 10
   min_top_of_book_liquidity: 1
-  # This test predates the edge gate and is about market-maker wiring, not
-  # cost. Maker-quote signals always carry observed_move_bps=0 (see
-  # strategies/market_maker.py), which the cost formula never clears -- see
-  # the report's concerns section.
-  edge_gate_mode: "off"
 """.strip(),
         encoding="utf-8",
     )
