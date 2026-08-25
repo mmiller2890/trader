@@ -205,6 +205,12 @@ class RiskConfig(BaseModel):
     circuit_breaker_failures: int = Field(default=5, ge=1, le=1000)
     circuit_breaker_window_seconds: float = Field(default=60.0, ge=1.0, le=3600.0)
     circuit_breaker_cooldown_seconds: float = Field(default=120.0, ge=1.0, le=86400.0)
+    # "enforce" blocks trades that cannot clear cost. "shadow" journals the
+    # decision and routes anyway, which is the only way to gather the fill data
+    # needed to calibrate the exit-cost model -- see the design doc. "off"
+    # disables the gate entirely.
+    edge_gate_mode: Literal["enforce", "shadow", "off"] = "enforce"
+    safety_margin_bps: Decimal = Field(default=Decimal("50"), ge=Decimal("0"))
 
 class SpikeStrategyConfig(BaseModel):
     """Single-strategy configuration for deterministic spike signals."""
@@ -394,4 +400,14 @@ class AppConfig(BaseModel):
             raise ValueError("live mode requires execution.dry_run_force=false")
         if self.execution.max_live_order_notional > self.notifications.large_order_threshold:
             raise ValueError("max_live_order_notional must be <= notifications.large_order_threshold")
+        if (
+            self.bot.mode == Mode.LIVE
+            and self.execution.allow_live_trading
+            and not self.execution.dry_run_force
+            and self.risk.edge_gate_mode == "shadow"
+        ):
+            raise ValueError(
+                "edge gate shadow mode is dry-run only: it routes trades the "
+                "gate rejected, which in live mode is a fee-gate bypass"
+            )
         return self
