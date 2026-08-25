@@ -163,3 +163,8 @@ position_management:
   exit_time_in_force: IOC
   exit_on_strategy_sell: true
   liquidate_full_position: true
+
+  # Rest the exit at the target first; cross only when the deadline passes or
+  # the market is about to resolve. The fallback is not optional.
+  exit_style: maker_first
+  maker_exit_deadline_seconds: 30

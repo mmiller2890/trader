@@ -26,6 +26,7 @@ class ExitDecision(BaseModel):
     effective_stop_loss_bps: Decimal | None = None
     dust: bool = False
     explanation: str
+    use_maker: bool = False
 
 
 class PositionExitPolicy:
@@ -100,6 +101,33 @@ class PositionExitPolicy:
         stop_loss = max([self._config.stop_loss_bps, *stop_floors_bps])
         return take_profit, stop_loss
 
+    def _use_maker(
+        self,
+        *,
+        lifecycle: PositionLifecycle,
+        reason: ExitReason,
+        now: datetime,
+    ) -> bool:
+        """
+        Rest the exit only when there is time for it to fill.
+
+        Expiry always crosses: an unfilled resting exit at resolution leaves the
+        full notional on a coin flip, which is strictly worse than paying the
+        spread to be certain. This check runs before the deadline is even
+        consulted, so no deadline configuration can produce a resting expiry
+        exit.
+        """
+
+        if self._config.exit_style != "maker_first":
+            return False
+        if reason == ExitReason.MARKET_EXPIRY:
+            return False
+        started = lifecycle.exit_first_attempted_at
+        if started is None:
+            return True
+        elapsed = (now - started).total_seconds()
+        return elapsed < self._config.maker_exit_deadline_seconds
+
     def evaluate(
         self,
         *,
@@ -153,6 +181,9 @@ class PositionExitPolicy:
                 reason=ExitReason.MARKET_EXPIRY,
                 requested_size=position.quantity,
                 explanation="market_expiry",
+                use_maker=self._use_maker(
+                    lifecycle=lifecycle, reason=ExitReason.MARKET_EXPIRY, now=now
+                ),
             )
 
         return_bps = (
@@ -173,6 +204,9 @@ class PositionExitPolicy:
                 effective_take_profit_bps=take_profit_bps,
                 effective_stop_loss_bps=stop_loss_bps,
                 explanation="stop_loss",
+                use_maker=self._use_maker(
+                    lifecycle=lifecycle, reason=ExitReason.STOP_LOSS, now=now
+                ),
             )
         if return_bps >= take_profit_bps:
             return ExitDecision(
@@ -183,6 +217,9 @@ class PositionExitPolicy:
                 effective_take_profit_bps=take_profit_bps,
                 effective_stop_loss_bps=stop_loss_bps,
                 explanation="take_profit",
+                use_maker=self._use_maker(
+                    lifecycle=lifecycle, reason=ExitReason.TAKE_PROFIT, now=now
+                ),
             )
         if now - lifecycle.opened_at >= timedelta(seconds=self._config.max_hold_seconds):
             return ExitDecision(
@@ -193,6 +230,9 @@ class PositionExitPolicy:
                 effective_take_profit_bps=take_profit_bps,
                 effective_stop_loss_bps=stop_loss_bps,
                 explanation="max_hold",
+                use_maker=self._use_maker(
+                    lifecycle=lifecycle, reason=ExitReason.MAX_HOLD, now=now
+                ),
             )
 
         return ExitDecision(

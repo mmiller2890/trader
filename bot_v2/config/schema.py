@@ -183,6 +183,11 @@ class PositionManagementConfig(BaseModel):
     exit_time_in_force: TimeInForce = TimeInForce.IOC
     exit_on_strategy_sell: bool = True
     liquidate_full_position: bool = True
+    # Maker exits rest at the target and pay no fee. The taker fallback below
+    # is mandatory: inventory unexited at resolution is a coin flip on full
+    # notional and trips the rotation kill switch.
+    exit_style: Literal["taker", "maker_first"] = "maker_first"
+    maker_exit_deadline_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
 
 
 class RiskConfig(BaseModel):

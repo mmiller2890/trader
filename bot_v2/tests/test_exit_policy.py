@@ -24,13 +24,17 @@ def policy(
     min_stop_ticks: str = "0",
     spread_floor_multiple: str = "0",
     tick_size: str = "0.01",
+    exit_style: str = "maker_first",
+    maker_exit_deadline_seconds: float = 30.0,
 ) -> PositionExitPolicy:
     """
     Build a policy for tests.
 
     The tick and spread floors default to disabled here so each test exercises
     exactly the threshold it names. Tests that care about the floors turn them
-    on explicitly.
+    on explicitly. exit_style and maker_exit_deadline_seconds default to the
+    same values as PositionManagementConfig's own defaults; tests that care
+    about use_maker override them explicitly.
     """
 
     return PositionExitPolicy(
@@ -42,6 +46,8 @@ def policy(
             min_edge_ticks=Decimal(min_edge_ticks),
             min_stop_ticks=Decimal(min_stop_ticks),
             spread_floor_multiple=Decimal(spread_floor_multiple),
+            exit_style=exit_style,
+            maker_exit_deadline_seconds=maker_exit_deadline_seconds,
         ),
         min_order_size=Decimal(min_order_size),
         max_data_age_seconds=max_data_age_seconds,
@@ -63,6 +69,7 @@ def lifecycle(
     opened_at: datetime = NOW - timedelta(seconds=30),
     market_end_at: datetime | None = None,
     pending_exit: str | None = None,
+    exit_first_attempted_at: datetime | None = None,
 ) -> PositionLifecycle:
     return PositionLifecycle(
         market_id="m1",
@@ -71,6 +78,7 @@ def lifecycle(
         last_fill_at=opened_at,
         market_end_at=market_end_at,
         pending_exit_client_order_id=pending_exit,
+        exit_first_attempted_at=exit_first_attempted_at,
     )
 
 
@@ -327,3 +335,78 @@ def test_policy_falls_back_to_default_tick_when_lookup_fails() -> None:
     )
 
     assert engine.tick_size_for("t1") == Decimal("0.01")
+
+
+def test_a_fresh_exit_rests_as_a_maker_order() -> None:
+    engine = policy(
+        take_profit_bps="100", exit_style="maker_first",
+        maker_exit_deadline_seconds=30,
+    )
+
+    decision = engine.evaluate(
+        position=position(quantity="5", average="0.50"),
+        lifecycle=lifecycle(opened_at=NOW - timedelta(seconds=5)),
+        snapshot=snapshot(best_bid="0.60", mid="0.60"),
+        now=NOW,
+    )
+
+    assert decision.should_exit is True
+    assert decision.use_maker is True
+
+
+def test_an_exit_past_its_deadline_crosses_the_spread() -> None:
+    engine = policy(
+        take_profit_bps="100", exit_style="maker_first",
+        maker_exit_deadline_seconds=30,
+    )
+
+    decision = engine.evaluate(
+        position=position(quantity="5", average="0.50"),
+        lifecycle=lifecycle(
+            opened_at=NOW - timedelta(seconds=200),
+            exit_first_attempted_at=NOW - timedelta(seconds=45),
+        ),
+        snapshot=snapshot(best_bid="0.60", mid="0.60"),
+        now=NOW,
+    )
+
+    assert decision.use_maker is False
+
+
+def test_market_expiry_always_crosses_regardless_of_deadline() -> None:
+    """
+    Inventory left at resolution is a coin flip on full notional.
+
+    maker_exit_deadline_seconds is capped at 600 by its schema Field(le=600.0),
+    so 600 -- the largest value an operator can legally configure -- stands in
+    for "arbitrarily huge" here: even at the maximum, an expiry exit must
+    still cross.
+    """
+
+    engine = policy(exit_style="maker_first", maker_exit_deadline_seconds=600)
+
+    decision = engine.evaluate(
+        position=position(quantity="5", average="0.50"),
+        lifecycle=lifecycle(
+            market_end_at=NOW + timedelta(seconds=10),
+            exit_first_attempted_at=NOW,
+        ),
+        snapshot=snapshot(best_bid="0.60", mid="0.60"),
+        now=NOW,
+    )
+
+    assert decision.reason == ExitReason.MARKET_EXPIRY
+    assert decision.use_maker is False
+
+
+def test_taker_exit_style_never_rests() -> None:
+    engine = policy(take_profit_bps="100", exit_style="taker")
+
+    decision = engine.evaluate(
+        position=position(quantity="5", average="0.50"),
+        lifecycle=lifecycle(opened_at=NOW - timedelta(seconds=5)),
+        snapshot=snapshot(best_bid="0.60", mid="0.60"),
+        now=NOW,
+    )
+
+    assert decision.use_maker is False
