@@ -171,7 +171,7 @@ class SpikeStrategy(StrategyBase):
                             token_id=complement,
                             side=SignalSide.BUY,
                             reference_price=Decimal("1") - reference,
-                            target_price=Decimal("1") - snapshot.mid_price,
+                            target_price=limit,
                             observed_move_bps=abs(move_bps),
                             created_at=self._now(),
                             reason=f"{reason}_via_complement",

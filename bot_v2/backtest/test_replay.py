@@ -17,7 +17,7 @@ from backtest.models import ExecutionStatus
 from config.schema import AppConfig, Mode
 from models.market import MarketSnapshot
 from models.order import OrderResult, OrderStatus
-from models.signal import SignalSide, TradeSignal
+from models.signal import SignalSide, SignalType, TradeSignal
 from strategies.base import StrategyBase
 from strategies.spike import SpikeStrategy
 
@@ -61,6 +61,45 @@ class BuyOnceStrategy(StrategyBase):
                 observed_move_bps=100,
                 created_at=item.received_ts,
                 reason="test signal",
+            )
+        ]
+
+    async def on_order_update(self, order_result: OrderResult) -> list[TradeSignal]:
+        return []
+
+    async def on_timer(self) -> list[TradeSignal]:
+        return []
+
+
+class PostOnlyNonCrossingQuoteStrategy(StrategyBase):
+    """Emits one post-only maker quote priced well clear of the touch.
+
+    Deliberately never crosses, so the paper exchange has nothing to fill.
+    """
+
+    @property
+    def name(self) -> str:
+        return "post-only-resting"
+
+    async def on_market_update(self, item: MarketSnapshot) -> list[TradeSignal]:
+        if hasattr(self, "_emitted"):
+            return []
+        self._emitted = True
+        return [
+            TradeSignal(
+                strategy_name=self.name,
+                signal_type=SignalType.MAKER_QUOTE,
+                market_id=item.market_id,
+                token_id=item.token_id,
+                side=SignalSide.BUY,
+                reference_price=item.mid_price,
+                target_price=Decimal("0.10"),
+                observed_move_bps=100,
+                created_at=item.received_ts,
+                reason="test post-only quote",
+                requested_size=Decimal("5"),
+                limit_price=Decimal("0.10"),
+                post_only=True,
             )
         ]
 
@@ -150,6 +189,37 @@ async def test_backtest_records_a_risk_rejection_without_a_fill() -> None:
     assert result.metrics.filled_order_count == 0
     assert result.metrics.rejected_order_count == 1
     assert result.positions == []
+
+
+@pytest.mark.asyncio
+async def test_backtest_reports_a_non_crossing_post_only_quote_as_resting() -> None:
+    """
+    Regression: the matching engine only quotes depth resting in the book
+    right now -- it does not simulate a post-only order sitting in queue and
+    picking up a fill later. A post-only quote that does not cross was never
+    rejected by anything; the backtester must say so the same way the
+    dry-run submitter does for the identical situation, not report a
+    spurious REJECTED that looks like the order was refused.
+    """
+
+    started_at = datetime(2025, 1, 1, tzinfo=UTC)
+    config = AppConfig(bot={"mode": Mode.BACKTEST}, risk={"edge_gate_mode": "off"})
+    engine = BacktestEngine(config=config)
+
+    result = await engine.run(
+        strategy=PostOnlyNonCrossingQuoteStrategy(),
+        snapshots=[snapshot(price="0.50", at=started_at)],
+    )
+
+    assert len(result.order_results) == 1
+    order_result = result.order_results[0]
+    assert order_result.status == OrderStatus.SUBMITTED
+    assert order_result.accepted is True
+    assert order_result.filled_size == Decimal("0")
+    assert order_result.message == "simulated_resting_quote"
+    # Not a rejection, and not counted as a rejection in the metrics.
+    assert result.metrics.rejected_order_count == 0
+    assert result.metrics.filled_order_count == 0
 
 
 @pytest.mark.asyncio

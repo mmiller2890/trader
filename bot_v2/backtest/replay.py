@@ -233,7 +233,24 @@ class BacktestEngine:
         )
 
     def _to_order_result(self, report: ExecutionReport) -> OrderResult:
-        if report.status in {ExecutionStatus.REJECTED, ExecutionStatus.UNFILLED}:
+        message = report.reason
+        if report.status == ExecutionStatus.UNFILLED and report.order.post_only:
+            # The matching engine above only ever quotes depth already
+            # resting in the book at this instant -- it does not model queue
+            # position or simulate a resting order picking up a fill on some
+            # later snapshot. So a post-only order that does not cross right
+            # now was never actually rejected by anything; it is exactly the
+            # same "sits behind the touch, no fill to report yet" situation
+            # the dry-run submitter reports (execution/submitter.py). A
+            # post-only order can therefore only ever come back here as
+            # resting, never filled -- backtest fill rates and fill counts
+            # for maker entries are not meaningful measurements of whether
+            # the quote would actually trade; that requires real queue
+            # simulation, which this engine does not do.
+            status = OrderStatus.SUBMITTED
+            accepted = True
+            message = "simulated_resting_quote"
+        elif report.status in {ExecutionStatus.REJECTED, ExecutionStatus.UNFILLED}:
             status = OrderStatus.REJECTED
             accepted = False
         elif report.status == ExecutionStatus.FILLED:
@@ -252,7 +269,7 @@ class BacktestEngine:
             side=report.order.side,
             status=status,
             accepted=accepted,
-            message=report.reason,
+            message=message,
             signal_id=report.order.signal_id,
             strategy_name=report.order.strategy_name,
             requested_size=report.requested_size,

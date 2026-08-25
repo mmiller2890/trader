@@ -459,6 +459,7 @@ async def test_a_maker_bid_rests_behind_the_touch() -> None:
 
     # Book is 0.59/0.61; a maker bid rests one tick under the bid.
     assert signals[0].limit_price == Decimal("0.58")
+    assert signals[0].target_price == signals[0].limit_price
 
 
 @pytest.mark.asyncio
@@ -507,3 +508,8 @@ async def test_maker_entry_style_applies_to_the_complement_path_too() -> None:
     # Book is 0.39/0.41; complement's implied bid is 1 - 0.41 = 0.59, and the
     # maker BUY rests one tick behind it.
     assert quote.limit_price == Decimal("0.58")
+    # Regression: target_price must describe the price actually quoted at
+    # (limit_price), not the taker-frame mirrored mid -- execution only
+    # reads limit_price, but journal/dashboard/analysis code reads
+    # target_price and must not be shown a price the bot never quoted.
+    assert quote.target_price == quote.limit_price
