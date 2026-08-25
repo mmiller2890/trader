@@ -60,11 +60,13 @@ def test_crossed_book_is_rejected_without_changing_previous_state() -> None:
 def test_buy_quote_walks_asks_and_calculates_vwap_and_fees() -> None:
     book = book_with_asks([("0.50", "2"), ("0.51", "3"), ("0.55", "10")])
     order = buy_order(price="0.50", size="5", tif="IOC")
-    report = book.quote(order, max_slippage_bps=Decimal("300"), fee_bps=Decimal("10"))
+    report = book.quote(order, max_slippage_bps=Decimal("300"), fee_rate=Decimal("0.07"))
     assert [fill.size for fill in report.fills] == [Decimal("2"), Decimal("3")]
     assert report.total_notional == Decimal("2.53")
     assert report.average_fill_price == Decimal("0.506")
-    assert report.total_fees == Decimal("0.00253")
+    # fee = shares * 0.07 * price * (1 - price), summed per fill:
+    # 2 * 0.07 * 0.50 * 0.50 = 0.0350; 3 * 0.07 * 0.51 * 0.49 = 0.052479
+    assert report.total_fees == Decimal("0.087479")
     assert report.executable_liquidity == Decimal("5")
     assert report.status == ExecutionStatus.FILLED
 
@@ -74,7 +76,7 @@ def test_executable_liquidity_excludes_levels_beyond_price_limit() -> None:
     report = book.quote(
         buy_order(price="0.50", size="1", tif="IOC"),
         max_slippage_bps=Decimal("300"),
-        fee_bps=Decimal("0"),
+        fee_rate=Decimal("0"),
     )
     assert report.executable_liquidity == Decimal("5")
 
@@ -84,7 +86,7 @@ def test_commit_validation_failure_leaves_every_level_unchanged() -> None:
     report = book.quote(
         buy_order(price="0.50", size="4", tif="IOC"),
         max_slippage_bps=Decimal("300"),
-        fee_bps=Decimal("0"),
+        fee_rate=Decimal("0"),
     )
     invalid = report.model_copy(update={
         "fills": [
@@ -100,7 +102,7 @@ def test_commit_validation_failure_leaves_every_level_unchanged() -> None:
 
 def test_partial_quote_does_not_mutate_until_commit() -> None:
     book = book_with_asks([("0.50", "2")])
-    report = book.quote(buy_order(price="0.50", size="5", tif="IOC"), max_slippage_bps=Decimal("0"), fee_bps=Decimal("0"))
+    report = book.quote(buy_order(price="0.50", size="5", tif="IOC"), max_slippage_bps=Decimal("0"), fee_rate=Decimal("0"))
     assert report.status == ExecutionStatus.PARTIAL
     assert report.filled_size == Decimal("2")
     assert book.asks[Decimal("0.50")] == Decimal("2")
@@ -110,7 +112,59 @@ def test_partial_quote_does_not_mutate_until_commit() -> None:
 
 def test_fok_insufficient_depth_has_no_fills_and_cannot_consume_book() -> None:
     book = book_with_asks([("0.50", "2")])
-    report = book.quote(buy_order(price="0.50", size="5", tif="FOK"), max_slippage_bps=Decimal("0"), fee_bps=Decimal("0"))
+    report = book.quote(buy_order(price="0.50", size="5", tif="FOK"), max_slippage_bps=Decimal("0"), fee_rate=Decimal("0"))
     assert report.status == ExecutionStatus.UNFILLED
     assert report.fills == []
     assert book.asks[Decimal("0.50")] == Decimal("2")
+
+
+def test_quote_charges_the_price_dependent_taker_fee() -> None:
+    from decimal import Decimal
+
+    from backtest.orderbook import OrderBookState
+    from models.order import OrderRequest, OrderSide, OrderTimeInForce
+
+    book = OrderBookState(market_id="m1", token_id="t1")
+    book.asks[Decimal("0.50")] = Decimal("100")
+    order = OrderRequest(
+        client_order_id="fee-test-00001",
+        market_id="m1",
+        token_id="t1",
+        side=OrderSide.BUY,
+        price=Decimal("0.50"),
+        size=Decimal("100"),
+        time_in_force=OrderTimeInForce.GTC,
+    )
+
+    report = book.quote(
+        order, max_slippage_bps=Decimal("0"), fee_rate=Decimal("0.07")
+    )
+
+    # 100 shares * 0.07 * 0.50 * 0.50 = 1.75, not notional * bps.
+    assert report.total_fees == Decimal("1.7500")
+
+
+def test_quote_fee_falls_toward_the_price_extremes() -> None:
+    from decimal import Decimal
+
+    from backtest.orderbook import OrderBookState
+    from models.order import OrderRequest, OrderSide, OrderTimeInForce
+
+    def fee_at(price: str) -> Decimal:
+        book = OrderBookState(market_id="m1", token_id="t1")
+        book.asks[Decimal(price)] = Decimal("100")
+        order = OrderRequest(
+            client_order_id="fee-test-00002",
+            market_id="m1",
+            token_id="t1",
+            side=OrderSide.BUY,
+            price=Decimal(price),
+            size=Decimal("100"),
+            time_in_force=OrderTimeInForce.GTC,
+        )
+        return book.quote(
+            order, max_slippage_bps=Decimal("0"), fee_rate=Decimal("0.07")
+        ).total_fees
+
+    assert fee_at("0.90") < fee_at("0.50")
+    assert fee_at("0.10") < fee_at("0.50")

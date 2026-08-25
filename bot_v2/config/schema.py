@@ -8,6 +8,7 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
+from models.fees import DEFAULT_FEE_RATE
 from models.tick import normalize_tick_size
 
 
@@ -131,7 +132,10 @@ class BacktestConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     starting_cash: Decimal = Field(default=Decimal("1000"), gt=Decimal("0"))
-    taker_fee_bps: Decimal = Field(default=Decimal("10"), ge=Decimal("0"), le=Decimal("1000"))
+    # Per-share fee rate, not basis points: the real fee is price-dependent
+    # (rate * p * (1 - p)), so a flat bps figure is wrong at every price
+    # except by coincidence. Set to 0 in tests that want fee-free arithmetic.
+    fee_rate: Decimal = Field(default=DEFAULT_FEE_RATE, ge=Decimal("0"), le=Decimal("1"))
     allow_short_positions: bool = True
     reject_sequence_gaps: bool = True
     max_payout_per_share: Decimal = Field(default=Decimal("1"), gt=Decimal("0"), le=Decimal("1"))

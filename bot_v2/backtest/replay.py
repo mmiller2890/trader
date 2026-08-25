@@ -179,7 +179,7 @@ class BacktestEngine:
         candidate = book.quote(
             order,
             max_slippage_bps=Decimal(str(self._config.execution.max_slippage_bps)),
-            fee_bps=self._config.backtest.taker_fee_bps,
+            fee_rate=self._config.backtest.fee_rate,
         )
 
         if candidate.filled_size <= 0:

@@ -21,7 +21,7 @@ NOW = datetime(2025, 1, 1, tzinfo=UTC)
 def test_backtest_config_has_conservative_defaults() -> None:
     config = AppConfig()
     assert config.backtest.starting_cash == Decimal("1000")
-    assert config.backtest.taker_fee_bps == Decimal("10")
+    assert config.backtest.fee_rate == Decimal("0.07")
     assert config.backtest.allow_short_positions is True
     assert config.backtest.reject_sequence_gaps is True
     assert config.backtest.max_payout_per_share == Decimal("1")
@@ -57,4 +57,4 @@ def test_delta_accepts_zero_size_as_level_deletion() -> None:
 
 def test_backtest_fee_cannot_be_negative() -> None:
     with pytest.raises(ValidationError):
-        AppConfig(backtest={"taker_fee_bps": "-1"})
+        AppConfig(backtest={"fee_rate": "-1"})

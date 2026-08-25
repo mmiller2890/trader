@@ -19,7 +19,7 @@ from models.order import OrderSide
 def test_second_market_short_uses_combined_portfolio_reserve() -> None:
     ledger = PortfolioLedger(BacktestConfig(
         starting_cash="4",
-        taker_fee_bps="0",
+        fee_rate="0",
         allow_short_positions=True,
     ))
     first = filled_sell(size="5", price="0.50")
@@ -42,7 +42,7 @@ def test_second_market_short_uses_combined_portfolio_reserve() -> None:
 
 
 def test_buy_reduces_cash_by_notional_and_fee() -> None:
-    ledger = PortfolioLedger(BacktestConfig(starting_cash="100", taker_fee_bps="10"))
+    ledger = PortfolioLedger(BacktestConfig(starting_cash="100", fee_rate="0.07"))
     report = filled_buy(size="5", price="0.50", fee_bps="10")
     allowed, reason = ledger.can_apply(report)
     assert (allowed, reason) == (True, "funded")
@@ -57,7 +57,7 @@ def test_buy_reduces_cash_by_notional_and_fee() -> None:
 
 
 def test_partial_fill_only_books_executed_size() -> None:
-    ledger = PortfolioLedger(BacktestConfig(starting_cash="100", taker_fee_bps="0"))
+    ledger = PortfolioLedger(BacktestConfig(starting_cash="100", fee_rate="0"))
     report = partial_buy(requested="10", filled="3", price="0.50")
     ledger.apply(report, NOW)
     assert ledger.positions[("m1", "t1")].quantity == Decimal("3")
@@ -65,7 +65,7 @@ def test_partial_fill_only_books_executed_size() -> None:
 
 
 def test_synthetic_short_reserves_full_payout_liability() -> None:
-    ledger = PortfolioLedger(BacktestConfig(starting_cash="10", taker_fee_bps="0", allow_short_positions=True))
+    ledger = PortfolioLedger(BacktestConfig(starting_cash="10", fee_rate="0", allow_short_positions=True))
     report = filled_sell(size="5", price="0.60", fee_bps="0")
     assert ledger.can_apply(report) == (True, "funded")
     ledger.apply(report, NOW)
@@ -76,7 +76,7 @@ def test_synthetic_short_reserves_full_payout_liability() -> None:
 
 
 def test_insufficient_short_collateral_is_rejected_without_mutation() -> None:
-    ledger = PortfolioLedger(BacktestConfig(starting_cash="1", taker_fee_bps="0", allow_short_positions=True))
+    ledger = PortfolioLedger(BacktestConfig(starting_cash="1", fee_rate="0", allow_short_positions=True))
     report = filled_sell(size="5", price="0.10", fee_bps="0")
     assert ledger.can_apply(report) == (False, "insufficient_short_collateral")
     assert ledger.cash == Decimal("1")
@@ -89,7 +89,7 @@ def test_short_is_rejected_when_disabled() -> None:
 
 
 def test_closing_short_releases_reserved_collateral() -> None:
-    ledger = PortfolioLedger(BacktestConfig(starting_cash="10", taker_fee_bps="0", allow_short_positions=True))
+    ledger = PortfolioLedger(BacktestConfig(starting_cash="10", fee_rate="0", allow_short_positions=True))
     ledger.apply(filled_sell(size="9", price="0.60"), NOW)
     assert ledger.snapshot(NOW).reserved_cash == Decimal("9")
     flip = fill_report(
@@ -104,7 +104,7 @@ def test_closing_short_releases_reserved_collateral() -> None:
 
 
 def test_long_round_trip_realizes_gross_pnl_and_net_pnl_includes_fees() -> None:
-    ledger = PortfolioLedger(BacktestConfig(starting_cash="100", taker_fee_bps="10"))
+    ledger = PortfolioLedger(BacktestConfig(starting_cash="100", fee_rate="0.07"))
     ledger.apply(filled_buy(size="5", price="0.50", fee_bps="10"), NOW)
     ledger.apply(filled_sell(size="5", price="0.60", fee_bps="10"), LATER)
     state = ledger.snapshot(LATER)

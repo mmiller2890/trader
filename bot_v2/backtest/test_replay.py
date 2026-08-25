@@ -255,7 +255,7 @@ async def test_backtest_consumes_depth_and_records_partial_fill_and_fees() -> No
     config = AppConfig(
         bot={"mode": Mode.BACKTEST},
         execution={"default_order_size": "5", "max_slippage_bps": 300, "time_in_force": "IOC"},
-        backtest={"starting_cash": "100", "taker_fee_bps": "10"},
+        backtest={"starting_cash": "100", "fee_rate": "0.07"},
         risk={"min_top_of_book_liquidity": "1", "max_slippage_bps": 100},
     )
     engine = BacktestEngine(config=config)
@@ -273,7 +273,9 @@ async def test_backtest_consumes_depth_and_records_partial_fill_and_fees() -> No
     assert order.requested_size == Decimal("5")
     assert order.filled_size == Decimal("3")
     assert report.average_fill_price == Decimal("0.5033333333333333333333333333")
-    assert report.total_fees == Decimal("0.00151")
+    # fee = shares * 0.07 * price * (1 - price), summed per fill:
+    # 2 * 0.07 * 0.50 * 0.50 = 0.035; 1 * 0.07 * 0.51 * 0.49 = 0.017493
+    assert report.total_fees == Decimal("0.052493")
     assert result.positions[0].quantity == Decimal("3")
     assert result.metrics.fill_rate == Decimal("0.6")
 
@@ -288,7 +290,7 @@ async def test_backtest_risk_rejects_depth_vwap_outside_risk_limit() -> None:
             "time_in_force": "IOC",
         },
         risk={"min_top_of_book_liquidity": "1", "max_slippage_bps": 25},
-        backtest={"starting_cash": "100", "taker_fee_bps": "0"},
+        backtest={"starting_cash": "100", "fee_rate": "0"},
     )
     engine = BacktestEngine(config=config)
     result = await engine.run_events(
@@ -329,7 +331,7 @@ async def test_unfunded_quote_does_not_consume_book_or_create_position() -> None
     config = AppConfig(
         bot={"mode": Mode.BACKTEST},
         execution={"default_order_size": "5"},
-        backtest={"starting_cash": "1", "taker_fee_bps": "10"},
+        backtest={"starting_cash": "1", "fee_rate": "0.07"},
     )
     engine = BacktestEngine(config=config)
     result = await engine.run_events(strategy=BuyOnceStrategy(), events=[deep_snapshot_event()])
@@ -499,7 +501,7 @@ async def test_synthetic_short_reserves_collateral() -> None:
     config = AppConfig(
         bot={"mode": Mode.BACKTEST},
         execution={"default_order_size": "5"},
-        backtest={"starting_cash": "10", "taker_fee_bps": "0"},
+        backtest={"starting_cash": "10", "fee_rate": "0"},
         risk={"min_top_of_book_liquidity": "1"},
     )
     engine = BacktestEngine(config=config)
@@ -518,7 +520,7 @@ async def test_unfundable_short_is_rejected_atomically() -> None:
     config = AppConfig(
         bot={"mode": Mode.BACKTEST},
         execution={"default_order_size": "5"},
-        backtest={"starting_cash": "2.5", "taker_fee_bps": "0"},
+        backtest={"starting_cash": "2.5", "fee_rate": "0"},
         risk={"min_top_of_book_liquidity": "1"},
     )
     engine = BacktestEngine(config=config)

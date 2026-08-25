@@ -12,6 +12,7 @@ from backtest.models import (
     ExecutionStatus,
     SimulatedFill,
 )
+from models.fees import taker_fee
 from models.market import MarketSnapshot
 from models.order import OrderRequest, OrderSide, OrderTimeInForce
 
@@ -96,7 +97,7 @@ class OrderBookState:
         order: OrderRequest,
         *,
         max_slippage_bps: Decimal,
-        fee_bps: Decimal,
+        fee_rate: Decimal,
     ) -> ExecutionReport:
         """Quote depth without mutating the book."""
         slippage = max_slippage_bps / Decimal("10000")
@@ -122,7 +123,7 @@ class OrderBookState:
                 break
             take = min(remaining, size)
             notional = price * take
-            fee = notional * fee_bps / Decimal("10000")
+            fee = taker_fee(take, price, fee_rate)
             fills.append(
                 SimulatedFill(price=price, size=take, notional=notional, fee=fee)
             )

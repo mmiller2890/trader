@@ -9,7 +9,7 @@ from config.schema import BacktestConfig
 
 
 def test_summarize_recovers_starting_cash_from_first_equity_snapshot() -> None:
-    ledger = PortfolioLedger(BacktestConfig(starting_cash="100", taker_fee_bps="10"))
+    ledger = PortfolioLedger(BacktestConfig(starting_cash="100", fee_rate="0.07"))
     report = filled_buy(size="5", price="0.50", fee_bps="10")
     ledger.apply(report, NOW)
     ledger.mark(snapshot(mid="0.50", at=NOW))
