@@ -102,6 +102,10 @@ class DryRunLifecycleHarness:
                 "min_order_size": "1",
                 "max_order_size": "25",
                 "time_in_force": "FOK",
+                # These fixtures quote half-cent prices, which only exist on a
+                # 0.005-tick market. Declaring it keeps the book on-grid so
+                # quantization stays a no-op here.
+                "default_tick_size": "0.005",
             },
             position_management={
                 "take_profit_bps": take_profit_bps,
@@ -143,6 +147,7 @@ class DryRunLifecycleHarness:
             self.config.position_management,
             min_order_size=self.config.execution.min_order_size,
             max_data_age_seconds=self.config.risk.max_data_staleness_seconds,
+            default_tick_size=self.config.execution.default_tick_size,
         )
         self.exit_manager = PositionExitManager(
             config=self.config,

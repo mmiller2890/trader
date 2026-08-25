@@ -82,6 +82,10 @@ def _validate_operator_overlay(payload: dict[str, Any]) -> None:
         "execution": {"allow_live_trading", "dry_run_force"},
         "market_data": {"subscribed_token_ids"},
         "spike_strategy": {"target_token_ids"},
+        "market_maker": {"enabled", "target_token_ids"},
+        # The switch only. Credentials come from the environment and are never
+        # written to, or read from, an operator-editable file.
+        "notifications": {"telegram_enabled"},
     }
     extra_sections = set(payload) - set(allowed)
     if extra_sections:
@@ -130,10 +134,16 @@ def load_config(config_dir: str | Path | None = None) -> AppConfig:
     base_config = _read_yaml(config_root / "bot.yaml", required=True)
     risk_config = _read_yaml(config_root / "risk.yaml", required=False)
     spike_config = _read_yaml(config_root / "strategies" / "spike.yaml", required=False)
+    market_maker_config = _read_yaml(
+        config_root / "strategies" / "market_maker.yaml", required=False
+    )
 
     merged = deepcopy(base_config)
     merged = _deep_merge(merged, _wrap_fragment("risk", risk_config))
     merged = _deep_merge(merged, _wrap_fragment("spike_strategy", spike_config))
+    merged = _deep_merge(
+        merged, _wrap_fragment("market_maker", market_maker_config)
+    )
     operator_config = _read_yaml(config_root / "operator.yaml", required=False)
     _validate_operator_overlay(operator_config)
     merged = _deep_merge(merged, operator_config)

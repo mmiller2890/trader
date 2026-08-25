@@ -74,6 +74,7 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
             )
         )
         checks.append(self._slippage_check(signal, snapshot, proposed_price))
+        checks.append(self._entry_spread_check(signal, snapshot))
 
         failed = [check for check in checks if not check.passed]
         if failed:
@@ -276,6 +277,27 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
         )
 
     async def _duplicate_guard_check(self, signal: TradeSignal) -> RiskCheckResult:
+        if signal.is_maker_quote:
+            # A market maker is *supposed* to keep a resting order on each
+            # side and refresh it as the book moves. Its own quote tracker
+            # owns replacement; the open-order cap still bounds the total.
+            return RiskCheckResult(
+                check_name="duplicate_guard",
+                passed=True,
+                reason="maker_quote_exempt",
+            )
+        if signal.reduce_only:
+            # Exit retries are deliberate repeats of the same intent, and the
+            # retry interval is far shorter than the duplicate window -- so
+            # this guard would block every retry after the first and exhaust
+            # the exit budget, latching the kill switch on a position that
+            # was never actually re-sent. Concurrency is already prevented by
+            # the exit reservation, which admits one live exit per position.
+            return RiskCheckResult(
+                check_name="duplicate_guard",
+                passed=True,
+                reason="exit_retry_exempt",
+            )
         window = timedelta(seconds=self._config.risk.duplicate_signal_window_seconds)
         cutoff = self._now() - window
         signals = await self._state_store.get_signals()
@@ -322,6 +344,15 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
                 passed=False,
                 reason="market_snapshot_missing",
             )
+        if signal.is_maker_quote:
+            # This check exists to stop a taker from sweeping a thin book.
+            # A resting quote adds depth instead of consuming it, so opposing
+            # liquidity is not a precondition for posting one.
+            return RiskCheckResult(
+                check_name="top_of_book_liquidity",
+                passed=True,
+                reason="maker_quote_adds_liquidity",
+            )
         available = executable_liquidity
         if available is None:
             available = snapshot.top_ask_size if signal.side.value == "buy" else snapshot.top_bid_size
@@ -332,6 +363,60 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
             reason="top_of_book_sufficient" if available >= minimum else f"top_of_book_too_thin:{available}<{minimum}",
         )
 
+    def _entry_spread_check(
+        self,
+        signal: TradeSignal,
+        snapshot: MarketSnapshot | None,
+    ) -> RiskCheckResult:
+        """
+        Refuse to cross a book whose spread exceeds the configured maximum.
+
+        Top-of-book *size* and top-of-book *tightness* are different things.
+        A book quoting 0.09 / 0.91 can show plenty of depth on both sides and
+        still cost 82 cents a share to cross -- a loss taken in full at the
+        moment of entry, before any market move. The liquidity check passes
+        such a book; only this one catches it.
+
+        Resting maker quotes are exempt: they add liquidity to a wide book
+        rather than paying to cross it, which is precisely when quoting is
+        most profitable.
+        """
+
+        limit = self._config.risk.max_entry_spread_bps
+        if limit <= 0 or signal.is_maker_quote or signal.reduce_only:
+            return RiskCheckResult(
+                check_name="entry_spread",
+                passed=True,
+                reason="entry_spread_not_applicable",
+            )
+        if snapshot is None:
+            return RiskCheckResult(
+                check_name="entry_spread",
+                passed=False,
+                reason="market_snapshot_missing",
+            )
+        if snapshot.best_ask <= 0 or snapshot.best_bid <= 0:
+            return RiskCheckResult(
+                check_name="entry_spread",
+                passed=False,
+                reason="entry_spread_book_one_sided",
+            )
+        spread_bps = float(
+            (snapshot.best_ask - snapshot.best_bid)
+            / snapshot.best_ask
+            * Decimal("10000")
+        )
+        passed = spread_bps <= limit
+        return RiskCheckResult(
+            check_name="entry_spread",
+            passed=passed,
+            reason=(
+                "entry_spread_within_limit"
+                if passed
+                else f"entry_spread_too_wide:{spread_bps:.0f}>{limit:.0f}"
+            ),
+        )
+
     def _slippage_check(
         self,
         signal: TradeSignal,
@@ -340,6 +425,15 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
     ) -> RiskCheckResult:
         if snapshot is None:
             return RiskCheckResult(check_name="slippage", passed=False, reason="market_snapshot_missing")
+        if signal.is_maker_quote:
+            # Slippage measures how far a taker pays through the touch. A
+            # maker quote sits away from the touch on purpose, and the order
+            # builder already clamped it so it cannot cross.
+            return RiskCheckResult(
+                check_name="slippage",
+                passed=True,
+                reason="maker_quote_prices_are_intentional",
+            )
         reference = snapshot.best_ask if signal.side.value == "buy" else snapshot.best_bid
         slippage_bps = _bps_distance(reference, proposed_price)
         passed = slippage_bps <= self._config.risk.max_slippage_bps

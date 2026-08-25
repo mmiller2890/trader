@@ -8,6 +8,8 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
+from models.tick import normalize_tick_size
+
 
 class Mode(str, Enum):
     """Supported app runtime modes."""
@@ -106,6 +108,8 @@ class ExecutionConfig(BaseModel):
     large_order_notional: Decimal = Field(default=Decimal("100"), gt=Decimal("0"))
     min_live_buy_notional: Decimal = Field(default=Decimal("1"), gt=Decimal("0"))
     max_live_order_notional: Decimal = Field(default=Decimal("1"), gt=Decimal("0"))
+    default_tick_size: Decimal = Field(default=Decimal("0.01"), gt=Decimal("0"))
+    post_only_maker_quotes: bool = True
 
     @model_validator(mode="after")
     def validate_order_size_bounds(self) -> Self:
@@ -117,6 +121,7 @@ class ExecutionConfig(BaseModel):
             raise ValueError(
                 "min_live_buy_notional must be <= max_live_order_notional"
             )
+        normalize_tick_size(self.default_tick_size)
         return self
 
 
@@ -154,6 +159,17 @@ class PositionManagementConfig(BaseModel):
     enabled: bool = True
     take_profit_bps: Decimal = Field(default=Decimal("300"), gt=0)
     stop_loss_bps: Decimal = Field(default=Decimal("200"), gt=0)
+    # A bps threshold is the wrong unit on a 0..1 market: one tick is 100 bps
+    # at price 1.00 but 2000 bps at price 0.05, and the tick itself differs by
+    # 10x between the 15m (0.001) and daily (0.01) markets. These floors
+    # re-express both thresholds in units the exchange actually trades in, so
+    # a stop can never sit inside the spread and fire on entry.
+    min_edge_ticks: Decimal = Field(default=Decimal("2"), ge=Decimal("0"))
+    min_stop_ticks: Decimal = Field(default=Decimal("2"), ge=Decimal("0"))
+    # Floor both thresholds at this multiple of the observed bid/ask spread.
+    # Entry fills at the ask and is marked against the bid, so a round trip
+    # costs one spread before the market moves at all.
+    spread_floor_multiple: Decimal = Field(default=Decimal("2"), ge=Decimal("0"))
     max_hold_seconds: float = Field(default=180, gt=0)
     exit_before_market_end_seconds: float = Field(default=60, gt=0)
     exit_retry_interval_seconds: float = Field(default=2, gt=0)
@@ -175,6 +191,10 @@ class RiskConfig(BaseModel):
     max_daily_loss: Decimal = Field(default=Decimal("50"), gt=Decimal("0"))
     max_data_staleness_seconds: float = Field(default=15.0, ge=1.0, le=600.0)
     min_top_of_book_liquidity: Decimal = Field(default=Decimal("20"), ge=Decimal("0"))
+    # Refuse to cross a book this wide. Depth is not the same as tightness: a
+    # book can show 100 shares on each side while quoting 0.09 / 0.91, and
+    # crossing it pays 82 cents a share the instant you enter. 0 disables.
+    max_entry_spread_bps: float = Field(default=600.0, ge=0.0, le=20000.0)
     max_slippage_bps: float = Field(default=25.0, ge=0.0, le=1000.0)
     duplicate_signal_window_seconds: float = Field(default=15.0, ge=0.0, le=3600.0)
     circuit_breaker_failures: int = Field(default=5, ge=1, le=1000)
@@ -187,14 +207,86 @@ class SpikeStrategyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
-    lookback_ticks: int = Field(default=3, ge=2, le=50)
+    # Which way to trade a detected spike.
+    #   "momentum"  -- go with the move. Measured on 95 episodes: 65% of
+    #                  spikes continue, worth ~+187 bps net of spread.
+    #   "reversion" -- fade the move. The original behaviour; measured
+    #                  negative on the same data.
+    # Flip this to A/B the two on identical conditions.
+    direction: Literal["momentum", "reversion"] = "momentum"
+    lookback_ticks: int = Field(default=3, ge=2, le=50000)
+    # Measure the move over a wall-clock window instead of a fixed number of
+    # book updates. Book updates arrive at ~250/sec per token, so a count of 8
+    # spans about 30 milliseconds -- noise, not a move. When set, this takes
+    # precedence and lookback_ticks becomes only a cap on retained history.
+    lookback_seconds: float | None = Field(default=None, gt=0.0, le=3600.0)
     spike_threshold_bps: float = Field(default=80.0, gt=0.0, le=5000.0)
     cooldown_seconds: float = Field(default=30.0, ge=0.0, le=3600.0)
     min_top_of_book_liquidity: Decimal = Field(default=Decimal("20"), ge=Decimal("0"))
     emit_on_upward_spike: bool = True
     emit_on_downward_spike: bool = True
+    # Polymarket has no borrow, so "sell YES" only executes against inventory
+    # already held. With this enabled an upward spike instead BUYs the paired
+    # NO token, which is the same economic trade and always executable.
+    sell_via_complement: bool = True
+    # Refuse entries near the payout bounds. A fade bought at 0.97 risks 97
+    # cents to make 3; the reward/risk is upside-down no matter how reliable
+    # the reversion is. This band is what keeps the strategy in the part of
+    # the curve where being right pays.
+    min_entry_price: Decimal = Field(
+        default=Decimal("0.10"), gt=Decimal("0"), lt=Decimal("1")
+    )
+    max_entry_price: Decimal = Field(
+        default=Decimal("0.90"), gt=Decimal("0"), lt=Decimal("1")
+    )
     target_market_ids: list[str] = Field(default_factory=list)
     target_token_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_entry_band(self) -> Self:
+        if self.min_entry_price >= self.max_entry_price:
+            raise ValueError("min_entry_price must be < max_entry_price")
+        return self
+
+
+class MarketMakerConfig(BaseModel):
+    """Two-sided quoting configuration for the market-making strategy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    # Total quoted spread in ticks; each side sits half of this from fair.
+    quote_spread_ticks: int = Field(default=2, ge=1, le=50)
+    # Spread used on the reducing side once inventory forces an unwind.
+    unwind_spread_ticks: int = Field(default=1, ge=0, le=50)
+    # Largest fair-value skew, in ticks, applied at full inventory.
+    max_skew_ticks: Decimal = Field(default=Decimal("2"), ge=Decimal("0"))
+    base_quote_size: Decimal = Field(default=Decimal("100"), gt=Decimal("0"))
+    min_quote_size: Decimal = Field(default=Decimal("5"), gt=Decimal("0"))
+    # Re-quote once the mid has moved more than this many ticks.
+    refresh_move_ticks: Decimal = Field(default=Decimal("1"), ge=Decimal("0"))
+    # Fraction of max inventory beyond which the accumulating side stops.
+    inventory_unwind_ratio: float = Field(default=0.8, gt=0.0, le=1.0)
+    max_position_size: Decimal = Field(default=Decimal("200"), gt=Decimal("0"))
+    min_book_liquidity: Decimal = Field(default=Decimal("0"), ge=Decimal("0"))
+    # Refresh a resting quote at least this often even in a quiet book.
+    quote_ttl_seconds: float = Field(default=30.0, gt=0.0, le=3600.0)
+    # Stop quoting this long before the market closes.
+    stop_quoting_before_end_seconds: float = Field(default=60.0, ge=0.0)
+    target_market_ids: list[str] = Field(default_factory=list)
+    target_token_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_quote_bounds(self) -> Self:
+        if self.min_quote_size > self.base_quote_size:
+            raise ValueError("min_quote_size must be <= base_quote_size")
+        if self.base_quote_size > self.max_position_size:
+            raise ValueError("base_quote_size must be <= max_position_size")
+        if self.unwind_spread_ticks > self.quote_spread_ticks:
+            raise ValueError(
+                "unwind_spread_ticks must be <= quote_spread_ticks"
+            )
+        return self
 
 
 class ReliabilityConfig(BaseModel):
@@ -285,6 +377,7 @@ class AppConfig(BaseModel):
         default_factory=PositionManagementConfig
     )
     spike_strategy: SpikeStrategyConfig = Field(default_factory=SpikeStrategyConfig)
+    market_maker: MarketMakerConfig = Field(default_factory=MarketMakerConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     secrets: SecretsConfig = Field(default_factory=SecretsConfig)
 

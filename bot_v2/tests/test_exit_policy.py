@@ -20,16 +20,32 @@ def policy(
     exit_before_market_end_seconds: float = 60,
     min_order_size: str = "1",
     max_data_age_seconds: float = 15,
+    min_edge_ticks: str = "0",
+    min_stop_ticks: str = "0",
+    spread_floor_multiple: str = "0",
+    tick_size: str = "0.01",
 ) -> PositionExitPolicy:
+    """
+    Build a policy for tests.
+
+    The tick and spread floors default to disabled here so each test exercises
+    exactly the threshold it names. Tests that care about the floors turn them
+    on explicitly.
+    """
+
     return PositionExitPolicy(
         PositionManagementConfig(
             take_profit_bps=Decimal(take_profit_bps),
             stop_loss_bps=Decimal(stop_loss_bps),
             max_hold_seconds=max_hold_seconds,
             exit_before_market_end_seconds=exit_before_market_end_seconds,
+            min_edge_ticks=Decimal(min_edge_ticks),
+            min_stop_ticks=Decimal(min_stop_ticks),
+            spread_floor_multiple=Decimal(spread_floor_multiple),
         ),
         min_order_size=Decimal(min_order_size),
         max_data_age_seconds=max_data_age_seconds,
+        tick_size_provider=lambda token_id: Decimal(tick_size),
     )
 
 
@@ -187,3 +203,127 @@ def test_zero_entry_price_blocks_exit() -> None:
         snapshot=snapshot(best_bid="0.60", mid="0.60"), now=NOW,
     )
     assert decision.should_exit is False
+
+
+def test_stop_inside_the_spread_is_raised_above_it() -> None:
+    # The reported failure mode: entry fills at the ask and is marked against
+    # the bid, so a stop narrower than the spread fires before the market moves.
+    engine = policy(
+        stop_loss_bps="110",
+        take_profit_bps="180",
+        spread_floor_multiple="2",
+        tick_size="0.01",
+    )
+    book = snapshot(best_bid="0.57", mid="0.575")
+
+    take_profit, stop_loss = engine.effective_thresholds(
+        entry_price=Decimal("0.58"), snapshot=book
+    )
+
+    # One 0.01 spread on a 0.58 entry is ~172 bps; the floor is 2x that.
+    assert stop_loss > Decimal("340")
+    assert take_profit > Decimal("340")
+
+
+def test_a_fresh_entry_does_not_immediately_stop_out() -> None:
+    engine = policy(
+        stop_loss_bps="110", spread_floor_multiple="2", tick_size="0.01"
+    )
+    # Bought at the ask (0.58), now marked against the bid (0.57).
+    decision = engine.evaluate(
+        position=position(quantity="5", average="0.58"),
+        lifecycle=lifecycle(),
+        snapshot=snapshot(best_bid="0.57", mid="0.575"),
+        now=NOW,
+    )
+
+    assert decision.should_exit is False
+    assert decision.explanation == "within_thresholds"
+
+
+def test_the_same_entry_would_stop_out_without_the_floor() -> None:
+    # Documents precisely what the floor prevents.
+    engine = policy(stop_loss_bps="110", spread_floor_multiple="0", min_stop_ticks="0")
+    decision = engine.evaluate(
+        position=position(quantity="5", average="0.58"),
+        lifecycle=lifecycle(),
+        snapshot=snapshot(best_bid="0.57", mid="0.575"),
+        now=NOW,
+    )
+
+    assert decision.should_exit is True
+    assert decision.reason == ExitReason.STOP_LOSS
+
+
+def test_tick_floor_scales_with_price_not_bps() -> None:
+    engine = policy(
+        take_profit_bps="180", min_edge_ticks="2", tick_size="0.01"
+    )
+    cheap, _ = engine.effective_thresholds(
+        entry_price=Decimal("0.10"), snapshot=snapshot(best_bid="0.09", mid="0.095")
+    )
+    dear, _ = engine.effective_thresholds(
+        entry_price=Decimal("0.90"), snapshot=snapshot(best_bid="0.89", mid="0.895")
+    )
+
+    # Two ticks is 2000 bps at 0.10 but only 222 bps at 0.90.
+    assert cheap > dear
+    assert cheap >= Decimal("2000")
+
+
+def test_finer_tick_market_gets_a_proportionally_smaller_floor() -> None:
+    # The 15m markets trade on a 0.001 grid, the daily on 0.01.
+    coarse = policy(min_edge_ticks="2", tick_size="0.01", take_profit_bps="1")
+    fine = policy(min_edge_ticks="2", tick_size="0.001", take_profit_bps="1")
+    book = snapshot(best_bid="0.49", mid="0.495")
+
+    coarse_tp, _ = coarse.effective_thresholds(
+        entry_price=Decimal("0.50"), snapshot=book
+    )
+    fine_tp, _ = fine.effective_thresholds(
+        entry_price=Decimal("0.50"), snapshot=book
+    )
+
+    assert coarse_tp > fine_tp
+
+
+def test_configured_threshold_wins_when_it_already_clears_the_floors() -> None:
+    engine = policy(
+        take_profit_bps="5000",
+        stop_loss_bps="4000",
+        min_edge_ticks="2",
+        min_stop_ticks="2",
+        spread_floor_multiple="2",
+    )
+    take_profit, stop_loss = engine.effective_thresholds(
+        entry_price=Decimal("0.50"), snapshot=snapshot(best_bid="0.49", mid="0.495")
+    )
+
+    assert take_profit == Decimal("5000")
+    assert stop_loss == Decimal("4000")
+
+
+def test_effective_thresholds_are_reported_on_every_decision() -> None:
+    decision = policy(spread_floor_multiple="2").evaluate(
+        position=position(quantity="5", average="0.50"),
+        lifecycle=lifecycle(),
+        snapshot=snapshot(best_bid="0.49", mid="0.495"),
+        now=NOW,
+    )
+
+    assert decision.effective_take_profit_bps is not None
+    assert decision.effective_stop_loss_bps is not None
+
+
+def test_policy_falls_back_to_default_tick_when_lookup_fails() -> None:
+    def broken(token_id: str) -> Decimal:
+        raise RuntimeError("clob down")
+
+    engine = PositionExitPolicy(
+        PositionManagementConfig(min_edge_ticks=Decimal("2")),
+        min_order_size=Decimal("1"),
+        max_data_age_seconds=15,
+        tick_size_provider=broken,
+    )
+
+    assert engine.tick_size_for("t1") == Decimal("0.01")

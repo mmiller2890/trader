@@ -439,3 +439,345 @@ async def test_reduce_only_buy_is_rejected() -> None:
 
     assert decision.approved is False
     assert "reduce_only_requires_sell" in decision.reason
+
+
+def maker_quote(
+    *,
+    side: SignalSide = SignalSide.BUY,
+    limit_price: str = "0.44",
+    size: str = "100",
+) -> TradeSignal:
+    return TradeSignal(
+        strategy_name="market_maker",
+        signal_type=SignalType.MAKER_QUOTE,
+        market_id="m1",
+        token_id="t1",
+        side=side,
+        reference_price=Decimal("0.455"),
+        target_price=Decimal(limit_price),
+        observed_move_bps=0,
+        reason="quote_refresh",
+        requested_size=Decimal(size),
+        limit_price=Decimal(limit_price),
+        post_only=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_maker_quote_is_not_blocked_by_its_own_previous_quote() -> None:
+    store = ready_state_store()
+    engine = risk_engine(store)
+    first = maker_quote()
+    await store.add_signal(first)
+
+    decision = await engine.evaluate(
+        signal=maker_quote(),
+        snapshot=fresh_snapshot(),
+        proposed_size=Decimal("1"),
+        proposed_price=Decimal("0.44"),
+    )
+
+    assert decision.approved is True
+    guard = next(
+        check for check in decision.checks if check.check_name == "duplicate_guard"
+    )
+    assert guard.reason == "maker_quote_exempt"
+
+
+@pytest.mark.asyncio
+async def test_maker_quote_does_not_require_opposing_liquidity() -> None:
+    store = ready_state_store()
+    engine = risk_engine(store)
+    empty_book = fresh_snapshot().model_copy(
+        update={"top_ask_size": Decimal("0"), "top_bid_size": Decimal("0")}
+    )
+
+    decision = await engine.evaluate(
+        signal=maker_quote(),
+        snapshot=empty_book,
+        proposed_size=Decimal("1"),
+        proposed_price=Decimal("0.44"),
+    )
+
+    assert decision.approved is True
+
+
+@pytest.mark.asyncio
+async def test_maker_quote_is_exempt_from_taker_slippage() -> None:
+    store = ready_state_store()
+    engine = risk_engine(store)
+
+    decision = await engine.evaluate(
+        signal=maker_quote(limit_price="0.30"),
+        snapshot=fresh_snapshot(),
+        proposed_size=Decimal("1"),
+        proposed_price=Decimal("0.30"),
+    )
+
+    assert decision.approved is True
+
+
+@pytest.mark.asyncio
+async def test_maker_quote_still_obeys_the_kill_switch() -> None:
+    store = ready_state_store()
+    await store.activate_kill_switch("manual halt")
+    engine = risk_engine(store)
+
+    decision = await engine.evaluate(
+        signal=maker_quote(),
+        snapshot=fresh_snapshot(),
+        proposed_size=Decimal("1"),
+        proposed_price=Decimal("0.44"),
+    )
+
+    assert decision.approved is False
+
+
+@pytest.mark.asyncio
+async def test_maker_quote_still_obeys_position_and_exposure_limits() -> None:
+    store = ready_state_store()
+    await store.set_position(
+        Position(
+            market_id="m1",
+            token_id="t1",
+            quantity=Decimal("49"),
+            average_entry_price=Decimal("0.45"),
+            mark_price=Decimal("0.45"),
+        )
+    )
+    engine = risk_engine(store)
+
+    decision = await engine.evaluate(
+        signal=maker_quote(size="100"),
+        snapshot=fresh_snapshot(),
+        proposed_size=Decimal("100"),
+        proposed_price=Decimal("0.44"),
+    )
+
+    assert decision.approved is False
+    assert "single_position_limit" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_maker_ask_still_requires_inventory_to_sell() -> None:
+    store = ready_state_store()
+    engine = risk_engine(store)
+
+    decision = await engine.evaluate(
+        signal=maker_quote(side=SignalSide.SELL, limit_price="0.47"),
+        snapshot=fresh_snapshot(),
+        proposed_size=Decimal("100"),
+        proposed_price=Decimal("0.47"),
+    )
+
+    assert decision.approved is False
+    assert "insufficient_position_to_sell" in decision.reason
+
+
+def exit_signal(*, size: str = "5") -> TradeSignal:
+    return TradeSignal(
+        strategy_name="position_exit",
+        signal_type=SignalType.POSITION_EXIT,
+        market_id="m1",
+        token_id="t1",
+        side=SignalSide.SELL,
+        reference_price=Decimal("0.50"),
+        target_price=Decimal("0.45"),
+        observed_move_bps=0,
+        reason="position_exit:stop_loss",
+        requested_size=Decimal(size),
+        reduce_only=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_exit_retry_is_not_blocked_as_a_duplicate() -> None:
+    """
+    Regression: the exit budget exhausted without a single retry being sent.
+
+    Retries fire every 2s while the duplicate window is 15s, so every retry
+    after the first was rejected as a duplicate, the budget ran out, and the
+    kill switch latched on a position the bot never actually tried to exit
+    more than once.
+    """
+
+    store = ready_state_store()
+    await store.set_position(
+        Position(
+            market_id="m1",
+            token_id="t1",
+            quantity=Decimal("5"),
+            average_entry_price=Decimal("0.50"),
+            mark_price=Decimal("0.45"),
+        )
+    )
+    engine = risk_engine(store)
+    first = exit_signal()
+    await store.add_signal(first)
+
+    decision = await engine.evaluate(
+        signal=exit_signal(),
+        snapshot=fresh_snapshot(),
+        proposed_size=Decimal("5"),
+        proposed_price=Decimal("0.45"),
+    )
+
+    guard = next(
+        check for check in decision.checks if check.check_name == "duplicate_guard"
+    )
+    assert guard.passed is True
+    assert guard.reason == "exit_retry_exempt"
+
+
+@pytest.mark.asyncio
+async def test_entry_duplicates_are_still_blocked() -> None:
+    store = ready_state_store()
+    engine = risk_engine(store)
+    await store.add_signal(make_signal())
+
+    decision = await engine.evaluate(
+        signal=make_signal(),
+        snapshot=fresh_snapshot(),
+        proposed_size=Decimal("1"),
+        proposed_price=Decimal("0.46"),
+    )
+
+    assert decision.approved is False
+    assert "duplicate_signal" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_exit_still_requires_inventory_to_sell() -> None:
+    store = ready_state_store()
+    engine = risk_engine(store)
+
+    decision = await engine.evaluate(
+        signal=exit_signal(size="5"),
+        snapshot=fresh_snapshot(),
+        proposed_size=Decimal("5"),
+        proposed_price=Decimal("0.45"),
+    )
+
+    assert decision.approved is False
+    assert "insufficient_position_to_sell" in decision.reason
+
+
+def wide_book(*, bid: str, ask: str) -> MarketSnapshot:
+    now = datetime.now(tz=UTC)
+    return MarketSnapshot(
+        market_id="m1",
+        token_id="t1",
+        best_bid=Decimal(bid),
+        best_ask=Decimal(ask),
+        mid_price=(Decimal(bid) + Decimal(ask)) / 2,
+        top_bid_size=Decimal("100"),
+        top_ask_size=Decimal("100"),
+        received_ts=now,
+        source_ts=now,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_book_too_wide_to_cross_is_refused() -> None:
+    """
+    Regression: 38 of 61 trades were sub-second round trips losing the spread.
+
+    The book quoted 0.09 / 0.91 with plenty of size on both sides, so the
+    liquidity check passed. Buying the ask and marking against the bid lost 82
+    cents a share at the instant of entry, before any market move.
+    """
+
+    store = ready_state_store()
+    engine = risk_engine(store)
+
+    decision = await engine.evaluate(
+        signal=make_signal(),
+        snapshot=wide_book(bid="0.09", ask="0.91"),
+        proposed_size=Decimal("5"),
+        proposed_price=Decimal("0.91"),
+    )
+
+    assert decision.approved is False
+    assert "entry_spread_too_wide" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_a_normal_book_still_passes() -> None:
+    store = ready_state_store()
+    engine = risk_engine(store)
+
+    decision = await engine.evaluate(
+        signal=make_signal(),
+        snapshot=wide_book(bid="0.45", ask="0.46"),
+        proposed_size=Decimal("1"),
+        proposed_price=Decimal("0.46"),
+    )
+
+    spread = next(
+        check for check in decision.checks if check.check_name == "entry_spread"
+    )
+    assert spread.passed is True
+
+
+@pytest.mark.asyncio
+async def test_exits_are_never_blocked_by_a_wide_book() -> None:
+    # Being stuck in a position is worse than crossing a wide book to leave it.
+    store = ready_state_store()
+    await store.set_position(
+        Position(
+            market_id="m1",
+            token_id="t1",
+            quantity=Decimal("5"),
+            average_entry_price=Decimal("0.50"),
+            mark_price=Decimal("0.09"),
+        )
+    )
+    engine = risk_engine(store)
+
+    decision = await engine.evaluate(
+        signal=exit_signal(),
+        snapshot=wide_book(bid="0.09", ask="0.91"),
+        proposed_size=Decimal("5"),
+        proposed_price=Decimal("0.09"),
+    )
+
+    spread = next(
+        check for check in decision.checks if check.check_name == "entry_spread"
+    )
+    assert spread.passed is True
+
+
+@pytest.mark.asyncio
+async def test_maker_quotes_are_exempt_from_the_spread_guard() -> None:
+    # A wide book is exactly where resting a quote is worth most.
+    store = ready_state_store()
+    engine = risk_engine(store)
+
+    decision = await engine.evaluate(
+        signal=maker_quote(limit_price="0.40"),
+        snapshot=wide_book(bid="0.09", ask="0.91"),
+        proposed_size=Decimal("1"),
+        proposed_price=Decimal("0.40"),
+    )
+
+    assert decision.approved is True
+
+
+@pytest.mark.asyncio
+async def test_spread_guard_can_be_disabled() -> None:
+    store = ready_state_store()
+    engine = PreTradeRiskEngine(
+        config=AppConfig(risk={"max_entry_spread_bps": 0}), state_store=store
+    )
+
+    decision = await engine.evaluate(
+        signal=make_signal(),
+        snapshot=wide_book(bid="0.09", ask="0.91"),
+        proposed_size=Decimal("1"),
+        proposed_price=Decimal("0.91"),
+    )
+
+    spread = next(
+        check for check in decision.checks if check.check_name == "entry_spread"
+    )
+    assert spread.passed is True

@@ -26,15 +26,37 @@ market_data:
 execution:
   dry_run_force: true
   allow_live_trading: false
-  default_order_size: 1
-  max_order_size: 25
+  # Sized for the active taker strategy (spike/mean-reversion), NOT for market
+  # making. An order is only as good as its exit: a 100-share position needs
+  # 100 shares of bid depth to unwind, and when that is not there the exit
+  # budget exhausts and the kill switch latches. Observed depth on these books
+  # is a median of ~100 with a 10th percentile of 13.
+  # If you enable market_maker, raise these to reward-qualifying size and
+  # raise max_live_order_notional with them.
+  default_order_size: 5
+  max_order_size: 10
   min_order_size: 1
   max_slippage_bps: 20
-  time_in_force: FOK
+  # GTC rests the remainder of a marketable limit order instead of killing it,
+  # which is what quoting requires. Exit orders still override this with IOC.
+  time_in_force: GTC
   client_order_id_prefix: pm-bot
   large_order_notional: 100
   min_live_buy_notional: 1
-  max_live_order_notional: 1.01
+  # Per-order live notional ceiling. This is the single most important number
+  # in this file: it is the most one order can ever risk.
+  #
+  # Held at 2 because preflight requires collateral >= this value and the
+  # funded account holds ~10 USDC, and because the live order path has not yet
+  # completed a clean submission. At 2 the account can carry roughly four
+  # concurrent resting quotes. Raise it once collateral is funded AND a live
+  # session shows a clean order-acceptance rate; quoting at reward-qualifying
+  # size needs this nearer 50.
+  max_live_order_notional: 2
+  # Fallback tick grid when the exchange lookup is unavailable. Live mode reads
+  # the real tick size per token from the CLOB.
+  default_tick_size: 0.01
+  post_only_maker_quotes: true
 
 exchange:
   clob_host: https://clob.polymarket.com
@@ -55,9 +77,16 @@ reliability:
   retry_initial_seconds: 1
   retry_max_seconds: 30
   retry_jitter_ratio: 0.20
-  disk_warning_percent: 80
-  disk_degraded_percent: 90
-  disk_halt_percent: 95
+  # Disk gates. These halt the bot to protect SQLite and snapshot writes from a
+  # full volume. Raised from 80/90/95 because a working machine sits near 97%
+  # routinely and the old values halted on startup. The bot's own steady state
+  # writes very little -- book updates are debug logs, not journal events, and
+  # the journal rotates at journal_rotation_mib below.
+  # Do not raise disk_halt_percent above 99: under ~1% free, SQLite can fail a
+  # write mid-transaction and the snapshot is what reconciliation trusts.
+  disk_warning_percent: 96
+  disk_degraded_percent: 98
+  disk_halt_percent: 99
   retention_interval_seconds: 3600
   signal_retention_count: 10000
   signal_retention_hours: 24
@@ -69,7 +98,7 @@ reliability:
   journal_total_limit_mib: 500
 
 notifications:
-  telegram_enabled: false
+  telegram_enabled: true
   telegram_send_retries: 2
   repeated_failure_alert_threshold: 3
   large_order_threshold: 100
@@ -89,10 +118,42 @@ backtest:
 
 position_management:
   enabled: true
-  take_profit_bps: 300
-  stop_loss_bps: 200
-  max_hold_seconds: 180
-  exit_before_market_end_seconds: 60
+
+  # take_profit_bps and stop_loss_bps are a MINIMUM AMBITION, not the threshold
+  # actually used. Both are raised to clear the floors below, because a bps
+  # threshold is the wrong unit on a 0..1 market: one 0.01 tick is 100 bps at
+  # price 1.00 but 2000 bps at price 0.05, and the 15m markets trade on a
+  # 0.001 grid while the daily ones use 0.01.
+  #
+  # Measured on a live book (bitcoin-up-or-down daily, bid 0.57 / ask 0.58) a
+  # single spread is 172 bps. Entry fills at the ask and is marked against the
+  # bid, so any stop tighter than that fires the instant you enter, before the
+  # market moves at all. The floors are what prevent that.
+  # Momentum profile. The measured edge (+187 bps net) is a MID-TO-MID result
+  # over a 60-second horizon with NO stops. That matters: 65% of spikes
+  # continue, but the mean continuation (~400 bps) is about the same size as
+  # the minimum stop the spread allows, so a stop set near it fires on noise
+  # before the move you were right about develops. In a 20-minute run the
+  # book said 65/35 while the bot's own trades came out 13/13 -- that gap is
+  # the stop cutting winners short.
+  #
+  # So the CLOCK is the primary exit here and the brackets are disaster
+  # guards, deliberately wide enough to rarely bind. If you tighten them,
+  # re-measure; do not assume tighter is safer.
+  take_profit_bps: 800
+  stop_loss_bps: 800
+
+  # Floors that stop a threshold sitting inside the spread, where it would
+  # fire the instant you enter. These bind at low prices regardless of the
+  # values above.
+  min_edge_ticks: 2
+  min_stop_ticks: 2
+  spread_floor_multiple: 2
+
+  # Primary exit: the horizon the edge was actually measured over.
+  max_hold_seconds: 60
+  # Leave before the resolution scramble.
+  exit_before_market_end_seconds: 30
   exit_retry_interval_seconds: 2
   max_exit_attempts: 3
   position_confirmation_grace_seconds: 30

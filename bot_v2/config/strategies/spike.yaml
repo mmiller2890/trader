@@ -1,10 +1,53 @@
 spike_strategy:
   enabled: true
+
+  # Trade WITH the spike, not against it.
+  #
+  # Measured on 95 episodes from ~35 minutes of recorded books, with
+  # uncrossable books excluded: 65% of spikes continue, and going with them is
+  # worth ~+187 bps net of the spread. Fading the same episodes loses.
+  #
+  # Set this to "reversion" to run the opposite and compare -- everything
+  # else stays identical, so it is a clean A/B. Re-measure any time with:
+  #   python3 -m scripts.record_books --minutes 120 --output data/research/books.jsonl
+  #   python3 -m scripts.analyze_reversion --input data/research/books.jsonl --sweep
+  direction: momentum
+
+  # Measure the move over wall-clock time, not a count of book updates.
+  # Book updates arrive at ~250/sec per token, so lookback_ticks: 8 spans about
+  # 30 milliseconds -- noise, not a sustained move. When lookback_seconds is
+  # set it wins, and lookback_ticks only bounds retained history.
+  lookback_seconds: 20
   lookback_ticks: 3
-  spike_threshold_bps: 80
-  cooldown_seconds: 30
+
+  # Threshold for calling a move a spike. Lowered from 80 because the move is
+  # now measured over a real window rather than a few milliseconds.
+  spike_threshold_bps: 45
+
+  # These markets are short-lived; re-entry needs to be quick.
+  cooldown_seconds: 15
+
+  # Do not signal into a book too thin to enter and exit.
   min_top_of_book_liquidity: 20
+
+  # Mean reversion: an upward overshoot is faded, a downward one is bought.
+  # This is already the direction the strategy trades -- upward -> sell side,
+  # downward -> buy side.
   emit_on_upward_spike: true
   emit_on_downward_spike: true
+
+  # Polymarket has no borrow, so a sell only executes against shares already
+  # held -- in the 2026-08-24 live session 57 sell signals were rejected for
+  # exactly this. With this on, the sell leg instead BUYs the paired NO token
+  # at 1 - p, which is the same trade and always executable.
+  sell_via_complement: true
+
+  # Only trade the part of the curve where being right pays. A fade entered at
+  # 0.97 risks 97 cents to make 3 -- no reversion frequency fixes that. The
+  # complement route is checked against this band too, so a YES token spiking
+  # to 0.03 does not become a 0.97 NO entry.
+  min_entry_price: 0.10
+  max_entry_price: 0.90
+
   target_market_ids: []
   target_token_ids: []

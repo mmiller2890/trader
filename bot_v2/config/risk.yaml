@@ -1,10 +1,18 @@
 risk:
-  max_single_position_size: 50
-  max_total_exposure: 150
-  max_open_orders: 5
+  # Backstop for market_maker.max_position_size; keep this at or above it.
+  max_single_position_size: 200
+  max_total_exposure: 200
+  # Quoting needs a resting order per side across both outcome tokens.
+  max_open_orders: 10
   max_daily_loss: 50
   max_data_staleness_seconds: 15
   min_top_of_book_liquidity: 20
+  # Refuse to cross a book wider than this. Depth is not tightness: a book can
+  # show 100 shares each side while quoting 0.09/0.91, and crossing it loses 82
+  # cents a share at the instant of entry. This single guard accounted for
+  # -30 of -30 P&L in a 20-minute dry run before it existed.
+  # 600 bps ~= 3 cents on a 0.50 market. Maker quotes and exits are exempt.
+  max_entry_spread_bps: 600
   max_slippage_bps: 25
   duplicate_signal_window_seconds: 15
   circuit_breaker_failures: 5
