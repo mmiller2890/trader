@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from collections.abc import Awaitable
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
@@ -132,6 +134,27 @@ async def test_reconciliation_loop_heartbeats_after_success() -> None:
     stop_event.set()
     await asyncio.gather(task, return_exceptions=True)
     assert beats
+
+
+@pytest.mark.asyncio
+async def test_successful_cycle_constructs_heartbeat_once() -> None:
+    calls = 0
+    services = make_services()
+    stop_event = asyncio.Event()
+
+    def heartbeat() -> Awaitable[None]:
+        nonlocal calls
+        calls += 1
+        return asyncio.sleep(0)
+
+    task = asyncio.create_task(
+        reconciliation_loop(services, stop_event, heartbeat, services.report)
+    )
+    await asyncio.sleep(0.02)
+    stop_event.set()
+    await task
+
+    assert calls == 1
 
 
 @pytest.mark.asyncio
@@ -304,3 +327,93 @@ async def test_notification_delivery_failure_does_not_kill_others() -> None:
     await run_one_cycle(notification_delivery_loop, services)
 
     assert len(attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_market_rotation_loop_spec_advances_its_heartbeat() -> None:
+    """
+    A supervised task that never heartbeats gets the whole runtime halted.
+
+    The rotation loop spends most of its life idle -- waiting for a market
+    window to end -- so silence is its normal state, not a fault signal.
+    """
+
+    from app.runtime import BotRuntime
+
+    beats: list[int] = []
+
+    class IdleRotator:
+        """Rotation with nothing to do yet -- returns rather than blocking."""
+
+        def status(self) -> SimpleNamespace:
+            return SimpleNamespace(current_market=None)
+
+        async def run(self, stop_event: asyncio.Event) -> None:
+            return None
+
+        def mark_failed(self, reason: str) -> None:
+            return None
+
+    rotator = IdleRotator()
+    services = SimpleNamespace(
+        config=SimpleNamespace(
+            bot=SimpleNamespace(
+                housekeeping_interval_seconds=0.01,
+                snapshot_interval_seconds=0.01,
+            ),
+            reliability=SimpleNamespace(
+                authoritative_state_halt_after_seconds=300.0,
+                retention_interval_seconds=3600.0,
+            ),
+        ),
+        market_rotator=rotator,
+    )
+    runtime = BotRuntime()
+    specs = runtime._default_loop_specs(services)
+
+    rotation = next(s for s in specs if s.name == "market-rotation-loop")
+    assert rotation.heartbeat_timeout_seconds > 0
+
+    stop = asyncio.Event()
+
+    async def heartbeat() -> None:
+        beats.append(1)
+        if len(beats) >= 2:
+            stop.set()
+
+    task = asyncio.create_task(rotation.factory(stop, heartbeat))
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=5)
+    finally:
+        stop.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+    assert len(beats) >= 2
+
+
+@pytest.mark.asyncio
+async def test_every_supervised_spec_declares_a_heartbeat_timeout() -> None:
+    from app.runtime import BotRuntime
+
+    services = SimpleNamespace(
+        config=SimpleNamespace(
+            bot=SimpleNamespace(
+                housekeeping_interval_seconds=1,
+                snapshot_interval_seconds=1,
+            ),
+            reliability=SimpleNamespace(
+                authoritative_state_halt_after_seconds=300.0,
+                retention_interval_seconds=3600.0,
+            ),
+        ),
+        market_rotator=SimpleNamespace(
+            status=lambda: SimpleNamespace(current_market=None)
+        ),
+    )
+    specs = BotRuntime()._default_loop_specs(services)
+
+    assert specs
+    for spec in specs:
+        assert spec.heartbeat_timeout_seconds >= 30, spec.name

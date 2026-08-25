@@ -16,7 +16,15 @@ from app.runtime import (
 )
 from app.shutdown import shutdown_app
 from config.schema import AppConfig, Mode
-from models.operations import OperationalState
+from models.operations import (
+    IncidentCategory,
+    IncidentSeverity,
+    LeaseStatus,
+    LiveOperatingLease,
+    OperationalIncident,
+    OperationalState,
+)
+from persistence.operations import OperationsRepository
 from models.risk import RiskAction, RiskCheckResult, RiskDecision
 from risk.circuit_breaker import CircuitBreaker
 from risk.runtime import RuntimeRiskEngine
@@ -60,13 +68,32 @@ class FakeSubmitter:
 class FakeMarketRotator:
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
+        self.heartbeat: object = None
 
-    async def run(self, stop_event: asyncio.Event) -> None:
+    async def run(
+        self,
+        stop_event: asyncio.Event,
+        *,
+        heartbeat: object = None,
+        heartbeat_interval_seconds: float = 15.0,
+    ) -> None:
+        # Rotation blocks for most of a market window, so the supervisor's
+        # heartbeat has to be threaded in rather than sent after run() returns.
+        self.heartbeat = heartbeat
         self.calls.append("rotation_run")
+        if heartbeat is not None:
+            self.calls.append("rotation_heartbeat_wired")
+            await heartbeat()
         await stop_event.wait()
 
     async def stop(self) -> None:
         self.calls.append("rotation_stop")
+
+    def mark_failed(self, reason: str) -> None:
+        self.calls.append(f"rotation_failed:{reason}")
+
+    def status(self) -> SimpleNamespace:
+        return SimpleNamespace(current_market=None)
 
 
 def fake_services(
@@ -163,6 +190,176 @@ async def test_runtime_starts_and_stops_dry_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runtime_forwards_process_services_to_bootstrap() -> None:
+    calls: list[str] = []
+    services = fake_services(Mode.DRY_RUN, calls)
+    process_services = object()
+
+    async def bootstrap(
+        config_dir: object = None,
+        *,
+        process_services: object,
+    ) -> SimpleNamespace:
+        calls.append("bootstrap")
+        assert process_services is expected_process_services
+        return services
+
+    async def shutdown(
+        current: object, tasks: list[asyncio.Task[object]]
+    ) -> None:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    expected_process_services = process_services
+    runtime = make_runtime(
+        services,
+        calls,
+        bootstrap=bootstrap,
+        shutdown=shutdown,
+        config_loader=lambda _: services.config,
+        process_services=process_services,
+    )
+
+    assert (await runtime.start()).phase == RuntimePhase.RUNNING
+    assert calls == ["bootstrap"]
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_default_health_loop_receives_stop_event_not_services() -> None:
+    services = SimpleNamespace(
+        config=AppConfig(),
+        health_store=object(),
+        market_rotator=None,
+    )
+    runtime = BotRuntime()
+    spec = next(
+        item
+        for item in runtime._default_loop_specs(services)
+        if item.name == "health-report-loop"
+    )
+    stop_event = asyncio.Event()
+    stop_event.set()
+
+    await spec.factory(stop_event, lambda: asyncio.sleep(0))
+
+
+def test_process_owned_notifications_are_not_duplicated_by_runtime() -> None:
+    services = SimpleNamespace(
+        config=AppConfig(),
+        health_store=object(),
+        market_rotator=None,
+    )
+    runtime = BotRuntime(process_services=object())
+
+    names = {spec.name for spec in runtime._default_loop_specs(services)}
+
+    assert "notification-delivery-loop" not in names
+
+
+@pytest.mark.asyncio
+async def test_runtime_wait_returns_failed_after_supervisor_budget_exhaustion() -> None:
+    calls: list[str] = []
+    services = fake_services(Mode.DRY_RUN, calls)
+    services.config = services.config.model_copy(
+        update={
+            "reliability": services.config.reliability.model_copy(
+                update={
+                    "task_restart_limit": 1,
+                    "retry_initial_seconds": 0.001,
+                    "retry_max_seconds": 0.001,
+                    "retry_jitter_ratio": 0,
+                }
+            )
+        }
+    )
+
+    async def bootstrap(config_dir: object = None) -> SimpleNamespace:
+        return services
+
+    async def crashing(_services: object, _stop_event: asyncio.Event) -> None:
+        raise RuntimeError("sensitive detail")
+
+    runtime = make_runtime(
+        services,
+        calls,
+        bootstrap=bootstrap,
+        config_loader=lambda _: services.config,
+        loop_factories={"critical-loop": crashing},
+    )
+
+    async def retry_incident(_incident: object) -> str:
+        return "retry"
+
+    runtime._supervised_incident_handler = retry_incident
+
+    assert (await runtime.start()).phase == RuntimePhase.RUNNING
+    status = await asyncio.wait_for(runtime.wait(), timeout=1)
+
+    assert status.phase == RuntimePhase.FAILED
+    assert status.reason == "task_crash:RuntimeError"
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_accounting_incident_persists_and_completes_durable_live_halt(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    services = fake_services(Mode.LIVE, calls)
+    repository = OperationsRepository(tmp_path / "bot.sqlite3")
+    await repository.create_lease(
+        LiveOperatingLease(
+            lease_id="lease-12345678",
+            issued_at=datetime(2026, 8, 24, tzinfo=UTC),
+            expires_at=datetime(2026, 8, 27, tzinfo=UTC),
+            config_fingerprint="a" * 64,
+            status=LeaseStatus.ACTIVE,
+        )
+    )
+
+    class Snapshots:
+        async def save_from_state(self, state_store: object) -> None:
+            calls.append("snapshot")
+
+    class Alerts:
+        async def enqueue_incident(self, incident: OperationalIncident) -> None:
+            calls.append(f"alert:{incident.incident_id}")
+
+    services.operations_repository = repository
+    services.alert_service = Alerts()
+    services.snapshots = Snapshots()
+    runtime = make_runtime(services, calls, config_loader=lambda _: services.config)
+    runtime._services = services
+    runtime._phase = RuntimePhase.RUNNING
+    incident = OperationalIncident(
+        incident_id="incident-accounting-0001",
+        fingerprint="runtime_risk:accounting:invariant",
+        component="runtime_risk",
+        category=IncidentCategory.ACCOUNTING,
+        severity=IncidentSeverity.URGENT,
+        reason="accounting_invariant",
+        first_seen_at=datetime(2026, 8, 24, tzinfo=UTC),
+        last_seen_at=datetime(2026, 8, 24, tzinfo=UTC),
+    )
+
+    action = await runtime.handle_incident(incident)
+
+    assert action == "halt"
+    assert runtime.status().phase == RuntimePhase.HALTED
+    assert await services.state_store.is_kill_switch_active() is True
+    assert await repository.get_active_lease() is None
+    stored = await repository.get_incident("incident-accounting-0001")
+    assert stored is not None and stored.reason == "accounting_invariant"
+    assert calls == [
+        "snapshot",
+        "alert:incident-accounting-0001",
+        "cancel_all",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_runtime_owns_named_market_rotation_task() -> None:
     calls: list[str] = []
     rotator = FakeMarketRotator(calls)
@@ -190,6 +387,9 @@ async def test_runtime_owns_named_market_rotation_task() -> None:
     assert (await runtime.start()).phase == RuntimePhase.RUNNING
     await asyncio.sleep(0.05)
     assert "rotation_run" in calls
+    # Regression: rotation ran but never beat, so the watchdog halted a healthy
+    # runtime after its timeout elapsed.
+    assert "rotation_heartbeat_wired" in calls
     await runtime.stop()
 
 
@@ -463,6 +663,48 @@ async def test_emergency_halt_remains_active_when_cancel_all_fails() -> None:
     assert status.phase == RuntimePhase.HALTED
     assert status.last_control_error == "cancel_all_failed"
     assert await services.state_store.is_kill_switch_active() is True
+
+
+@pytest.mark.asyncio
+async def test_emergency_halt_persists_incident_and_revokes_live_lease(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    services = fake_services(Mode.LIVE, calls)
+    repository = OperationsRepository(tmp_path / "bot.sqlite3")
+    await repository.create_lease(
+        LiveOperatingLease(
+            lease_id="lease-emergency-0001",
+            issued_at=datetime(2026, 8, 24, tzinfo=UTC),
+            expires_at=datetime(2026, 8, 27, tzinfo=UTC),
+            config_fingerprint="b" * 64,
+            status=LeaseStatus.ACTIVE,
+        )
+    )
+
+    class Snapshots:
+        async def save_from_state(self, state_store: object) -> None:
+            calls.append("snapshot")
+
+    class Alerts:
+        async def enqueue_incident(self, incident: OperationalIncident) -> None:
+            calls.append("alert")
+
+    services.operations_repository = repository
+    services.snapshots = Snapshots()
+    services.alert_service = Alerts()
+    runtime = make_runtime(services, calls, config_loader=lambda _: services.config)
+    runtime._services = services
+    runtime._phase = RuntimePhase.RUNNING
+
+    status = await runtime.emergency_halt("HALT")
+
+    assert status.phase == RuntimePhase.HALTED
+    assert await repository.get_active_lease() is None
+    incidents = await repository.recent_incidents(limit=10)
+    assert len(incidents) == 1
+    assert incidents[0].reason == "operator_emergency_halt"
+    assert calls == ["snapshot", "alert", "cancel_all"]
 
 
 @pytest.mark.asyncio

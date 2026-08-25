@@ -12,6 +12,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from app.bootstrap import AppServices, LivePreflightError, bootstrap_app
+from app.process_services import ProcessReliabilityServices
 from app.shutdown import shutdown_app
 from app.supervisor import RuntimeSupervisor, TaskSpec
 from config.loader import load_config
@@ -24,7 +25,7 @@ from models.operations import (
     OperationalState,
 )
 from models.risk import RiskCheckResult
-from reliability.policy import FaultPolicy, RecoveryAction
+from reliability.policy import FaultPolicy, RecoveryAction, RecoveryContext
 
 
 logger = logging.getLogger(__name__)
@@ -71,7 +72,9 @@ class FatalRuntimeError(RuntimeError):
 
 
 async def market_rotation_loop(
-    services: AppServices, stop_event: asyncio.Event
+    services: AppServices,
+    stop_event: asyncio.Event,
+    heartbeat: Callable[[], Awaitable[None]] | None = None,
 ) -> OperationalIncident | None:
     """Supervise rotation; return an incident instead of halting directly."""
 
@@ -79,7 +82,10 @@ async def market_rotation_loop(
     if rotator is None:
         return None
     try:
-        await rotator.run(stop_event)
+        if heartbeat is not None:
+            await rotator.run(stop_event, heartbeat=heartbeat)
+        else:
+            await rotator.run(stop_event)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -100,11 +106,15 @@ async def market_rotation_loop(
     return None
 
 
-Bootstrap = Callable[[str | Path | None], Awaitable[Any]]
+Bootstrap = Callable[..., Awaitable[Any]]
 Shutdown = Callable[[Any, list[asyncio.Task[object]]], Awaitable[None]]
 ConfigLoader = Callable[[str | Path | None], AppConfig]
 EventEmitter = Callable[[Any, BotEvent], Awaitable[None]]
 LoopFactory = Callable[[AppServices, asyncio.Event], Awaitable[None]]
+SupervisedLoopFactory = Callable[
+    [AppServices, asyncio.Event, Callable[[], Awaitable[None]]],
+    Awaitable[None],
+]
 
 
 class BotRuntime:
@@ -118,12 +128,14 @@ class BotRuntime:
         config_loader: ConfigLoader = load_config,
         event_emitter: EventEmitter = emit_event,
         loop_factories: dict[str, LoopFactory] | None = None,
+        process_services: ProcessReliabilityServices | None = None,
     ) -> None:
         self._bootstrap = bootstrap
         self._shutdown = shutdown
         self._config_loader = config_loader
         self._event_emitter = event_emitter
         self._loop_factories = loop_factories
+        self._process_services = process_services
         self._lock = asyncio.Lock()
         self._phase = RuntimePhase.STOPPED
         self._services: Any | None = None
@@ -137,6 +149,9 @@ class BotRuntime:
         self._degraded_since: datetime | None = None
         self._last_control_error: str | None = None
         self._supervisor: RuntimeSupervisor | None = None
+        self._supervisor_monitor: asyncio.Task[None] | None = None
+        self._incident_first_seen: dict[str, datetime] = {}
+        self._incident_counts: dict[str, int] = {}
 
     @property
     def services(self) -> Any | None:
@@ -156,19 +171,39 @@ class BotRuntime:
             last_control_error=self._last_control_error,
         )
 
-    async def handle_incident(self, incident: OperationalIncident) -> str:
+    async def handle_incident(
+        self,
+        incident: OperationalIncident,
+        *,
+        force_action: str | None = None,
+        terminal_phase: RuntimePhase = RuntimePhase.HALTED,
+    ) -> str:
         """Centralized halt/degrade ordering for every typed incident."""
 
         services = self._services
+        stored_incident = incident
+        repository = getattr(services, "operations_repository", None)
+        if repository is not None:
+            stored_incident = await repository.record_incident(incident)
+        self._incident_first_seen.setdefault(
+            stored_incident.fingerprint, stored_incident.first_seen_at
+        )
+        self._incident_counts[stored_incident.fingerprint] = max(
+            stored_incident.consecutive_count,
+            self._incident_counts.get(stored_incident.fingerprint, 0) + 1,
+        )
+        alert_service = getattr(services, "alert_service", None)
         policy = FaultPolicy(
             getattr(services.config, "reliability", ReliabilityConfig())
             if services is not None
             else ReliabilityConfig()
         )
-        context = await self._build_recovery_context(incident)
-        action = policy.decide(incident, context)
+        context = await self._build_recovery_context(stored_incident)
+        action = force_action or policy.decide(stored_incident, context)
 
         if action == RecoveryAction.RETRY:
+            if alert_service is not None:
+                await alert_service.enqueue_incident(stored_incident)
             return action
 
         if action == RecoveryAction.DEGRADE:
@@ -176,25 +211,39 @@ class BotRuntime:
                 self._degraded_since = utc_now()
             if services is not None:
                 await services.state_store.set_operational_state(
-                    RuntimePhase.DEGRADED, reason=incident.reason
+                    RuntimePhase.DEGRADED, reason=stored_incident.reason
                 )
-            self._operational_reason = incident.reason
-            await self._emit_degraded_event(services, incident, recovered=False)
+            self._operational_reason = stored_incident.reason
+            await self._emit_degraded_event(
+                services, stored_incident, recovered=False
+            )
+            if alert_service is not None:
+                await alert_service.enqueue_incident(stored_incident)
             return action
 
         # HALT — centralized safety ordering.
         self._phase = RuntimePhase.HALTING
         if services is not None:
-            activated = await services.state_store.activate_kill_switch(
-                incident.reason
-            )
-            try:
-                await services.snapshots.save_from_state(services.state_store)
-            except Exception:
-                logger.critical(
-                    "failed to persist kill switch snapshot",
-                    extra={"component": "runtime", "reason": incident.reason},
+            if repository is not None:
+                await repository.revoke_active_lease(
+                    reason=stored_incident.reason,
+                    revoked_at=utc_now(),
                 )
+            activated = await services.state_store.activate_kill_switch(
+                stored_incident.reason
+            )
+            snapshots = getattr(services, "snapshots", None)
+            if snapshots is not None:
+                try:
+                    await snapshots.save_from_state(services.state_store)
+                except Exception:
+                    logger.critical(
+                        "failed to persist kill switch snapshot",
+                        extra={
+                            "component": "runtime",
+                            "reason": stored_incident.reason,
+                        },
+                    )
             if activated:
                 await self._event_emitter(
                     services,
@@ -203,16 +252,20 @@ class BotRuntime:
                         component="runtime",
                         mode=services.config.bot.mode.value,
                         message="safety halt latched kill switch",
-                        reason=incident.reason,
+                        reason=stored_incident.reason,
                     ),
                 )
+            if alert_service is not None:
+                await alert_service.enqueue_incident(stored_incident)
             if services.config.bot.mode == Mode.LIVE:
                 try:
                     await asyncio.wait_for(
                         services.submitter.cancel_all_open_orders(),
                         timeout=services.config.bot.shutdown_timeout_seconds,
                     )
+                    self._last_control_error = None
                 except Exception as exc:
+                    self._last_control_error = "cancel_all_failed"
                     logger.critical(
                         "cancel-all failed during safety halt",
                         extra={
@@ -220,9 +273,27 @@ class BotRuntime:
                             "reason": f"cancel_all_failed:{type(exc).__name__}",
                         },
                     )
-        self._phase = RuntimePhase.HALTED
-        self._reason = incident.reason
+            self._forget_resting_quotes(services)
+        self._phase = terminal_phase
+        self._reason = stored_incident.reason
         self._terminal_event.set()
+        return action
+
+    @staticmethod
+    def _forget_resting_quotes(services: object) -> None:
+        """
+        Drop locally tracked quotes after a halt cancelled them.
+
+        Cancel-all removed the orders at the exchange, so anything the quoting
+        strategy still believes is resting is stale. Reconciliation remains the
+        authority on what actually survived.
+        """
+
+        market_maker = getattr(services, "market_maker", None)
+        if market_maker is None:
+            return
+        for quote in market_maker.resting_quotes():
+            market_maker.forget_quote(quote.client_order_id)
 
     async def _build_recovery_context(self, incident: OperationalIncident) -> RecoveryContext:
         services = self._services
@@ -230,7 +301,31 @@ class BotRuntime:
         if services is not None:
             positions = await services.state_store.get_positions()
             flat = all(position.quantity <= 0 for position in positions)
-        return RecoveryContext(flat=flat)
+        count = self._incident_counts.get(
+            incident.fingerprint, incident.consecutive_count
+        )
+        first_seen = self._incident_first_seen.get(
+            incident.fingerprint, incident.first_seen_at
+        )
+        unavailable_seconds = max(
+            0.0, (utc_now() - first_seen).total_seconds()
+        )
+        disk_percent = 0.0
+        data_dir = getattr(services, "data_dir", None)
+        if data_dir is not None:
+            import shutil
+
+            total, _used, free = shutil.disk_usage(data_dir)
+            if total > 0:
+                disk_percent = (total - free) / total * 100.0
+        return RecoveryContext(
+            flat=flat,
+            authoritative_unavailable_seconds=unavailable_seconds,
+            repeated_authoritative_confirmations=count,
+            task_crashes_in_window=count,
+            disk_percent=disk_percent,
+            required_for_safe_exit=not flat,
+        )
 
     async def _emit_degraded_event(
         self, services: Any | None, incident: OperationalIncident, *, recovered: bool
@@ -260,8 +355,7 @@ class BotRuntime:
 
     def _make_reporter(self) -> Callable[[OperationalIncident], Awaitable[str]]:
         async def report(incident: OperationalIncident) -> str:
-            await self.handle_incident(incident)
-            return RecoveryAction.RETRY
+            return await self.handle_incident(incident)
 
         return report
 
@@ -289,29 +383,33 @@ class BotRuntime:
                 )
             ),
         )
-        factories: dict[str, LoopFactory] = {
-            "reconciliation-loop": lambda svc, stop: reconciliation_loop(
-                svc, stop, lambda: asyncio.sleep(0), reporter
+        factories: dict[str, SupervisedLoopFactory] = {
+            "reconciliation-loop": lambda svc, stop, heartbeat: reconciliation_loop(
+                svc, stop, heartbeat, reporter
             ),
-            "runtime-risk-loop": lambda svc, stop: runtime_risk_loop(
-                svc, stop, lambda: asyncio.sleep(0), reporter
+            "runtime-risk-loop": lambda svc, stop, heartbeat: runtime_risk_loop(
+                svc, stop, heartbeat, reporter
             ),
-            "position-exit-loop": lambda svc, stop: position_exit_loop(
-                svc, stop, lambda: asyncio.sleep(0), reporter
+            "position-exit-loop": lambda svc, stop, heartbeat: position_exit_loop(
+                svc, stop, heartbeat, reporter
             ),
-            "strategy-timer-loop": lambda svc, stop: strategy_timer_loop(
-                svc, stop, lambda: asyncio.sleep(0), reporter
+            "strategy-timer-loop": lambda svc, stop, heartbeat: strategy_timer_loop(
+                svc, stop, heartbeat, reporter
             ),
-            "snapshot-retention-loop": lambda svc, stop: snapshot_loop(
-                svc, stop, lambda: asyncio.sleep(0), reporter
+            "snapshot-retention-loop": lambda svc, stop, heartbeat: snapshot_loop(
+                svc, stop, heartbeat, reporter
             ),
-            "notification-delivery-loop": lambda svc, stop: notification_delivery_loop(
-                svc, stop, lambda: asyncio.sleep(0), reporter
+            "notification-delivery-loop": lambda svc, stop, heartbeat: notification_delivery_loop(
+                svc, stop, heartbeat, reporter
             ),
         }
+        if self._process_services is not None:
+            factories.pop("notification-delivery-loop")
 
         async def health_report_with_runtime(
-            stop_event: asyncio.Event, heartbeat: Any
+            _services: AppServices,
+            stop_event: asyncio.Event,
+            heartbeat: Callable[[], Awaitable[None]],
         ) -> None:
             await health_report_loop(
                 services,
@@ -323,27 +421,50 @@ class BotRuntime:
 
         factories["health-report-loop"] = health_report_with_runtime
         if self._loop_factories is not None:
-            factories = dict(self._loop_factories)
-        specs: list[TaskSpec] = []
-        for name, factory in factories.items():
-            specs.append(
+            specs = [
                 TaskSpec(
                     name=name,
-                    factory=lambda stop, hb, _f=factory, _s=services: _f(_s, stop),
+                    factory=lambda stop, heartbeat, _f=factory, _s=services: _f(
+                        _s, stop
+                    ),
                     heartbeat_timeout_seconds=heartbeat_timeout,
                 )
-            )
+                for name, factory in self._loop_factories.items()
+                if not (
+                    self._process_services is not None
+                    and name == "notification-delivery-loop"
+                )
+            ]
+        else:
+            specs = []
+            for name, factory in factories.items():
+                specs.append(
+                    TaskSpec(
+                        name=name,
+                        factory=lambda stop, heartbeat, _f=factory, _s=services: _f(
+                            _s, stop, heartbeat
+                        ),
+                        heartbeat_timeout_seconds=heartbeat_timeout,
+                    )
+                )
         rotator = getattr(services, "market_rotator", None)
         if rotator is not None:
             async def rotation_with_incident_handling(
                 stop_event: asyncio.Event, heartbeat: Any
             ) -> None:
                 while not stop_event.is_set():
-                    incident = await market_rotation_loop(services, stop_event)
+                    # The heartbeat is threaded *into* rotation rather than
+                    # sent after it returns: run() blocks for most of a market
+                    # window, so a beat afterwards can be many minutes apart
+                    # and the watchdog halts a healthy runtime first.
+                    incident = await market_rotation_loop(
+                        services, stop_event, heartbeat
+                    )
                     if incident is not None:
                         await self.handle_incident(incident)
                         if self._phase in (RuntimePhase.HALTED, RuntimePhase.FAILED):
                             return
+                    await heartbeat()
                     await asyncio.sleep(0.5)
 
             specs.append(
@@ -351,6 +472,7 @@ class BotRuntime:
                     name="market-rotation-loop",
                     factory=rotation_with_incident_handling,
                     restartable=False,
+                    heartbeat_timeout_seconds=heartbeat_timeout,
                 )
             )
         return specs
@@ -358,10 +480,26 @@ class BotRuntime:
     async def _supervised_incident_handler(
         self, incident: OperationalIncident
     ) -> str:
-        await self.handle_incident(incident)
-        return RecoveryAction.RETRY
+        return await self.handle_incident(incident)
 
-        return report
+    async def _monitor_supervisor(self, supervisor: RuntimeSupervisor) -> None:
+        """Turn an exhausted supervision budget into a terminal runtime state."""
+
+        try:
+            incident = await supervisor.wait_fatal()
+        except asyncio.CancelledError:
+            raise
+        async with self._lock:
+            if self._supervisor is not supervisor or self._phase in {
+                RuntimePhase.STOPPED,
+                RuntimePhase.STOPPING,
+            }:
+                return
+            await self.handle_incident(
+                incident,
+                force_action=RecoveryAction.HALT,
+                terminal_phase=RuntimePhase.FAILED,
+            )
 
     async def start(
         self,
@@ -395,7 +533,13 @@ class BotRuntime:
                     backoff=_supervisor_backoff(config),
                 )
 
-                services = await self._bootstrap(config_dir)
+                if self._process_services is None:
+                    services = await self._bootstrap(config_dir)
+                else:
+                    services = await self._bootstrap(
+                        config_dir,
+                        process_services=self._process_services,
+                    )
                 report = await services.reconciliation.reconcile_startup()
                 if services.config.bot.mode == Mode.LIVE and not report.ok:
                     raise RuntimeError("live_startup_reconciliation_failed")
@@ -417,11 +561,14 @@ class BotRuntime:
                     await services.ws_manager.start()
 
                 specs = self._default_loop_specs(services)
-                await supervisor.start(specs)
-
                 self._services = services
                 self._supervisor = supervisor
                 self._tasks = []
+                await supervisor.start(specs)
+                self._supervisor_monitor = asyncio.create_task(
+                    self._monitor_supervisor(supervisor),
+                    name="runtime-supervisor-monitor",
+                )
                 self._phase = RuntimePhase.RUNNING
             except Exception as exc:
                 if isinstance(exc, LivePreflightError):
@@ -437,6 +584,12 @@ class BotRuntime:
                         )
                 if supervisor is not None:
                     await supervisor.stop()
+                if self._supervisor_monitor is not None:
+                    self._supervisor_monitor.cancel()
+                    await asyncio.gather(
+                        self._supervisor_monitor, return_exceptions=True
+                    )
+                    self._supervisor_monitor = None
                 self._services = None
                 self._tasks = []
                 self._phase = RuntimePhase.FAILED
@@ -454,11 +607,16 @@ class BotRuntime:
             services = self._services
             tasks = list(self._tasks)
             supervisor = self._supervisor
+            supervisor_monitor = self._supervisor_monitor
             self._phase = RuntimePhase.STOPPING
             self._stop_event.set()
             self._terminal_event.set()
             shutdown_failed = False
             if services is not None:
+                if supervisor_monitor is not None:
+                    supervisor_monitor.cancel()
+                    await asyncio.gather(supervisor_monitor, return_exceptions=True)
+                    self._supervisor_monitor = None
                 if supervisor is not None:
                     try:
                         await supervisor.stop()
@@ -501,13 +659,23 @@ class BotRuntime:
                 True,
                 reason="operator_emergency_halt",
             )
-            self._phase = RuntimePhase.HALTED
-            if self._services.config.bot.mode == Mode.LIVE:
-                try:
-                    await self._services.submitter.cancel_all_open_orders()
-                    self._last_control_error = None
-                except Exception:
-                    self._last_control_error = "cancel_all_failed"
+            from uuid import uuid4
+
+            now = utc_now()
+            incident = OperationalIncident(
+                incident_id=f"inc-{uuid4().hex}",
+                fingerprint="operator:emergency_halt",
+                component="operator",
+                category=IncidentCategory.EXIT_SAFETY,
+                severity=IncidentSeverity.URGENT,
+                reason="operator_emergency_halt",
+                first_seen_at=now,
+                last_seen_at=now,
+            )
+            await self.handle_incident(
+                incident,
+                force_action=RecoveryAction.HALT,
+            )
             return self.status()
 
     async def cancel_all(self, confirmation: str) -> ControlResult:

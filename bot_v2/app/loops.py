@@ -62,9 +62,7 @@ async def _cycle(
         await work()
     except asyncio.CancelledError:
         raise
-    heartbeat_done = heartbeat()
     await heartbeat()
-    del heartbeat_done
     try:
         await asyncio.wait_for(stop_event.wait(), timeout=max(0.01, interval_seconds))
     except TimeoutError:
@@ -214,16 +212,30 @@ async def strategy_timer_loop(
     config = getattr(services, "config", None)
     interval = getattr(getattr(config, "bot", None), "housekeeping_interval_seconds", 15)
     strategy = getattr(services, "strategy", None)
+    market_maker = getattr(services, "market_maker", None)
     router = getattr(services, "router", None)
+    state_store = getattr(services, "state_store", None)
 
     while not stop_event.is_set():
 
         async def work() -> None:
-            if strategy is None or router is None:
+            if router is None:
                 return
-            signals = await strategy.on_timer()
-            for signal in signals:
-                await router.route_signal(signal)
+            if strategy is not None:
+                for signal in await strategy.on_timer():
+                    await router.route_signal(signal)
+            if market_maker is None:
+                return
+            # A latched kill switch means stop quoting entirely; otherwise
+            # retire quotes that have outlived their TTL so they re-price.
+            halted = state_store is not None and await state_store.is_kill_switch_active()
+            plan = (
+                await market_maker.plan_withdrawal("kill_switch_active")
+                if halted
+                else await market_maker.plan_maintenance()
+            )
+            if not plan.empty:
+                await router.route_quote_plan(plan, strategy=market_maker)
 
         await _cycle(
             interval_seconds=interval,

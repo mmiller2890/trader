@@ -81,6 +81,8 @@ class Btc15mMarketRotator:
         self._waiter = waiter
         self._can_rotate = can_rotate
         self._closed = False
+        self._heartbeat: Callable[[], Awaitable[None]] | None = None
+        self._heartbeat_interval = 15.0
         self._status = MarketRotationStatus(
             state=(
                 MarketRotationState.HEALTHY
@@ -100,6 +102,33 @@ class Btc15mMarketRotator:
         """Return an immutable snapshot of public rotation state."""
 
         return self._status.model_copy(deep=True)
+
+    async def _beat(self) -> None:
+        """Signal liveness to the supervisor, if one is watching."""
+
+        if self._heartbeat is None:
+            return
+        await self._heartbeat()
+
+    async def _wait(self, stop_event: asyncio.Event, delay: float) -> bool:
+        """
+        Wait up to ``delay`` seconds, beating along the way.
+
+        Returns True when a stop was requested, matching ``Waiter``. The wait
+        is split so an idle rotation still proves it is alive; a real hang
+        inside ``_waiter`` still starves the heartbeat, which is the point.
+        """
+
+        remaining = max(0.0, delay)
+        if self._heartbeat is None:
+            return await self._waiter(stop_event, remaining)
+        while remaining > 0:
+            slice_seconds = min(remaining, self._heartbeat_interval)
+            if await self._waiter(stop_event, slice_seconds):
+                return True
+            remaining -= slice_seconds
+            await self._beat()
+        return False
 
     def mark_failed(self, reason: str) -> None:
         """Expose a supervised terminal failure without discarding market context."""
@@ -137,16 +166,33 @@ class Btc15mMarketRotator:
         )
         return market
 
-    async def run(self, stop_event: asyncio.Event) -> None:
-        """Rotate subscriptions until shutdown is requested."""
+    async def run(
+        self,
+        stop_event: asyncio.Event,
+        *,
+        heartbeat: Callable[[], Awaitable[None]] | None = None,
+        heartbeat_interval_seconds: float = 15.0,
+    ) -> None:
+        """
+        Rotate subscriptions until shutdown is requested.
 
+        Rotation is idle by design for most of a market window -- it waits for
+        the current market to approach its end. That silence looks identical to
+        a hung task from outside, so long waits are chunked and ``heartbeat``
+        is invoked between chunks. Without it the supervisor's watchdog halts a
+        perfectly healthy runtime as soon as a wait exceeds its timeout.
+        """
+
+        self._heartbeat = heartbeat
+        self._heartbeat_interval = max(0.1, heartbeat_interval_seconds)
         current = await self.initialize()
+        await self._beat()
         retry_delay = 1.0
         while not stop_event.is_set():
             now = self._now()
             lead_at = current.end_at - self._lead_delta()
             if now < lead_at:
-                if await self._waiter(stop_event, (lead_at - now).total_seconds()):
+                if await self._wait(stop_event, (lead_at - now).total_seconds()):
                     return
                 continue
 
@@ -154,7 +200,7 @@ class Btc15mMarketRotator:
                 candidate = await self._discovery.discover_active(now=now)
                 if candidate.asset_ids == current.asset_ids:
                     retry_delay = 1.0
-                    if await self._waiter(stop_event, 1.0):
+                    if await self._wait(stop_event, 1.0):
                         return
                     continue
                 if self._can_rotate is not None and not await self._can_rotate(current):
@@ -166,7 +212,7 @@ class Btc15mMarketRotator:
                         last_success_at=self._status.last_success_at,
                         reason="position_exit_pending",
                     )
-                    if await self._waiter(stop_event, 1.0):
+                    if await self._wait(stop_event, 1.0):
                         return
                     continue
                 await self._websocket.replace_asset_ids(candidate.asset_ids)
@@ -182,7 +228,7 @@ class Btc15mMarketRotator:
                     now=now,
                     retry_delay=retry_delay,
                 )
-                if await self._waiter(stop_event, delay):
+                if await self._wait(stop_event, delay):
                     return
                 retry_delay = min(10.0, retry_delay * 2)
                 continue

@@ -347,3 +347,93 @@ async def test_rotation_gate_raises_when_market_ends_with_position() -> None:
     await rotator.initialize()
     with pytest.raises(RuntimeError, match="position_open_at_market_end"):
         await rotator.run(stop_event)
+
+
+class _StopRotation(Exception):
+    """Used to break out of the rotation loop once enough beats are seen."""
+
+
+@pytest.mark.asyncio
+async def test_long_idle_wait_still_beats_the_supervisor_heartbeat() -> None:
+    """
+    Regression: a full market window starved the watchdog and halted the bot.
+
+    Rotation is idle for nearly the whole window by design. A single long wait
+    looks identical to a hung task from outside, so the wait is chunked and
+    beats between chunks.
+    """
+
+    beats: list[int] = []
+    waits: list[float] = []
+
+    async def recording_waiter(stop_event: asyncio.Event, delay: float) -> bool:
+        waits.append(delay)
+        return False
+
+    async def heartbeat() -> None:
+        beats.append(1)
+        if len(beats) >= 5:
+            raise _StopRotation
+
+    rotator = Btc15mMarketRotator(
+        config=AutomaticMarketConfig(enabled=True, refresh_lead_seconds=10),
+        discovery=FakeDiscovery([market(0, "111", "222")]),
+        websocket=FakeWebSocket(),
+        initial_market=market(0, "111", "222"),
+        clock=lambda: CURRENT_START,
+        waiter=recording_waiter,
+    )
+
+    with pytest.raises(_StopRotation):
+        await rotator.run(
+            asyncio.Event(), heartbeat=heartbeat, heartbeat_interval_seconds=15.0
+        )
+
+    assert len(beats) >= 5
+    # No single wait may exceed the beat interval.
+    assert waits and max(waits) <= 15.0
+
+
+@pytest.mark.asyncio
+async def test_a_stop_during_a_chunked_wait_still_returns() -> None:
+    async def stopping_waiter(stop_event: asyncio.Event, delay: float) -> bool:
+        return True
+
+    beats: list[int] = []
+
+    async def heartbeat() -> None:
+        beats.append(1)
+
+    rotator = Btc15mMarketRotator(
+        config=AutomaticMarketConfig(enabled=True, refresh_lead_seconds=10),
+        discovery=FakeDiscovery([market(0, "111", "222")]),
+        websocket=FakeWebSocket(),
+        initial_market=market(0, "111", "222"),
+        clock=lambda: CURRENT_START,
+        waiter=stopping_waiter,
+    )
+
+    await rotator.run(asyncio.Event(), heartbeat=heartbeat)
+
+
+@pytest.mark.asyncio
+async def test_wait_without_a_heartbeat_keeps_the_original_single_shot() -> None:
+    waits: list[float] = []
+
+    async def recording_waiter(stop_event: asyncio.Event, delay: float) -> bool:
+        waits.append(delay)
+        return True
+
+    rotator = Btc15mMarketRotator(
+        config=AutomaticMarketConfig(enabled=True, refresh_lead_seconds=10),
+        discovery=FakeDiscovery([market(0, "111", "222")]),
+        websocket=FakeWebSocket(),
+        initial_market=market(0, "111", "222"),
+        clock=lambda: CURRENT_START,
+        waiter=recording_waiter,
+    )
+
+    await rotator.run(asyncio.Event())
+
+    assert len(waits) == 1
+    assert waits[0] > 15.0
