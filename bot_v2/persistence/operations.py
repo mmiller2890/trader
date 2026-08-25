@@ -156,9 +156,6 @@ class OperationsRepository:
             await asyncio.to_thread(_create)
             self._initialized = True
 
-    def _run(self, work: Any) -> Any:
-        return work
-
     async def create_lease(self, lease: LiveOperatingLease) -> None:
         await self._ensure_schema()
 
@@ -274,47 +271,83 @@ class OperationsRepository:
             revocation_reason=row["revocation_reason"],
         )
 
-    async def record_incident(self, incident: OperationalIncident) -> None:
+    async def record_incident(
+        self, incident: OperationalIncident
+    ) -> OperationalIncident:
         await self._ensure_schema()
 
-        def _work() -> None:
+        def _work() -> dict[str, Any]:
             connection = self._connect()
             try:
-                connection.execute(
-                    "INSERT INTO operational_incidents (incident_id, fingerprint,"
-                    " component, category, severity, reason, first_seen_at,"
-                    " last_seen_at, consecutive_count, market_id, token_id,"
-                    " client_order_id, resolved_at, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                    " ON CONFLICT(incident_id) DO UPDATE SET"
-                    " last_seen_at = excluded.last_seen_at,"
-                    " consecutive_count = excluded.consecutive_count,"
-                    " resolved_at = excluded.resolved_at,"
-                    " updated_at = excluded.updated_at",
-                    (
-                        incident.incident_id,
-                        incident.fingerprint,
-                        incident.component,
-                        incident.category.value,
-                        incident.severity.value,
-                        incident.reason,
-                        _to_iso(incident.first_seen_at),
-                        _to_iso(incident.last_seen_at),
-                        incident.consecutive_count,
-                        incident.market_id,
-                        incident.token_id,
-                        incident.client_order_id,
-                        _to_iso(incident.resolved_at)
-                        if incident.resolved_at
-                        else None,
-                        _to_iso(_utc_now()),
-                    ),
-                )
+                connection.execute("BEGIN IMMEDIATE")
+                existing = connection.execute(
+                    "SELECT * FROM operational_incidents"
+                    " WHERE fingerprint = ? AND resolved_at IS NULL"
+                    " ORDER BY last_seen_at DESC LIMIT 1",
+                    (incident.fingerprint,),
+                ).fetchone()
+                if existing is None:
+                    incident_id = incident.incident_id
+                    connection.execute(
+                        "INSERT INTO operational_incidents (incident_id, fingerprint,"
+                        " component, category, severity, reason, first_seen_at,"
+                        " last_seen_at, consecutive_count, market_id, token_id,"
+                        " client_order_id, resolved_at, updated_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            incident_id,
+                            incident.fingerprint,
+                            incident.component,
+                            incident.category.value,
+                            incident.severity.value,
+                            incident.reason,
+                            _to_iso(incident.first_seen_at),
+                            _to_iso(incident.last_seen_at),
+                            incident.consecutive_count,
+                            incident.market_id,
+                            incident.token_id,
+                            incident.client_order_id,
+                            _to_iso(incident.resolved_at)
+                            if incident.resolved_at
+                            else None,
+                            _to_iso(_utc_now()),
+                        ),
+                    )
+                else:
+                    incident_id = existing["incident_id"]
+                    connection.execute(
+                        "UPDATE operational_incidents SET"
+                        " last_seen_at = ?, consecutive_count = ?, severity = ?,"
+                        " reason = ?, market_id = COALESCE(?, market_id),"
+                        " token_id = COALESCE(?, token_id),"
+                        " client_order_id = COALESCE(?, client_order_id),"
+                        " updated_at = ? WHERE incident_id = ?",
+                        (
+                            _to_iso(incident.last_seen_at),
+                            int(existing["consecutive_count"])
+                            + incident.consecutive_count,
+                            incident.severity.value,
+                            incident.reason,
+                            incident.market_id,
+                            incident.token_id,
+                            incident.client_order_id,
+                            _to_iso(_utc_now()),
+                            incident_id,
+                        ),
+                    )
+                row = connection.execute(
+                    "SELECT * FROM operational_incidents WHERE incident_id = ?",
+                    (incident_id,),
+                ).fetchone()
                 connection.commit()
+                return dict(row) if row is not None else {}
             finally:
                 connection.close()
 
-        await asyncio.to_thread(_work)
+        row = await asyncio.to_thread(_work)
+        if not row:
+            raise RuntimeError("incident_persistence_failed")
+        return self._incident_from_row(row)
 
     @staticmethod
     def _incident_from_row(row: dict[str, Any]) -> OperationalIncident:

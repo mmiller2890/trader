@@ -13,6 +13,10 @@ from decimal import Decimal
 from pathlib import Path
 
 from app.modes import is_live_mode
+from app.process_services import (
+    ProcessReliabilityServices,
+    build_process_reliability_services,
+)
 from clients.auth import build_clob_credentials
 from clients.clob_client import ClobClientAdapter
 from clients.data_api import DataApiClient
@@ -32,7 +36,6 @@ from notifications.events import EventBus
 from notifications.outbox import (
     AlertService,
     NotificationWorker,
-    TelegramTransport,
 )
 from persistence.db import KeyValueSqliteStore
 from persistence.health import HealthSnapshotStore
@@ -49,6 +52,7 @@ from risk.runtime import RuntimeRiskEngine
 from scripts.live_preflight import run_preflight
 from state.reconciliation import ReconciliationService
 from state.store import InMemoryStateStore
+from strategies.market_maker import MarketMakerStrategy
 from strategies.spike import SpikeStrategy
 
 
@@ -109,11 +113,13 @@ class AppServices:
     """Container of bootstrapped runtime services."""
 
     config: AppConfig
+    data_dir: Path
     state_store: InMemoryStateStore
     clob_client: ClobClientAdapter
     ws_manager: WebSocketManager
     market_data_client: MarketDataClient
     strategy: SpikeStrategy
+    market_maker: MarketMakerStrategy | None
     pretrade_risk: PreTradeRiskEngine
     runtime_risk: RuntimeRiskEngine
     circuit_breaker: CircuitBreaker
@@ -165,6 +171,42 @@ def _position_market_end(
     return None
 
 
+def _complement_token(
+    initial_market: object | None,
+    market_rotator: object | None,
+    *,
+    market_id: str,
+    token_id: str,
+) -> str | None:
+    """
+    Return the other outcome token of the same market, when it is known.
+
+    A binary market's two tokens price at p and 1 - p, so buying one is the
+    same trade as selling the other. This lookup is what lets a sell-side
+    signal execute without holding inventory.
+    """
+
+    current = None
+    if market_rotator is not None:
+        status = market_rotator.status()
+        current = getattr(status, "current_market", None)
+    for market in (current, initial_market):
+        if market is None:
+            continue
+        asset_ids = list(getattr(market, "asset_ids", []) or [])
+        if token_id not in asset_ids:
+            continue
+        if market_id not in {
+            getattr(market, "condition_id", None),
+            getattr(market, "market_id", None),
+        }:
+            continue
+        others = [candidate for candidate in asset_ids if candidate != token_id]
+        if len(others) == 1:
+            return others[0]
+    return None
+
+
 async def _rotation_safe(
     state_store: InMemoryStateStore,
     market: object,
@@ -208,6 +250,7 @@ async def bootstrap_app(
     config_dir: str | Path | None = None,
     *,
     discovery_client_factory: DiscoveryClientFactory = GammaMarketDiscoveryClient,
+    process_services: ProcessReliabilityServices | None = None,
 ) -> AppServices:
     """Load config, configure logging, and wire all runtime services."""
 
@@ -215,7 +258,14 @@ async def bootstrap_app(
     configure_logging(config)
 
     data_dir = Path(os.getenv("BOT_DATA_DIR", "data"))
-    journal = JsonlJournal(data_dir / "journal" / "events.jsonl")
+    journal = JsonlJournal(
+        data_dir / "journal" / "events.jsonl",
+        rotate_bytes=int(config.reliability.journal_rotation_mib * 1024 * 1024),
+        retention_days=config.reliability.journal_retention_days,
+        total_limit_bytes=int(
+            config.reliability.journal_total_limit_mib * 1024 * 1024
+        ),
+    )
     snapshots = SnapshotStore(data_dir / "snapshots" / "state.json")
     db = KeyValueSqliteStore(data_dir / "bot.sqlite3")
 
@@ -267,6 +317,14 @@ async def bootstrap_app(
         token_id: str,
     ) -> datetime | None:
         return _position_market_end(
+            initial_market,
+            market_rotator,
+            market_id=market_id,
+            token_id=token_id,
+        )
+
+    def complement_token_lookup(market_id: str, token_id: str) -> str | None:
+        return _complement_token(
             initial_market,
             market_rotator,
             market_id=market_id,
@@ -330,14 +388,13 @@ async def bootstrap_app(
         raise
 
     event_bus = EventBus()
-    operations_repository = OperationsRepository(data_dir / "bot.sqlite3")
-    alert_service = AlertService(operations_repository, config)
-    telegram_transport = TelegramTransport(config)
-    notification_worker = NotificationWorker(
-        operations_repository,
-        telegram_transport,
-        config,
+    process_services = process_services or build_process_reliability_services(
+        config=config,
+        data_dir=data_dir,
     )
+    operations_repository = process_services.repository
+    alert_service = process_services.alerts
+    notification_worker = process_services.notification_worker
     retention_manager = RetentionManager(
         repository=operations_repository,
         config=config.reliability,
@@ -414,14 +471,38 @@ async def bootstrap_app(
         strategy_config = strategy_config.model_copy(
             update={"target_token_ids": []}
         )
-    strategy = SpikeStrategy(strategy_config)
+    strategy = SpikeStrategy(
+        strategy_config,
+        complement_provider=complement_token_lookup,
+    )
+    market_maker: MarketMakerStrategy | None = None
+    if config.market_maker.enabled:
+        market_maker_config = config.market_maker
+        if config.market_data.automatic_market.enabled:
+            market_maker_config = market_maker_config.model_copy(
+                update={"target_token_ids": []}
+            )
+        market_maker = MarketMakerStrategy(
+            market_maker_config,
+            position_reader=state_store.get_position,
+            tick_size_provider=(
+                clob_client.get_tick_size
+                if is_live_mode(config.bot.mode)
+                else None
+            ),
+        )
     pretrade_risk = PreTradeRiskEngine(config=config, state_store=state_store)
     runtime_risk = RuntimeRiskEngine(
         config=config,
         state_store=state_store,
         circuit_breaker=circuit_breaker,
     )
-    order_builder = OrderBuilder(config)
+    order_builder = OrderBuilder(
+        config,
+        tick_size_provider=(
+            clob_client.get_tick_size if is_live_mode(config.bot.mode) else None
+        ),
+    )
     submitter = OrderSubmitter(
         config=config,
         clob_client=clob_client,
@@ -456,6 +537,10 @@ async def bootstrap_app(
         config.position_management,
         min_order_size=config.execution.min_order_size,
         max_data_age_seconds=config.risk.max_data_staleness_seconds,
+        tick_size_provider=(
+            clob_client.get_tick_size if is_live_mode(config.bot.mode) else None
+        ),
+        default_tick_size=config.execution.default_tick_size,
     )
     exit_manager = PositionExitManager(
         config=config,
@@ -475,6 +560,17 @@ async def bootstrap_app(
             await router.route_signal(
                 exit_signal, snapshot=snapshot, market_end_at=market_end_at
             )
+        if market_maker is not None:
+            quote_plan = await market_maker.plan_quotes(
+                snapshot, market_end_at=market_end_at
+            )
+            if not quote_plan.empty:
+                await router.route_quote_plan(
+                    quote_plan,
+                    strategy=market_maker,
+                    snapshot=snapshot,
+                    market_end_at=market_end_at,
+                )
         for signal in await strategy.on_market_update(snapshot):
             if signal.side.value == "sell":
                 converted = await exit_manager.from_strategy_signal(
@@ -525,11 +621,13 @@ async def bootstrap_app(
 
         return AppServices(
             config=config,
+            data_dir=data_dir,
             state_store=state_store,
             clob_client=clob_client,
             ws_manager=ws_manager,
             market_data_client=market_data_client,
             strategy=strategy,
+            market_maker=market_maker,
             pretrade_risk=pretrade_risk,
             runtime_risk=runtime_risk,
             circuit_breaker=circuit_breaker,

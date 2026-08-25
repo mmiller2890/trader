@@ -152,6 +152,27 @@ async def test_incidents_round_trip_and_resolve(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_repeated_unresolved_fingerprint_keeps_identity_and_increments(
+    tmp_path: Path,
+) -> None:
+    repository = OperationsRepository(tmp_path / "bot.sqlite3")
+    first = incident(incident_id="incident-00000001")
+    repeated = incident(incident_id="incident-00000002").model_copy(
+        update={"last_seen_at": NOW + timedelta(minutes=1)}
+    )
+
+    stored_first = await repository.record_incident(first)
+    stored_repeated = await repository.record_incident(repeated)
+
+    assert stored_first.incident_id == "incident-00000001"
+    assert stored_repeated.incident_id == "incident-00000001"
+    assert stored_repeated.first_seen_at == NOW
+    assert stored_repeated.last_seen_at == NOW + timedelta(minutes=1)
+    assert stored_repeated.consecutive_count == 2
+    assert len(await repository.recent_incidents(limit=10)) == 1
+
+
+@pytest.mark.asyncio
 async def test_last_delivered_at_returns_latest_for_fingerprint(
     tmp_path: Path,
 ) -> None:

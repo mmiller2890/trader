@@ -166,7 +166,7 @@ class AcceleratedHarness:
         sell_id = f"client-sell-{index:06d}"
 
         try:
-            self.state.apply_confirmed_fill(
+            await self.state.apply_confirmed_fill(
                 self._fill(buy_id, f"0x{index:012d}", market_id, index, OrderSide.BUY, "0.45"),
                 market_end_at=None,
                 confirmed_at=at,
@@ -174,7 +174,7 @@ class AcceleratedHarness:
             )
             self._orders_submitted += 1
             self._seen_order_ids.add(sell_id)
-            self.state.apply_confirmed_fill(
+            await self.state.apply_confirmed_fill(
                 self._fill(sell_id, f"0x{index:012d}s", market_id, index, OrderSide.SELL, "0.50"),
                 market_end_at=None,
                 confirmed_at=at,

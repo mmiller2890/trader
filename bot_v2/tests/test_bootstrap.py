@@ -9,9 +9,12 @@ import pytest
 
 from app.bootstrap import LivePreflightError, bootstrap_app
 from clients.gamma_markets import DiscoveredMarket, MarketOutcome
-from config.schema import AutomaticMarketConfig
+from config.schema import AppConfig, AutomaticMarketConfig
 from models.market import MarketSnapshot
 from models.signal import SignalSide, TradeSignal
+from notifications.outbox import AlertService
+from persistence.operations import OperationsRepository
+from reliability.lease import LiveLeaseService
 from scripts.live_preflight import LivePreflightReport, PreflightCheck
 
 
@@ -75,6 +78,37 @@ def set_live_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CLOB_API_KEY", "key")
     monkeypatch.setenv("CLOB_SECRET", "secret")
     monkeypatch.setenv("CLOB_PASSPHRASE", "passphrase")
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_reuses_process_owned_reliability_services(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_dir = tmp_path / "config"
+    write_config(config_dir, automatic=False)
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("BOT_DATA_DIR", str(data_dir))
+    config = AppConfig()
+    repository = OperationsRepository(data_dir / "bot.sqlite3")
+    alerts = AlertService(repository, config)
+    worker = object()
+    process_services = SimpleNamespace(
+        repository=repository,
+        leases=LiveLeaseService(repository),
+        alerts=alerts,
+        telegram=object(),
+        notification_worker=worker,
+    )
+
+    services = await bootstrap_app(
+        config_dir,
+        process_services=process_services,
+    )
+
+    assert services.operations_repository is repository
+    assert services.alert_service is alerts
+    assert services.notification_worker is worker
 
 
 class FakeDiscovery:
@@ -414,3 +448,60 @@ async def test_confirmed_live_fill_reconciles_immediately(
     )
 
     assert reconciliation_calls == [1]
+
+
+def paired_market() -> DiscoveredMarket:
+    return discovered_market()
+
+
+def test_complement_lookup_returns_the_other_outcome_token() -> None:
+    from app.bootstrap import _complement_token
+
+    market = paired_market()
+    up, down = market.asset_ids
+
+    assert _complement_token(
+        market, None, market_id=market.condition_id, token_id=up
+    ) == down
+    assert _complement_token(
+        market, None, market_id=market.condition_id, token_id=down
+    ) == up
+
+
+def test_complement_lookup_rejects_a_token_from_another_market() -> None:
+    from app.bootstrap import _complement_token
+
+    market = paired_market()
+
+    assert _complement_token(
+        market, None, market_id=market.condition_id, token_id="999999"
+    ) is None
+
+
+def test_complement_lookup_rejects_a_mismatched_market_id() -> None:
+    from app.bootstrap import _complement_token
+
+    market = paired_market()
+
+    assert _complement_token(
+        market, None, market_id="some-other-condition", token_id=market.asset_ids[0]
+    ) is None
+
+
+def test_complement_lookup_prefers_the_rotator_current_market() -> None:
+    from app.bootstrap import _complement_token
+
+    market = paired_market()
+    rotator = SimpleNamespace(
+        status=lambda: SimpleNamespace(current_market=market)
+    )
+
+    assert _complement_token(
+        None, rotator, market_id=market.condition_id, token_id=market.asset_ids[0]
+    ) == market.asset_ids[1]
+
+
+def test_complement_lookup_is_none_without_any_market() -> None:
+    from app.bootstrap import _complement_token
+
+    assert _complement_token(None, None, market_id="m", token_id="t") is None

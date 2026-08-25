@@ -48,6 +48,25 @@ def apply_fill(
 
 
 @pytest.mark.asyncio
+async def test_market_cycle_applies_confirmed_fills_to_accounting_state(
+    tmp_path: Path,
+) -> None:
+    harness = AcceleratedHarness(
+        config=AppConfig(),
+        repository=OperationsRepository(tmp_path / "bot.sqlite3"),
+        markets=1,
+        inject_faults=False,
+        now=lambda: NOW,
+    )
+
+    assert await harness.run_market_cycle(1) is True
+
+    closed = await harness.state.get_closed_position_lifecycles()
+    assert len(closed) == 1
+    assert closed[0].closed_realized_pnl == Decimal("0.10")
+
+
+@pytest.mark.asyncio
 async def test_accelerated_run_survives_injected_faults_and_stays_bounded(
     tmp_path: Path,
 ) -> None:
