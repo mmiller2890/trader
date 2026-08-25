@@ -56,7 +56,8 @@ In scope:
 1. A fee model, used by risk and by accounting.
 2. An edge gate with an explicit abstain state.
 3. Maker-first execution: post-only entries, maker exits with a taker fallback.
-4. A spike (Path B) measuring whether an exchange-spot proxy tracks the
+4. An offline fill-rate measurement, since dry run cannot produce one.
+5. A spike (Path B) measuring whether an exchange-spot proxy tracks the
    settlement oracle closely enough to compute fair value.
 
 Out of scope: the market-maker strategy (`strategies/market_maker.py`) keeps
@@ -120,6 +121,39 @@ the taker-fee component but not from the gate itself.
 round trip needs 700 bps of edge before spread. A much quieter bot is the
 correct outcome of this change, not a regression.
 
+### Shadow mode, and why it is required
+
+The gate as specified deadlocks against its own measurement. Worked through at
+p=0.50 with a ~200 bps spread:
+
+```
+maker entry   -100   (half spread earned)
+taker exit    +350   (fee, modelled pessimistically)
+              +100   (half spread paid on that exit)
+margin         +50
+              ----
+required       400 bps   against a measured edge of ~121 bps
+```
+
+That is not selective, it is total abstention. And abstaining means no resting
+quotes, which means no fills, which means the exit-cost model that caused the
+abstention can never be calibrated. Step 2 forecloses step 3.
+
+The gate therefore supports `shadow` mode: evaluate normally, journal the full
+decision with its numbers, and route the order anyway.
+
+**Shadow mode is hard-guarded to dry run.** A flag that logs `REJECT` and
+trades regardless is, in live mode, a fee-gate bypass with real money. The
+guard belongs in the config validator, not in operator discipline:
+
+```
+if mode is LIVE and edge_gate_mode is SHADOW:
+    raise ConfigError("edge gate shadow mode is dry-run only")
+```
+
+This mirrors the existing live-arming bundle validation, which already refuses
+incoherent mode combinations at load time.
+
 ## Component 3: Maker-first execution
 
 Entries become post-only. `SpikeStrategyConfig` gains
@@ -162,6 +196,46 @@ return.
 
 This is the assumption most likely to be wrong, and the fill-rate measurement
 below is what tests it.
+
+### Fill rate cannot be measured in dry run
+
+Dry run returns post-only orders as `SUBMITTED` with `filled_size=0`
+permanently -- `execution/submitter.py` calls this `simulated_resting_quote`,
+and `test_dry_run_post_only_quote_rests_instead_of_filling` pins it. That was
+deliberate: inventing fills at the quoted price is the most flattering fiction
+available to a maker strategy. The consequence is that **dry-run fill rate is
+structurally zero**, so no amount of shadow-mode routing produces the number
+this design depends on.
+
+Fill rate has exactly two honest sources:
+
+**Offline replay against recorded books (do this first).** For a hypothetical
+quote at price X placed at time T, scan forward in the recorded book: if the
+best bid later trades at or below X, a resting bid at X would have filled.
+This ignores queue position, so it is an *upper bound* on fill rate -- which is
+the useful direction, because a strategy that fails on its upper bound is dead
+without risking anything. Runs against the 665k observations already recorded
+by `scripts/record_books.py`; needs neither the gate nor shadow mode nor live
+credentials.
+
+**Live at minimum size.** The only ground truth, and it collides with the
+0-of-110 live submission record. It confirms the offline estimate rather than
+replacing it.
+
+New `scripts/measure_fill_rate.py` implements the offline version.
+
+### Pre-registered interpretation
+
+Written before the measurement runs, so no result can be rationalised
+afterwards. "High" is >=20% of quotes filling within their TTL; "low" is below
+that. The threshold is arbitrary but fixed in advance, which is the point.
+
+| fill rate | P&L | meaning |
+|---|---|---|
+| high | positive | thesis holds; proceed to live confirmation |
+| high | negative | adverse selection confirmed -- resting bids are catching falling knives. Maker entry is dead |
+| low | positive | viable but capital-starved; widen quotes or add markets |
+| low | negative | dead; stop |
 
 ## Component 4: TWAP fair value (spike first, Path B)
 
@@ -237,7 +311,9 @@ Every component is unit-testable without network access.
   be reintroduced by config.
 - **Edge gate:** a signal whose edge is below cost abstains; the abstain record
   carries the numbers; maker quotes skip the taker-fee term but not the gate; a
-  genuinely profitable signal still approves.
+  genuinely profitable signal still approves; shadow mode routes a rejected
+  signal while still journalling the rejection; **shadow mode plus live mode is
+  refused at config load**.
 - **Maker execution:** an entry is post-only and priced inside the spread; an
   unfilled quote is cancelled at TTL; a filled position exits as a maker first;
   the deadline escalates to IOC; expiry escalates regardless of deadline; a
@@ -253,21 +329,38 @@ and that no taker entry is routed while `entry_style: maker`.
 
 ## Rollout
 
-1. Fee model, with `taker_fee_bps` removed. Re-run existing recorded data to
-   restate past results net of real fees.
-2. Edge gate, defaulting to abstain-heavy. Observe the rejection rate in dry
-   run before touching execution.
-3. Maker-first execution in dry run. Measure **fill rate** -- the number the
-   whole design rests on. Post-only quotes that never fill make this moot.
-4. Path B spike. Build component 4 only on a pass.
+1. **Fee model**, with `taker_fee_bps` removed. Restate past recorded results
+   net of real fees.
+2. **Offline fill-rate measurement** against recorded books. Needs no gate and
+   no execution changes, and answers the load-bearing question first. Interpret
+   strictly against the pre-registered table above.
+3. **Edge gate**, shadow-guarded to dry run. Success criterion stated in
+   advance: **if more than 95% of signals abstain across a full session, that
+   is an answer about these markets, not a tuning problem** -- they carry no
+   signal that clears cost, and the correct response is to stop rather than to
+   loosen the gate.
+4. **Maker-first execution**, calibrated by the step 2 numbers.
+5. **Live fill-rate confirmation** at minimum size, which is also the first
+   real test of whether the tick-size and post-only fixes cleared the
+   0-of-110 rejection rate.
+6. **Path B spike**, then component 4 only on a pass.
+
+Steps 1-3 are worth doing regardless of how 2 turns out: the bot currently
+cannot evaluate its own performance at any fee assumption, and that is true
+whether or not maker entry survives.
 
 Live arming is unchanged and remains a manual operator action behind preflight,
 the Telegram gate, and an explicit confirmation phrase.
 
 ## Risks and open questions
 
-- **Fill rate is unmeasured.** If resting quotes rarely fill, maker execution
-  trades a known loss for no trades at all. Step 3 measures it before step 4.
+- **Fill rate is unmeasured**, and cannot be measured in dry run at all (see
+  above). The offline replay gives an upper bound; only live fills give truth.
+  If resting quotes rarely fill, maker execution trades a known loss for no
+  trades at all.
+- **The offline fill estimate ignores queue position** and so is optimistic by
+  an unknown margin. It is useful for rejecting the design, not for confirming
+  it: failing the upper bound is conclusive, passing it is not.
 - **The maker rebate is undocumented.** It is modelled as zero. If it is
   material, the economics improve; the design does not depend on it.
 - **Adverse selection**, as described above.
