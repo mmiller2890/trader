@@ -184,6 +184,9 @@ async def test_backtest_uses_snapshot_time_for_strategy_cooldown_and_duplicate_r
             "lookback_ticks": 2,
             "spike_threshold_bps": 100,
             "cooldown_seconds": 1,
+            # This test exercises cooldown/duplicate-risk timing, not entry
+            # style, so it is pinned to the pre-existing taker behaviour.
+            "entry_style": "taker",
         },
     )
     engine = BacktestEngine(config=config)
@@ -227,6 +230,12 @@ def test_backtest_cli_writes_results_for_json_snapshots(tmp_path: Path) -> None:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     (config_dir / "bot.yaml").write_text("bot:\n  mode: dry_run\n", encoding="utf-8")
+    # This test exercises CLI wiring and fill counting, not maker/taker entry
+    # style, so it is pinned to the pre-existing taker behaviour explicitly.
+    (config_dir / "strategies").mkdir()
+    (config_dir / "strategies" / "spike.yaml").write_text(
+        "spike_strategy:\n  entry_style: taker\n", encoding="utf-8"
+    )
     snapshot_path = tmp_path / "snapshots.json"
     started_at = datetime(2025, 1, 1, tzinfo=UTC)
     snapshots = [

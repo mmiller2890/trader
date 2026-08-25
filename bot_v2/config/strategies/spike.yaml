@@ -51,3 +51,10 @@ spike_strategy:
 
   target_market_ids: []
   target_token_ids: []
+
+  # Maker entries rest inside the spread and pay zero fee. Taker entries pay
+  # ~350 bps at even odds, which exceeds the measured edge several times over.
+  entry_style: maker
+  maker_offset_ticks: 1
+  quote_ttl_seconds: 30
+  maker_quote_size: 5

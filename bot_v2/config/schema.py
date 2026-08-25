@@ -253,6 +253,15 @@ class SpikeStrategyConfig(BaseModel):
     target_market_ids: list[str] = Field(default_factory=list)
     target_token_ids: list[str] = Field(default_factory=list)
 
+    # Maker entries rest inside the spread and pay no fee; taker entries cross
+    # and pay ~350 bps at even odds. See the fee-aware execution design.
+    entry_style: Literal["taker", "maker"] = "maker"
+    maker_offset_ticks: int = Field(default=1, ge=0, le=20)
+    quote_ttl_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
+    # MAKER_QUOTE signals must carry their own size; the order builder clamps
+    # it to execution min/max and the live notional cap.
+    maker_quote_size: Decimal = Field(default=Decimal("5"), gt=Decimal("0"))
+
     @model_validator(mode="after")
     def validate_entry_band(self) -> Self:
         if self.min_entry_price >= self.max_entry_price:

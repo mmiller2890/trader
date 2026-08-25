@@ -490,6 +490,7 @@ class ClobClientAdapter:
                 strategy_name=order.strategy_name,
                 requested_size=order.size,
                 latency_ms=latency_ms,
+                liquidity="maker" if order.post_only else "taker",
             )
         exchange_status = str(raw.get("status") or "").lower()
         if exchange_status not in {"live", "delayed", "matched", "unmatched"}:
@@ -549,6 +550,10 @@ class ClobClientAdapter:
             filled_size=filled_size,
             avg_fill_price=avg_fill_price,
             latency_ms=latency_ms,
+            # A post-only order that crossed would be rejected outright
+            # rather than filled, so a fill here is trustworthy as a maker
+            # fill whenever the order was submitted post-only.
+            liquidity="maker" if order.post_only else "taker",
         )
 
     def cancel_order(self, order_id: str) -> bool:

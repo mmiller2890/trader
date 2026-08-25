@@ -475,6 +475,9 @@ async def bootstrap_app(
     strategy = SpikeStrategy(
         strategy_config,
         complement_provider=complement_token_lookup,
+        tick_size_provider=(
+            clob_client.get_tick_size if is_live_mode(config.bot.mode) else None
+        ),
     )
     market_maker: MarketMakerStrategy | None = None
     if config.market_maker.enabled:

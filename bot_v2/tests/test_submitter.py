@@ -160,6 +160,47 @@ async def test_successful_live_submit_reaches_adapter_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_live_submission_liquidity_is_derived_from_post_only() -> None:
+    """
+    Fee accounting reads OrderResult.liquidity to pick maker vs taker fees.
+    A post-only order that crossed would be rejected by the exchange rather
+    than filled, so submitted post_only is a sound signal that any resulting
+    fill was a maker fill -- and the submitter must set it even though the
+    adapter's own OrderResult does not know about the originating order.
+    """
+
+    adapter = RecordingAdapter()
+    submitter = make_submitter(adapter)
+
+    maker_order = OrderRequest(
+        client_order_id="maker-order-001",
+        market_id="m1",
+        token_id="t1",
+        side=OrderSide.BUY,
+        price=Decimal("0.49"),
+        size=Decimal("1"),
+        time_in_force=OrderTimeInForce.GTC,
+        post_only=True,
+    )
+    taker_order = OrderRequest(
+        client_order_id="taker-order-001",
+        market_id="m1",
+        token_id="t1",
+        side=OrderSide.BUY,
+        price=Decimal("0.51"),
+        size=Decimal("1"),
+        time_in_force=OrderTimeInForce.GTC,
+        post_only=False,
+    )
+
+    maker_result = await submitter.submit(maker_order)
+    taker_result = await submitter.submit(taker_order)
+
+    assert maker_result.liquidity == "maker"
+    assert taker_result.liquidity == "taker"
+
+
+@pytest.mark.asyncio
 async def test_live_sdk_submission_runs_outside_event_loop_thread() -> None:
     main_thread_id = threading.get_ident()
 
@@ -214,6 +255,7 @@ async def test_dry_run_post_only_quote_rests_instead_of_filling() -> None:
     assert result.filled_size == Decimal("0")
     assert result.avg_fill_price is None
     assert result.exchange_order_id == "sim-quote-000000001"
+    assert result.liquidity == "maker"
 
 
 @pytest.mark.asyncio
@@ -236,6 +278,7 @@ async def test_dry_run_taker_order_still_simulates_a_fill() -> None:
 
     assert result.status == OrderStatus.SIMULATED
     assert result.filled_size == Decimal("10")
+    assert result.liquidity == "taker"
 
 
 @pytest.mark.asyncio

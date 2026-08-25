@@ -9,13 +9,18 @@ from decimal import Decimal
 from config.schema import SpikeStrategyConfig
 from models.market import MarketSnapshot
 from models.order import OrderResult
-from models.signal import SignalSide, TradeSignal
+from models.signal import SignalSide, SignalType, TradeSignal
+from models.tick import DEFAULT_TICK_SIZE
 from state.cache import MarketHistoryCache
 from strategies.base import StrategyBase
 
 
 #: Maps (market_id, token_id) to the market's other outcome token, if known.
 ComplementProvider = Callable[[str, str], "str | None"]
+
+#: Resolves a token's exchange tick size, so maker offsets rest a real number
+#: of ticks behind the touch rather than an arbitrary fraction of a cent.
+TickSizeProvider = Callable[[str], Decimal]
 
 #: Observed peak book-update rate per token on Polymarket crypto markets.
 #: Used only to size retained history; age-based eviction does the real work.
@@ -56,10 +61,12 @@ class SpikeStrategy(StrategyBase):
         *,
         now: Callable[[], datetime] = utc_now,
         complement_provider: ComplementProvider | None = None,
+        tick_size_provider: TickSizeProvider | None = None,
     ) -> None:
         self._config = config
         self._now = now
         self._complement_provider = complement_provider
+        self._tick_size_provider = tick_size_provider
         self._history = MarketHistoryCache(
             max_points_per_market=_history_capacity(config),
             max_age_seconds=(
@@ -82,6 +89,14 @@ class SpikeStrategy(StrategyBase):
             return self._complement_provider(market_id, token_id)
         except Exception:
             return None
+
+    def _tick_size(self, token_id: str) -> Decimal:
+        if self._tick_size_provider is None:
+            return DEFAULT_TICK_SIZE
+        try:
+            return self._tick_size_provider(token_id)
+        except Exception:
+            return DEFAULT_TICK_SIZE
 
     @property
     def name(self) -> str:
@@ -135,9 +150,38 @@ class SpikeStrategy(StrategyBase):
                 complement_price = Decimal("1") - snapshot.best_bid
                 if not self._entry_price_allowed(complement_price):
                     return []
-                self._last_signal_at[key] = self._now()
                 # Selling YES needs YES on hand. Buying the paired NO at
                 # 1 - p expresses the identical view and always executes.
+                if self._config.entry_style == "maker":
+                    tick = self._tick_size(complement)
+                    offset = Decimal(self._config.maker_offset_ticks) * tick
+                    # The complement's implied bid is 1 - this book's ask, so
+                    # a maker BUY on the complement rests one offset behind
+                    # that mirrored bid.
+                    limit = (Decimal("1") - snapshot.best_ask) - offset
+                    if limit <= 0 or limit >= 1:
+                        return []
+                    self._last_signal_at[key] = self._now()
+                    self._last_signal_at[(snapshot.market_id, complement)] = self._now()
+                    return [
+                        TradeSignal(
+                            strategy_name=self.name,
+                            signal_type=SignalType.MAKER_QUOTE,
+                            market_id=snapshot.market_id,
+                            token_id=complement,
+                            side=SignalSide.BUY,
+                            reference_price=Decimal("1") - reference,
+                            target_price=Decimal("1") - snapshot.mid_price,
+                            observed_move_bps=abs(move_bps),
+                            created_at=self._now(),
+                            reason=f"{reason}_via_complement",
+                            requested_size=self._config.maker_quote_size,
+                            limit_price=limit,
+                            post_only=True,
+                        )
+                    ]
+
+                self._last_signal_at[key] = self._now()
                 self._last_signal_at[(snapshot.market_id, complement)] = self._now()
                 return [
                     TradeSignal(
@@ -158,6 +202,36 @@ class SpikeStrategy(StrategyBase):
             snapshot.best_ask
         ):
             return []
+
+        if self._config.entry_style == "maker":
+            tick = self._tick_size(snapshot.token_id)
+            offset = Decimal(self._config.maker_offset_ticks) * tick
+            limit = (
+                snapshot.best_bid - offset
+                if side == SignalSide.BUY
+                else snapshot.best_ask + offset
+            )
+            if limit <= 0 or limit >= 1:
+                return []
+            self._last_signal_at[key] = self._now()
+            return [
+                TradeSignal(
+                    strategy_name=self.name,
+                    signal_type=SignalType.MAKER_QUOTE,
+                    market_id=snapshot.market_id,
+                    token_id=snapshot.token_id,
+                    side=side,
+                    reference_price=reference,
+                    target_price=limit,
+                    observed_move_bps=abs(move_bps),
+                    created_at=self._now(),
+                    reason=reason,
+                    requested_size=self._config.maker_quote_size,
+                    limit_price=limit,
+                    post_only=True,
+                )
+            ]
+
         self._last_signal_at[key] = self._now()
         signal = TradeSignal(
             strategy_name=self.name,

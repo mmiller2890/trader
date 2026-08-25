@@ -48,7 +48,9 @@ def complete_credentials() -> ClobCredentials:
     )
 
 
-def buy_request(*, size: str = "1", price: str = "0.50") -> OrderRequest:
+def buy_request(
+    *, size: str = "1", price: str = "0.50", post_only: bool = False
+) -> OrderRequest:
     return OrderRequest(
         client_order_id="test-order-0001",
         market_id="m1",
@@ -57,6 +59,7 @@ def buy_request(*, size: str = "1", price: str = "0.50") -> OrderRequest:
         price=Decimal(price),
         size=Decimal(size),
         time_in_force=OrderTimeInForce.GTC,
+        post_only=post_only,
         strategy_name="test",
     )
 
@@ -464,6 +467,7 @@ def test_submit_order_maps_side_and_time_in_force_and_normalizes_response() -> N
     assert result.status == OrderStatus.SUBMITTED
     assert result.accepted is True
     assert result.exchange_order_id == "0xabc123"
+    assert result.liquidity == "taker"
     calls = {call[0]: call for call in adapter._client.calls}
     create_call = calls["create_order"]
     assert create_call[1].token_id == "t1"
@@ -479,6 +483,25 @@ def test_submit_order_maps_side_and_time_in_force_and_normalizes_response() -> N
     post_call = calls["post_order"]
     assert post_call[2] == "GTC"
     assert post_call[3] is False
+
+
+def test_submit_order_reports_maker_liquidity_for_post_only_submissions() -> None:
+    """
+    Fee accounting reads OrderResult.liquidity to charge maker vs taker fees.
+    A post-only order that crossed would be rejected by the exchange rather
+    than filled, so a fill on a post-only submission is trustworthy as maker.
+    """
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=FakeV2Client,
+    )
+    result = adapter.submit_order(
+        buy_request(size="1", price="0.50", post_only=True)
+    )
+    assert result.status == OrderStatus.SUBMITTED
+    assert result.liquidity == "maker"
 
 
 def test_submit_order_treats_local_order_creation_failure_as_definite() -> None:

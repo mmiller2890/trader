@@ -50,6 +50,11 @@ class OrderSubmitter:
     async def submit(self, order: OrderRequest) -> OrderResult:
         """Submit one order request and return typed result."""
 
+        # A post-only order that ended up crossing would be rejected by the
+        # exchange rather than filled as a taker, so the submitted intent is
+        # a sound source of truth for how a fill should be fee-accounted.
+        liquidity = "maker" if order.post_only else "taker"
+
         if order.client_order_id in self._submitted_ids:
             if self._circuit_breaker is not None:
                 self._circuit_breaker.record_failure()
@@ -64,6 +69,7 @@ class OrderSubmitter:
                 signal_id=order.signal_id,
                 strategy_name=order.strategy_name,
                 requested_size=order.size,
+                liquidity=liquidity,
             )
 
         live_trading_enabled = is_live_trading_enabled(self._config)
@@ -88,6 +94,7 @@ class OrderSubmitter:
                 signal_id=order.signal_id,
                 strategy_name=order.strategy_name,
                 requested_size=order.size,
+                liquidity=liquidity,
             )
 
         self._remember_submission(order.client_order_id)
@@ -130,6 +137,7 @@ class OrderSubmitter:
                     strategy_name=order.strategy_name,
                     requested_size=order.size,
                     latency_ms=latency_ms,
+                    liquidity=liquidity,
                 )
             return OrderResult(
                 client_order_id=order.client_order_id,
@@ -145,6 +153,7 @@ class OrderSubmitter:
                 filled_size=order.size,
                 avg_fill_price=order.price,
                 latency_ms=latency_ms,
+                liquidity=liquidity,
             )
 
         try:
@@ -165,6 +174,7 @@ class OrderSubmitter:
                 strategy_name=order.strategy_name,
                 requested_size=order.size,
                 latency_ms=latency_ms,
+                liquidity=liquidity,
             )
         except ClobAdapterError as exc:
             latency_ms = int((datetime.now(tz=UTC) - started).total_seconds() * 1000)
@@ -182,6 +192,7 @@ class OrderSubmitter:
                 strategy_name=order.strategy_name,
                 requested_size=order.size,
                 latency_ms=latency_ms,
+                liquidity=liquidity,
             )
 
         if self._circuit_breaker is not None:
@@ -191,6 +202,11 @@ class OrderSubmitter:
         result.side = order.side
         result.signal_id = order.signal_id
         result.strategy_name = order.strategy_name
+        # A post-only order that crossed would be rejected by the exchange
+        # rather than filled, so the submitted intent is authoritative for
+        # fee accounting -- the adapter's own construction is not trusted to
+        # have set this correctly.
+        result.liquidity = liquidity
         return result
 
     def _remember_submission(self, client_order_id: str) -> None:

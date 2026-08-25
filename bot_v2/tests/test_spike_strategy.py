@@ -7,7 +7,7 @@ import pytest
 
 from config.schema import SpikeStrategyConfig
 from models.market import MarketSnapshot
-from models.signal import SignalSide
+from models.signal import SignalSide, SignalType
 from strategies.spike import SpikeStrategy
 
 
@@ -87,6 +87,7 @@ def reversion_config(**overrides: object) -> SpikeStrategyConfig:
     base: dict[str, object] = {
         "enabled": True,
         "direction": "reversion",
+        "entry_style": "taker",
         "lookback_ticks": 3,
         "spike_threshold_bps": 45.0,
         "cooldown_seconds": 0.0,
@@ -421,3 +422,88 @@ async def test_reversion_direction_still_available_for_comparison() -> None:
     signals = await strategy.on_market_update(mm_snapshot(mid="0.60"))
 
     assert signals[0].side == SignalSide.SELL
+
+
+@pytest.mark.asyncio
+async def test_maker_entry_style_emits_a_post_only_quote() -> None:
+    strategy = SpikeStrategy(
+        reversion_config(
+            direction="momentum", entry_style="maker", sell_via_complement=False
+        ),
+        tick_size_provider=lambda token_id: Decimal("0.01"),
+    )
+    for mid in ("0.50", "0.50", "0.50"):
+        await strategy.on_market_update(mm_snapshot(mid=mid))
+    signals = await strategy.on_market_update(mm_snapshot(mid="0.60"))
+
+    assert len(signals) == 1
+    quote = signals[0]
+    assert quote.signal_type is SignalType.MAKER_QUOTE
+    assert quote.post_only is True
+    assert quote.limit_price is not None
+    assert quote.requested_size is not None
+
+
+@pytest.mark.asyncio
+async def test_a_maker_bid_rests_behind_the_touch() -> None:
+    strategy = SpikeStrategy(
+        reversion_config(
+            direction="momentum", entry_style="maker",
+            maker_offset_ticks=1, sell_via_complement=False,
+        ),
+        tick_size_provider=lambda token_id: Decimal("0.01"),
+    )
+    for mid in ("0.50", "0.50", "0.50"):
+        await strategy.on_market_update(mm_snapshot(mid=mid))
+    signals = await strategy.on_market_update(mm_snapshot(mid="0.60"))
+
+    # Book is 0.59/0.61; a maker bid rests one tick under the bid.
+    assert signals[0].limit_price == Decimal("0.58")
+
+
+@pytest.mark.asyncio
+async def test_taker_entry_style_is_still_available() -> None:
+    strategy = SpikeStrategy(
+        reversion_config(
+            direction="momentum", entry_style="taker", sell_via_complement=False
+        )
+    )
+    for mid in ("0.50", "0.50", "0.50"):
+        await strategy.on_market_update(mm_snapshot(mid=mid))
+    signals = await strategy.on_market_update(mm_snapshot(mid="0.60"))
+
+    assert signals[0].signal_type is SignalType.PRICE_SPIKE
+    assert signals[0].post_only is False
+
+
+@pytest.mark.asyncio
+async def test_maker_entry_style_applies_to_the_complement_path_too() -> None:
+    """
+    Regression: the complement route must not stay a taker order once
+    entry_style="maker" is set, or fee-aware execution only covers half the
+    strategy's entries.
+    """
+
+    strategy = SpikeStrategy(
+        reversion_config(
+            direction="momentum", entry_style="maker", maker_offset_ticks=1,
+            sell_via_complement=True,
+        ),
+        complement_provider=lambda market_id, token_id: "t2",
+        tick_size_provider=lambda token_id: Decimal("0.01"),
+    )
+    for mid in ("0.50", "0.50", "0.50"):
+        await strategy.on_market_update(mm_snapshot(mid=mid))
+    # Momentum sells a downward spike; with sell_via_complement this routes
+    # through buying the paired token instead.
+    signals = await strategy.on_market_update(mm_snapshot(mid="0.40"))
+
+    assert len(signals) == 1
+    quote = signals[0]
+    assert quote.token_id == "t2"
+    assert quote.side == SignalSide.BUY
+    assert quote.signal_type is SignalType.MAKER_QUOTE
+    assert quote.post_only is True
+    # Book is 0.39/0.41; complement's implied bid is 1 - 0.41 = 0.59, and the
+    # maker BUY rests one tick behind it.
+    assert quote.limit_price == Decimal("0.58")
