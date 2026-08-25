@@ -10,6 +10,10 @@ A dry-run-first Python trading bot for Polymarket's recurring Bitcoin Up/Down 15
 Implemented today:
 
 - automatic discovery and rotation of active BTC 15-minute markets;
+- inventory-skewed post-only market making with cancel-before-replace quoting;
+- momentum/reversion spike trading with complement-token routing, spread guards, and tick-floored exits;
+- book recording and reversion measurement tooling for offline strategy research;
+- exchange tick-size and lot-size quantization on every submitted price;
 - WebSocket order-book ingestion with reconnect backoff;
 - spike-strategy signals with liquidity, exposure, slippage, and duplicate guards;
 - simulated dry-run execution and guarded Polymarket CLOB V2 live execution;
@@ -138,6 +142,7 @@ Configuration is validated with Pydantic and assembled from:
 | `config/bot.yaml` | Runtime, market data, exchange, execution, position management, and notifications |
 | `config/risk.yaml` | Exposure, loss, liquidity, staleness, and circuit-breaker limits |
 | `config/strategies/spike.yaml` | Spike strategy behavior |
+| `config/strategies/market_maker.yaml` | Market-making quote, inventory, and unwind behavior |
 | `config/operator.yaml` | Dashboard-managed mode and token scope; ignored by Git |
 | `.env` | Credentials and secrets; ignored by Git |
 
@@ -269,7 +274,28 @@ python3 -m pytest -q tests/test_live_preflight.py
 python3 -m pytest -q tests/test_reconciliation.py tests/test_position_accounting.py
 python3 -m pytest -q tests/test_exit_manager.py tests/test_rotation_gate.py
 python3 -m pytest -q tests/test_dashboard_controller.py tests/test_dashboard_api.py
+python3 -m pytest -q tests/test_market_maker.py tests/test_quote_routing.py
+python3 -m pytest -q tests/test_tick.py tests/test_order_builder.py
+python3 -m pytest -q tests/test_spike_strategy.py tests/test_exit_policy.py
+python3 -m pytest -q tests/test_reversion_analysis.py
 ```
+
+## Strategy research
+
+Neither strategy has a measured edge. Before tuning either, record real books
+and measure whether the pattern beats its own trading cost:
+
+```bash
+python3 -m scripts.record_books --minutes 120 --output data/research/books.jsonl
+```
+
+```bash
+python3 -m scripts.analyze_reversion --input data/research/books.jsonl --sweep
+```
+
+`mean_net_bps_after_spread` is the number that matters: it is signed in the
+direction the trade is positioned and already subtracts the spread paid to
+enter. The summary refuses to render a verdict below 100 episodes.
 
 ## Backtesting
 
@@ -320,6 +346,8 @@ bot_v2/
 ## Documentation
 
 - [Live trading runbook](docs/live-runbook.md)
+- [Market making](docs/market-making.md)
+- [Spike trading on short-duration crypto markets](docs/spike-trading.md)
 - [Dashboard design](backtest/docs/superpowers/specs/2026-08-24-dashboard-live-control-design.md)
 - [Position lifecycle and exit design](backtest/docs/superpowers/specs/2026-08-24-position-lifecycle-exit-management-design.md)
 - [Lifecycle safety fixes plan](backtest/docs/superpowers/plans/2026-08-24-position-lifecycle-safety-fixes.md)
