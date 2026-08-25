@@ -243,3 +243,151 @@ def _buy_signal() -> TradeSignal:
         observed_move_bps=100,
         reason="test",
     )
+
+
+def _book(
+    *,
+    bid: str = "0.44",
+    ask: str = "0.45",
+    bid_size: str = "500",
+    ask_size: str = "500",
+) -> MarketSnapshot:
+    now = datetime.now(tz=UTC)
+    return MarketSnapshot(
+        market_id="m1",
+        token_id="t1",
+        best_bid=Decimal(bid),
+        best_ask=Decimal(ask),
+        mid_price=(Decimal(bid) + Decimal(ask)) / 2,
+        top_bid_size=Decimal(bid_size),
+        top_ask_size=Decimal(ask_size),
+        received_ts=now,
+        source_ts=now,
+    )
+
+
+def _maker_quote(
+    *,
+    side: SignalSide,
+    limit_price: str,
+    size: str = "100",
+) -> TradeSignal:
+    return TradeSignal(
+        signal_id="quote123456789",
+        strategy_name="market_maker",
+        signal_type=SignalType.MAKER_QUOTE,
+        market_id="m1",
+        token_id="t1",
+        side=side,
+        reference_price=Decimal("0.445"),
+        target_price=Decimal(limit_price),
+        observed_move_bps=0,
+        reason="quote",
+        requested_size=Decimal(size),
+        limit_price=Decimal(limit_price),
+        post_only=True,
+    )
+
+
+def test_taker_price_is_snapped_onto_the_tick_grid() -> None:
+    # A 0.01-tick market cannot accept 0.455; a marketable buy rounds up.
+    builder = OrderBuilder(AppConfig())
+    order = builder.build(signal=_buy_signal(), snapshot=_book(ask="0.455"))
+    assert order.price == Decimal("0.46")
+    assert order.tick_size == Decimal("0.01")
+    assert order.post_only is False
+
+
+def test_builder_uses_the_injected_tick_size_provider() -> None:
+    builder = OrderBuilder(
+        AppConfig(), tick_size_provider=lambda token_id: Decimal("0.001")
+    )
+    order = builder.build(signal=_buy_signal(), snapshot=_book(ask="0.4555"))
+    assert order.tick_size == Decimal("0.001")
+    assert order.price == Decimal("0.456")
+
+
+def test_builder_falls_back_when_the_tick_provider_fails() -> None:
+    def broken(token_id: str) -> Decimal:
+        raise RuntimeError("lookup down")
+
+    builder = OrderBuilder(AppConfig(), tick_size_provider=broken)
+    order = builder.build(signal=_buy_signal(), snapshot=_book(ask="0.45"))
+    assert order.tick_size == Decimal("0.01")
+
+
+def _mm_config() -> AppConfig:
+    return AppConfig(
+        execution={
+            "default_order_size": "100",
+            "max_order_size": "500",
+            "min_order_size": "1",
+        }
+    )
+
+
+def test_maker_quote_rests_at_its_own_limit_price() -> None:
+    builder = OrderBuilder(_mm_config())
+    order = builder.build(
+        signal=_maker_quote(side=SignalSide.BUY, limit_price="0.43"),
+        snapshot=_book(),
+    )
+    assert order.price == Decimal("0.43")
+    assert order.size == Decimal("100")
+    assert order.post_only is True
+    assert order.time_in_force == OrderTimeInForce.GTC
+
+
+def test_maker_bid_is_clamped_below_the_best_ask() -> None:
+    # A post-only buy at or above the ask would be rejected outright.
+    builder = OrderBuilder(AppConfig())
+    order = builder.build(
+        signal=_maker_quote(side=SignalSide.BUY, limit_price="0.48"),
+        snapshot=_book(bid="0.44", ask="0.45"),
+    )
+    assert order.price == Decimal("0.44")
+
+
+def test_maker_ask_is_clamped_above_the_best_bid() -> None:
+    builder = OrderBuilder(AppConfig())
+    order = builder.build(
+        signal=_maker_quote(side=SignalSide.SELL, limit_price="0.41"),
+        snapshot=_book(bid="0.44", ask="0.45"),
+    )
+    assert order.price == Decimal("0.45")
+
+
+def test_maker_quote_size_is_capped_by_live_notional() -> None:
+    config = AppConfig(
+        bot={"mode": "live"},
+        execution={
+            "allow_live_trading": True,
+            "dry_run_force": False,
+            "default_order_size": "100",
+            "max_order_size": "500",
+            "min_order_size": "1",
+            "min_live_buy_notional": "1",
+            "max_live_order_notional": "10",
+        },
+    )
+    builder = OrderBuilder(config)
+    order = builder.build(
+        signal=_maker_quote(side=SignalSide.BUY, limit_price="0.40", size="100"),
+        snapshot=_book(),
+    )
+    # $10 cap at $0.40 funds at most 25 shares.
+    assert order.size == Decimal("25")
+
+
+def test_maker_quote_price_off_grid_is_snapped_passively() -> None:
+    builder = OrderBuilder(AppConfig())
+    bid_order = builder.build(
+        signal=_maker_quote(side=SignalSide.BUY, limit_price="0.4267"),
+        snapshot=_book(),
+    )
+    assert bid_order.price == Decimal("0.42")
+    ask_order = builder.build(
+        signal=_maker_quote(side=SignalSide.SELL, limit_price="0.4612"),
+        snapshot=_book(),
+    )
+    assert ask_order.price == Decimal("0.47")

@@ -37,6 +37,8 @@ class SignalType(str, Enum):
 
     PRICE_SPIKE = "price_spike"
     POSITION_EXIT = "position_exit"
+    MAKER_QUOTE = "maker_quote"
+    INVENTORY_UNWIND = "inventory_unwind"
 
 
 class TradeSignal(BaseModel):
@@ -58,6 +60,10 @@ class TradeSignal(BaseModel):
     requested_size: Decimal | None = Field(default=None, gt=Decimal("0"))
     reduce_only: bool = False
     time_in_force: OrderTimeInForce | None = None
+    post_only: bool = False
+    limit_price: Decimal | None = Field(
+        default=None, gt=Decimal("0"), lt=Decimal("1")
+    )
 
     @model_validator(mode="after")
     def validate_exit_intent(self) -> Self:
@@ -65,4 +71,17 @@ class TradeSignal(BaseModel):
             raise ValueError("position_exit signals require reduce_only=true")
         if self.reduce_only and self.side != SignalSide.SELL:
             raise ValueError("reduce_only signals require side=sell")
+        if self.signal_type == SignalType.MAKER_QUOTE:
+            if self.limit_price is None:
+                raise ValueError("maker_quote signals require an explicit limit_price")
+            if self.requested_size is None:
+                raise ValueError("maker_quote signals require an explicit requested_size")
+            if not self.post_only:
+                raise ValueError("maker_quote signals require post_only=true")
         return self
+
+    @property
+    def is_maker_quote(self) -> bool:
+        """True when this signal is a resting post-only quote."""
+
+        return self.signal_type == SignalType.MAKER_QUOTE

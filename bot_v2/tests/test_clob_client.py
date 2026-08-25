@@ -12,7 +12,14 @@ from clients.clob_client import (
     ClobUncertainOutcomeError,
 )
 from config.schema import AppConfig, Mode
-from models.order import OrderRequest, OrderSide, OrderStatus, OrderTimeInForce
+from models.order import (
+    CancelIntent,
+    CancelOutcome,
+    OrderRequest,
+    OrderSide,
+    OrderStatus,
+    OrderTimeInForce,
+)
 
 
 def live_config() -> AppConfig:
@@ -75,8 +82,8 @@ class FakeV2Client:
             "market": "m1",
             "asset_id": "t1",
             "side": "BUY",
-            "original_size": "1000000",
-            "size_matched": "1000000",
+            "original_size": "1",
+            "size_matched": "1",
             "price": "0.5",
         }
 
@@ -91,12 +98,22 @@ class FakeV2Client:
             },
         }
 
-    def create_order(self, order_args: object) -> dict[str, object]:
-        self.calls.append(("create_order", order_args))
+    def get_tick_size(self, token_id: str) -> str:
+        self.calls.append(("get_tick_size", token_id))
+        return "0.01"
+
+    def get_neg_risk(self, token_id: str) -> bool:
+        self.calls.append(("get_neg_risk", token_id))
+        return False
+
+    def create_order(
+        self, order_args: object, options: object = None
+    ) -> dict[str, object]:
+        self.calls.append(("create_order", order_args, options))
         return {"signed": True}
 
     def post_order(self, order: object, order_type: object = "GTC", post_only: bool = False, defer_exec: bool = False) -> dict[str, object]:
-        self.calls.append(("post_order", order, order_type))
+        self.calls.append(("post_order", order, order_type, post_only))
         return {
             "success": True,
             "orderID": "0xabc123",
@@ -277,8 +294,8 @@ def test_get_open_orders_normalizes_v2_rows() -> None:
                     "asset_id": "t1",
                     "side": "SELL",
                     "price": "0.45",
-                    "original_size": "5000000",
-                    "size_matched": "1000000",
+                    "original_size": "5",
+                    "size_matched": "1",
                 }
             ]
 
@@ -296,6 +313,33 @@ def test_get_open_orders_normalizes_v2_rows() -> None:
     assert orders[0].status == OrderStatus.PARTIALLY_FILLED
     assert orders[0].side == OrderSide.SELL
     assert orders[0].avg_fill_price == Decimal("0.45")
+
+
+def test_get_open_orders_uses_decimal_units_not_fixed_six() -> None:
+    class DecimalOrdersClient(FakeV2Client):
+        def get_open_orders(self, params: object = None, only_first_page: bool = False, next_cursor: object = None) -> list[dict[str, object]]:
+            self.calls.append(("get_open_orders", params, only_first_page, next_cursor))
+            return [
+                {
+                    "id": "0xorder0001",
+                    "market": "m1",
+                    "asset_id": "t1",
+                    "side": "BUY",
+                    "price": "0.52",
+                    "original_size": "10",
+                    "size_matched": "10",
+                }
+            ]
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=DecimalOrdersClient,
+    )
+    orders = adapter.get_open_orders()
+    assert orders[0].requested_size == Decimal("10")
+    assert orders[0].filled_size == Decimal("10")
+    assert orders[0].status == OrderStatus.PARTIALLY_FILLED
 
 
 def test_get_open_orders_fails_closed_on_malformed_response() -> None:
@@ -329,6 +373,27 @@ def test_get_order_normalizes_terminal_fill_and_preserves_client_id() -> None:
     assert result.status == OrderStatus.FILLED
     assert result.filled_size == Decimal("1")
     assert result.avg_fill_price == Decimal("0.5")
+
+
+def test_get_order_uses_decimal_units_not_fixed_six() -> None:
+    class DecimalOrderClient(FakeV2Client):
+        def get_order(self, order_id: str) -> dict[str, object]:
+            row = super().get_order(order_id)
+            row["original_size"] = "10"
+            row["size_matched"] = "10"
+            return row
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=DecimalOrderClient,
+    )
+
+    result = adapter.get_order("0xorder0001")
+
+    assert result.status == OrderStatus.FILLED
+    assert result.requested_size == Decimal("10")
+    assert result.filled_size == Decimal("10")
 
 
 def test_get_order_normalizes_exchange_cancellation() -> None:
@@ -399,22 +464,28 @@ def test_submit_order_maps_side_and_time_in_force_and_normalizes_response() -> N
     assert result.status == OrderStatus.SUBMITTED
     assert result.accepted is True
     assert result.exchange_order_id == "0xabc123"
-    create_call = adapter._client.calls[0]
-    assert create_call[0] == "create_order"
+    calls = {call[0]: call for call in adapter._client.calls}
+    create_call = calls["create_order"]
     assert create_call[1].token_id == "t1"
     assert create_call[1].price == 0.5
     assert create_call[1].size == 1.0
     from py_clob_client_v2 import Side
 
     assert create_call[1].side == Side.BUY
-    post_call = adapter._client.calls[1]
-    assert post_call[0] == "post_order"
+    # Signing options carry the resolved tick size and neg-risk flag so the
+    # SDK rounds against the same grid the order builder used.
+    assert create_call[2].tick_size == "0.01"
+    assert create_call[2].neg_risk is False
+    post_call = calls["post_order"]
     assert post_call[2] == "GTC"
+    assert post_call[3] is False
 
 
 def test_submit_order_treats_local_order_creation_failure_as_definite() -> None:
     class SigningFailureClient(FakeV2Client):
-        def create_order(self, order_args: object) -> dict[str, object]:
+        def create_order(
+            self, order_args: object, options: object = None
+        ) -> dict[str, object]:
             raise ValueError("invalid signing input")
 
     adapter = ClobClientAdapter.from_v2(
@@ -513,15 +584,15 @@ def test_submit_order_rejects_explicit_unsuccessful_response_even_with_order_id(
     assert result.message == "insufficient balance"
 
 
-def test_submit_order_normalizes_partial_matched_amounts_from_fixed_six() -> None:
+def test_submit_order_normalizes_decimal_matched_response_amounts() -> None:
     class PartiallyMatchedClient(FakeV2Client):
         def post_order(self, order: object, order_type: object = "GTC", post_only: bool = False, defer_exec: bool = False) -> dict[str, object]:
             return {
                 "success": True,
                 "orderID": "0xpartial",
                 "status": "matched",
-                "makingAmount": "250000",
-                "takingAmount": "500000",
+                "makingAmount": "0.25",
+                "takingAmount": "0.5",
                 "errorMsg": "",
             }
 
@@ -559,8 +630,8 @@ def test_fok_submission_rejects_partial_matched_response() -> None:
                 "success": True,
                 "orderID": "0xpartial",
                 "status": "matched",
-                "makingAmount": "250000",
-                "takingAmount": "500000",
+                "makingAmount": "0.25",
+                "takingAmount": "0.5",
                 "errorMsg": "",
             }
 
@@ -577,6 +648,29 @@ def test_fok_submission_rejects_partial_matched_response() -> None:
     assert result.status == OrderStatus.UNKNOWN
     assert result.filled_size == Decimal("0.5")
     assert result.message == "fok_partial_fill_invariant_violation"
+
+
+def test_submit_order_accepts_unmatched_status_as_resting_order() -> None:
+    class UnmatchedClient(FakeV2Client):
+        def post_order(self, order: object, order_type: object = "GTC", post_only: bool = False, defer_exec: bool = False) -> dict[str, object]:
+            return {
+                "success": True,
+                "orderID": "0xunmatched",
+                "status": "unmatched",
+                "makingAmount": "",
+                "takingAmount": "",
+                "errorMsg": "",
+            }
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=UnmatchedClient,
+    )
+    result = adapter.submit_order(buy_request(size="1", price="0.50"))
+    assert result.accepted is True
+    assert result.status == OrderStatus.SUBMITTED
+    assert result.message == "unmatched"
 
 
 def test_submit_order_fails_closed_on_malformed_response() -> None:
@@ -649,3 +743,216 @@ def test_disabled_adapter_blocks_submission_and_cancellation() -> None:
     with pytest.raises(ClobAdapterError, match="disabled"):
         adapter.cancel_all()
     assert adapter.get_open_orders() == []
+
+
+def test_tick_size_is_resolved_once_and_cached() -> None:
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=FakeV2Client,
+    )
+    assert adapter.get_tick_size("t1") == Decimal("0.01")
+    assert adapter.get_tick_size("t1") == Decimal("0.01")
+    lookups = [call for call in adapter._client.calls if call[0] == "get_tick_size"]
+    assert len(lookups) == 1
+
+
+def test_tick_size_falls_back_to_configured_default_on_transport_failure() -> None:
+    class NoTickClient(FakeV2Client):
+        def get_tick_size(self, token_id: str) -> str:
+            raise RuntimeError("upstream down")
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=NoTickClient,
+    )
+    assert adapter.get_tick_size("t1") == Decimal("0.01")
+
+
+def test_tick_size_rejects_unsupported_grid_and_uses_default() -> None:
+    class OddTickClient(FakeV2Client):
+        def get_tick_size(self, token_id: str) -> str:
+            return "0.02"
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=OddTickClient,
+    )
+    assert adapter.get_tick_size("t1") == Decimal("0.01")
+
+
+def test_submit_order_refuses_price_off_the_tick_grid() -> None:
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=FakeV2Client,
+    )
+    with pytest.raises(ClobAdapterError, match="tick size"):
+        adapter.submit_order(buy_request(price="0.505"))
+
+
+def test_post_only_flag_reaches_the_exchange() -> None:
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=FakeV2Client,
+    )
+    order = buy_request(price="0.50").model_copy(update={"post_only": True})
+    adapter.submit_order(order)
+    post_call = next(
+        call for call in adapter._client.calls if call[0] == "post_order"
+    )
+    assert post_call[3] is True
+
+
+def test_http_rejection_preserves_sanitized_upstream_reason() -> None:
+    class RejectingClient(FakeV2Client):
+        def post_order(
+            self,
+            order: object,
+            order_type: object = "GTC",
+            post_only: bool = False,
+            defer_exec: bool = False,
+        ) -> dict[str, object]:
+            from py_clob_client_v2.exceptions import PolyApiException
+
+            raise PolyApiException(
+                resp=httpx.Response(
+                    400,
+                    json={"error": "not enough balance/allowance"},
+                    request=httpx.Request("POST", "https://clob.example/order"),
+                )
+            )
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=RejectingClient,
+    )
+    with pytest.raises(ClobAdapterError) as excinfo:
+        adapter.submit_order(buy_request(price="0.50"))
+    message = str(excinfo.value)
+    assert "http_400" in message
+    assert "not enough balance/allowance" in message
+
+
+def test_http_rejection_strips_secret_shaped_tokens() -> None:
+    class LeakyClient(FakeV2Client):
+        def post_order(
+            self,
+            order: object,
+            order_type: object = "GTC",
+            post_only: bool = False,
+            defer_exec: bool = False,
+        ) -> dict[str, object]:
+            from py_clob_client_v2.exceptions import PolyApiException
+
+            raise PolyApiException(
+                resp=httpx.Response(
+                    400,
+                    json={
+                        "error": "bad signature 0xdeadbeefdeadbeefdeadbeefdeadbeef"
+                    },
+                    request=httpx.Request("POST", "https://clob.example/order"),
+                )
+            )
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=LeakyClient,
+    )
+    with pytest.raises(ClobAdapterError) as excinfo:
+        adapter.submit_order(buy_request(price="0.50"))
+    message = str(excinfo.value)
+    assert "bad signature" in message
+    assert "deadbeef" not in message
+
+
+def cancel_intent(order_id: str | None = "0xabc123") -> CancelIntent:
+    return CancelIntent(
+        client_order_id="test-order-0001",
+        exchange_order_id=order_id,
+        market_id="m1",
+        token_id="t1",
+        side=OrderSide.BUY,
+        reason="quote_stale",
+    )
+
+
+def test_cancel_resting_order_reports_cancelled() -> None:
+    class CancelClient(FakeV2Client):
+        def cancel_order(self, payload: object) -> dict[str, object]:
+            return {"canceled": ["0xabc123"], "not_canceled": {}}
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=CancelClient,
+    )
+    result = adapter.cancel_resting_order(cancel_intent())
+    assert result.outcome == CancelOutcome.CANCELLED
+    assert result.terminal is True
+
+
+def test_cancel_treats_already_filled_order_as_terminal_not_found() -> None:
+    class GoneClient(FakeV2Client):
+        def cancel_order(self, payload: object) -> dict[str, object]:
+            return {
+                "canceled": [],
+                "not_canceled": {"0xabc123": "order already matched"},
+            }
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=GoneClient,
+    )
+    result = adapter.cancel_resting_order(cancel_intent())
+    assert result.outcome == CancelOutcome.NOT_FOUND
+    assert result.terminal is True
+
+
+def test_cancel_reports_genuine_refusal_as_failed() -> None:
+    class RefusingClient(FakeV2Client):
+        def cancel_order(self, payload: object) -> dict[str, object]:
+            return {
+                "canceled": [],
+                "not_canceled": {"0xabc123": "market is closed for cancellation"},
+            }
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=RefusingClient,
+    )
+    result = adapter.cancel_resting_order(cancel_intent())
+    assert result.outcome == CancelOutcome.FAILED
+    assert result.terminal is False
+
+
+def test_cancel_transport_failure_is_unknown_and_not_terminal() -> None:
+    class BrokenClient(FakeV2Client):
+        def cancel_order(self, payload: object) -> dict[str, object]:
+            raise TimeoutError("no answer")
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=BrokenClient,
+    )
+    result = adapter.cancel_resting_order(cancel_intent())
+    assert result.outcome == CancelOutcome.UNKNOWN
+    assert result.terminal is False
+
+
+def test_cancel_without_exchange_id_is_not_found() -> None:
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=FakeV2Client,
+    )
+    result = adapter.cancel_resting_order(cancel_intent(order_id=None))
+    assert result.outcome == CancelOutcome.NOT_FOUND

@@ -5,10 +5,18 @@ from decimal import Decimal
 
 import pytest
 
-from clients.clob_client import ClobUncertainOutcomeError
+from clients.clob_client import ClobClientAdapter, ClobUncertainOutcomeError
 from config.schema import AppConfig, Mode
 from execution.submitter import OrderSubmitter
-from models.order import OrderRequest, OrderResult, OrderSide, OrderStatus, OrderTimeInForce
+from models.order import (
+    CancelIntent,
+    CancelOutcome,
+    OrderRequest,
+    OrderResult,
+    OrderSide,
+    OrderStatus,
+    OrderTimeInForce,
+)
 from risk.circuit_breaker import CircuitBreaker
 
 
@@ -179,3 +187,91 @@ async def test_cancel_all_open_orders_delegates_to_adapter() -> None:
     cancelled = await submitter.cancel_all_open_orders()
     assert cancelled is True
     assert adapter.cancel_all_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_dry_run_post_only_quote_rests_instead_of_filling() -> None:
+    submitter = OrderSubmitter(
+        config=AppConfig(bot={"mode": Mode.DRY_RUN}),
+        clob_client=ClobClientAdapter.disabled(),
+    )
+    order = OrderRequest(
+        client_order_id="quote-000000001",
+        market_id="m1",
+        token_id="t1",
+        side=OrderSide.BUY,
+        price=Decimal("0.49"),
+        size=Decimal("100"),
+        time_in_force=OrderTimeInForce.GTC,
+        post_only=True,
+    )
+
+    result = await submitter.submit(order)
+
+    # No fantasy fill: a resting quote reports zero filled size.
+    assert result.status == OrderStatus.SUBMITTED
+    assert result.accepted is True
+    assert result.filled_size == Decimal("0")
+    assert result.avg_fill_price is None
+    assert result.exchange_order_id == "sim-quote-000000001"
+
+
+@pytest.mark.asyncio
+async def test_dry_run_taker_order_still_simulates_a_fill() -> None:
+    submitter = OrderSubmitter(
+        config=AppConfig(bot={"mode": Mode.DRY_RUN}),
+        clob_client=ClobClientAdapter.disabled(),
+    )
+    order = OrderRequest(
+        client_order_id="taker-000000001",
+        market_id="m1",
+        token_id="t1",
+        side=OrderSide.BUY,
+        price=Decimal("0.51"),
+        size=Decimal("10"),
+        time_in_force=OrderTimeInForce.FOK,
+    )
+
+    result = await submitter.submit(order)
+
+    assert result.status == OrderStatus.SIMULATED
+    assert result.filled_size == Decimal("10")
+
+
+@pytest.mark.asyncio
+async def test_dry_run_cancellation_is_simulated_and_terminal() -> None:
+    submitter = OrderSubmitter(
+        config=AppConfig(bot={"mode": Mode.DRY_RUN}),
+        clob_client=ClobClientAdapter.disabled(),
+    )
+
+    result = await submitter.cancel_order(
+        CancelIntent(
+            client_order_id="quote-000000001",
+            exchange_order_id="sim-quote-000000001",
+            market_id="m1",
+            token_id="t1",
+            side=OrderSide.BUY,
+            reason="quote_stale",
+        )
+    )
+
+    assert result.outcome == CancelOutcome.SIMULATED
+    assert result.terminal is True
+
+
+@pytest.mark.asyncio
+async def test_submitted_id_history_is_bounded() -> None:
+    from execution.submitter import SUBMITTED_ID_HISTORY
+
+    submitter = OrderSubmitter(
+        config=AppConfig(bot={"mode": Mode.DRY_RUN}),
+        clob_client=ClobClientAdapter.disabled(),
+    )
+    for index in range(SUBMITTED_ID_HISTORY + 50):
+        submitter._remember_submission(f"order-{index:08d}")
+
+    assert len(submitter._submitted_ids) == SUBMITTED_ID_HISTORY
+    # The oldest ids are evicted, the newest retained.
+    assert "order-00000000" not in submitter._submitted_ids
+    assert f"order-{SUBMITTED_ID_HISTORY + 49:08d}" in submitter._submitted_ids

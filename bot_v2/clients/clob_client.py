@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Callable
@@ -12,7 +13,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from clients.auth import ClobCredentials, effective_funder_address
 from config.schema import AppConfig
 from models.market import MarketSnapshot, OrderBookLevel
+from models.tick import TickSizeError, normalize_tick_size
 from models.order import (
+    CancelIntent,
+    CancelOutcome,
+    CancelResult,
     OrderRequest,
     OrderResult,
     OrderSide,
@@ -61,6 +66,8 @@ class ClobClientAdapter:
         self._config = config
         self._allow_trading = allow_trading
         self._read_only = read_only
+        self._tick_size_cache: dict[str, Decimal] = {}
+        self._neg_risk_cache: dict[str, bool] = {}
 
     @classmethod
     def disabled(cls) -> "ClobClientAdapter":
@@ -199,8 +206,8 @@ class ClobClientAdapter:
             if not order_id:
                 raise ClobAdapterError("open orders row missing order id")
             try:
-                requested = _fixed_six(row.get("original_size"))
-                filled = _fixed_six(row.get("size_matched"))
+                requested = _decimal_units(row.get("original_size"))
+                filled = _decimal_units(row.get("size_matched"))
                 price = Decimal(str(row.get("price") or "0"))
             except Exception as exc:
                 raise ClobAdapterError(f"open orders row has invalid sizes: {exc}") from exc
@@ -251,8 +258,8 @@ class ClobClientAdapter:
             "ORDER_STATUS_"
         )
         try:
-            requested = _fixed_six(raw.get("original_size"))
-            filled = _fixed_six(raw.get("size_matched"))
+            requested = _decimal_units(raw.get("original_size"))
+            filled = _decimal_units(raw.get("size_matched"))
             price = Decimal(str(raw.get("price") or "0"))
         except Exception as exc:
             raise ClobAdapterError(f"order response has invalid numbers: {exc}") from exc
@@ -327,6 +334,69 @@ class ClobClientAdapter:
             raise ClobAdapterError(f"collateral response has invalid numbers: {exc}") from exc
         return CollateralStatus(balance=balance, allowance=allowance)
 
+    def get_tick_size(self, token_id: str) -> Decimal:
+        """
+        Return the exchange tick size for ``token_id``.
+
+        The value is cached because it is immutable for the life of a market
+        and every quote refresh needs it. A transport failure falls back to
+        the configured default rather than blocking execution, because the
+        order builder still snaps onto a valid grid either way.
+        """
+
+        cached = self._tick_size_cache.get(token_id)
+        if cached is not None:
+            return cached
+        try:
+            raw = self._client.get_tick_size(token_id)
+        except Exception as exc:
+            logger.warning(
+                "tick size lookup failed",
+                extra={
+                    "component": "clob_client",
+                    "event_type": "tick_size_lookup_failed",
+                    "token_id": token_id,
+                    "reason": type(exc).__name__,
+                },
+            )
+            return self._config.execution.default_tick_size
+        try:
+            tick_size = normalize_tick_size(str(raw))
+        except TickSizeError:
+            logger.warning(
+                "tick size response unsupported",
+                extra={
+                    "component": "clob_client",
+                    "event_type": "tick_size_unsupported",
+                    "token_id": token_id,
+                },
+            )
+            return self._config.execution.default_tick_size
+        self._tick_size_cache[token_id] = tick_size
+        return tick_size
+
+    def get_neg_risk(self, token_id: str) -> bool:
+        """Return the cached negative-risk flag required for order signing."""
+
+        cached = self._neg_risk_cache.get(token_id)
+        if cached is not None:
+            return cached
+        try:
+            value = bool(self._client.get_neg_risk(token_id))
+        except Exception as exc:
+            logger.warning(
+                "neg risk lookup failed",
+                extra={
+                    "component": "clob_client",
+                    "event_type": "neg_risk_lookup_failed",
+                    "token_id": token_id,
+                    "reason": type(exc).__name__,
+                },
+            )
+            return False
+        self._neg_risk_cache[token_id] = value
+        return value
+
     def submit_order(self, order: OrderRequest) -> OrderResult:
         """Sign and submit one order through explicit V2 methods."""
 
@@ -340,9 +410,19 @@ class ClobClientAdapter:
                 f"{self._config.execution.max_live_order_notional}"
             )
 
-        from py_clob_client_v2 import OrderArgs, OrderType, Side
+        from py_clob_client_v2 import (
+            OrderArgs,
+            OrderType,
+            PartialCreateOrderOptions,
+            Side,
+        )
         from py_clob_client_v2.exceptions import PolyApiException
 
+        tick_size = self.get_tick_size(order.token_id)
+        if order.price % tick_size != 0:
+            raise ClobAdapterError(
+                f"order price {order.price} is not a multiple of tick size {tick_size}"
+            )
         side = Side.BUY if order.side == OrderSide.BUY else Side.SELL
         order_type = {
             OrderTimeInForce.GTC: OrderType.GTC,
@@ -355,10 +435,14 @@ class ClobClientAdapter:
             size=float(str(order.size)),
             side=side,
         )
+        options = PartialCreateOrderOptions(
+            tick_size=str(tick_size),
+            neg_risk=self.get_neg_risk(order.token_id),
+        )
 
         started = datetime.now(tz=UTC)
         try:
-            signed = self._client.create_order(args)
+            signed = self._client.create_order(args, options)
         except ClobAdapterError:
             raise
         except Exception as exc:
@@ -366,13 +450,18 @@ class ClobClientAdapter:
                 f"order creation failed: {type(exc).__name__}"
             ) from exc
         try:
-            raw = self._client.post_order(signed, order_type=order_type)
+            raw = self._client.post_order(
+                signed,
+                order_type=order_type,
+                post_only=order.post_only,
+            )
         except ClobAdapterError:
             raise
         except PolyApiException as exc:
             if exc.status_code is not None:
                 raise ClobAdapterError(
                     f"order submission rejected:http_{exc.status_code}"
+                    f":{_sanitize_upstream_error(exc.error_msg)}"
                 ) from exc
             raise ClobUncertainOutcomeError(
                 "order submission outcome unknown:PolyApiException"
@@ -403,7 +492,7 @@ class ClobClientAdapter:
                 latency_ms=latency_ms,
             )
         exchange_status = str(raw.get("status") or "").lower()
-        if exchange_status not in {"live", "delayed", "matched"}:
+        if exchange_status not in {"live", "delayed", "matched", "unmatched"}:
             raise ClobAdapterError(
                 f"submission response has unknown status: {exchange_status!r}"
             )
@@ -421,8 +510,8 @@ class ClobClientAdapter:
             accepted = False
             result_message = f"fok_fill_not_confirmed:{exchange_status}"
         if exchange_status == "matched":
-            making_amount = _fixed_six(raw.get("makingAmount"))
-            taking_amount = _fixed_six(raw.get("takingAmount"))
+            making_amount = _decimal_units(raw.get("makingAmount"))
+            taking_amount = _decimal_units(raw.get("takingAmount"))
             if order.side == OrderSide.BUY:
                 filled_size = taking_amount
                 fill_notional = making_amount
@@ -475,6 +564,75 @@ class ClobClientAdapter:
             raise ClobAdapterError(f"order cancellation failed: {exc}") from exc
         return _validate_cancel_response(raw, expected_order_id=order_id)
 
+    def cancel_resting_order(self, intent: CancelIntent) -> CancelResult:
+        """
+        Cancel one resting order and classify the outcome.
+
+        Market making cancels constantly, and an order that filled or expired
+        between the decision and the request is the normal case rather than a
+        fault. Those resolve to ``NOT_FOUND`` — terminal, book is clean — while
+        a genuine refusal resolves to ``FAILED`` and a transport failure to
+        ``UNKNOWN`` so the caller can fail closed.
+        """
+
+        if self._read_only or not self._allow_trading:
+            raise ClobAdapterError("real order cancellation disabled in current mode")
+        order_id = intent.exchange_order_id
+        if not order_id:
+            return CancelResult(
+                client_order_id=intent.client_order_id,
+                outcome=CancelOutcome.NOT_FOUND,
+                message="no_exchange_order_id",
+            )
+        from py_clob_client_v2 import OrderPayload
+
+        try:
+            raw = self._client.cancel_order(OrderPayload(orderID=order_id))
+        except Exception as exc:
+            return CancelResult(
+                client_order_id=intent.client_order_id,
+                exchange_order_id=order_id,
+                outcome=CancelOutcome.UNKNOWN,
+                message=f"cancel_transport_failed:{type(exc).__name__}",
+            )
+        if not isinstance(raw, dict):
+            return CancelResult(
+                client_order_id=intent.client_order_id,
+                exchange_order_id=order_id,
+                outcome=CancelOutcome.UNKNOWN,
+                message="cancellation_response_malformed",
+            )
+        canceled = raw.get("canceled")
+        not_canceled = raw.get("not_canceled")
+        if not isinstance(canceled, list) or not isinstance(not_canceled, dict):
+            return CancelResult(
+                client_order_id=intent.client_order_id,
+                exchange_order_id=order_id,
+                outcome=CancelOutcome.UNKNOWN,
+                message="cancellation_response_malformed",
+            )
+        if order_id in {str(value) for value in canceled}:
+            return CancelResult(
+                client_order_id=intent.client_order_id,
+                exchange_order_id=order_id,
+                outcome=CancelOutcome.CANCELLED,
+                message="cancelled",
+            )
+        refusal = _sanitize_upstream_error(not_canceled.get(order_id))
+        if _is_already_gone(refusal):
+            return CancelResult(
+                client_order_id=intent.client_order_id,
+                exchange_order_id=order_id,
+                outcome=CancelOutcome.NOT_FOUND,
+                message=refusal,
+            )
+        return CancelResult(
+            client_order_id=intent.client_order_id,
+            exchange_order_id=order_id,
+            outcome=CancelOutcome.FAILED,
+            message=refusal,
+        )
+
     def cancel_all(self) -> bool:
         """Cancel every open order through the explicit V2 method."""
 
@@ -494,10 +652,68 @@ class _DisabledClobClient:
         return []
 
 
+_SECRET_SHAPED = re.compile(r"[A-Za-z0-9+=]{16,}")
+_ALLOWED_ERROR_CHARS = re.compile(r"[^a-z0-9 ,.:;'()/_-]")
+
+
+_ALREADY_GONE_MARKERS = (
+    "not found",
+    "no order",
+    "does not exist",
+    "already canceled",
+    "already cancelled",
+    "already filled",
+    "already matched",
+    "not live",
+)
+
+
+def _is_already_gone(refusal: str) -> bool:
+    """True when a cancel refusal means the order already left the book."""
+
+    return any(marker in refusal for marker in _ALREADY_GONE_MARKERS)
+
+
+def _sanitize_upstream_error(message: object) -> str:
+    """
+    Reduce an upstream error body to a short, secret-free diagnostic.
+
+    The CLOB returns the actionable reason for a 4xx ("not enough balance",
+    "invalid tick size") which the operator needs, but the body is attacker-
+    and account-adjacent text. Any run of 16 or more token characters is the
+    shape of a key, signature, address, or order hash, so it is dropped
+    before the remainder is character-filtered and truncated.
+    """
+
+    if message is None:
+        return "no_detail"
+    if isinstance(message, dict):
+        for key in ("error", "errorMsg", "message", "detail"):
+            value = message.get(key)
+            if isinstance(value, str) and value:
+                message = value
+                break
+        else:
+            message = ",".join(sorted(str(key) for key in message))
+    text = str(message).strip().lower()
+    text = _SECRET_SHAPED.sub("", text)
+    text = _ALLOWED_ERROR_CHARS.sub(" ", text)
+    text = " ".join(text.split())
+    if not text:
+        return "no_detail"
+    return text[:160]
+
+
 def _fixed_six(value: object) -> Decimal:
     """Convert a CLOB fixed-math amount with six decimals to units."""
 
     return Decimal(str(value or "0")) / FIXED_SIX_SCALE
+
+
+def _decimal_units(value: object) -> Decimal:
+    """Convert decimal-unit amounts returned by immediate order submission."""
+
+    return Decimal(str(value or "0"))
 
 
 def _validate_cancel_response(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import OrderedDict
 from datetime import UTC, datetime
 
 from clients.auth import is_live_trading_enabled
@@ -13,10 +14,22 @@ from clients.clob_client import (
     ClobUncertainOutcomeError,
 )
 from config.schema import AppConfig, Mode
-from models.order import OrderRequest, OrderResult, OrderStatus
+from models.order import (
+    CancelIntent,
+    CancelOutcome,
+    CancelResult,
+    OrderRequest,
+    OrderResult,
+    OrderStatus,
+)
 from risk.circuit_breaker import CircuitBreaker
 
 logger = logging.getLogger(__name__)
+
+#: Upper bound on remembered client order ids. Market making mints a new id on
+#: every quote refresh, so an unbounded set would grow for the life of the
+#: process. The window only needs to outlive in-flight duplicates.
+SUBMITTED_ID_HISTORY = 10_000
 
 
 class OrderSubmitter:
@@ -32,7 +45,7 @@ class OrderSubmitter:
         self._config = config
         self._clob_client = clob_client
         self._circuit_breaker = circuit_breaker
-        self._submitted_ids: set[str] = set()
+        self._submitted_ids: OrderedDict[str, None] = OrderedDict()
 
     async def submit(self, order: OrderRequest) -> OrderResult:
         """Submit one order request and return typed result."""
@@ -77,7 +90,7 @@ class OrderSubmitter:
                 requested_size=order.size,
             )
 
-        self._submitted_ids.add(order.client_order_id)
+        self._remember_submission(order.client_order_id)
         started = datetime.now(tz=UTC)
         logger.info(
             "submitting order",
@@ -97,6 +110,27 @@ class OrderSubmitter:
             latency_ms = int((datetime.now(tz=UTC) - started).total_seconds() * 1000)
             if self._circuit_breaker is not None:
                 self._circuit_breaker.record_success()
+            if order.post_only:
+                # A post-only quote sits behind the touch by construction, so
+                # simulating an instant fill at its own limit price would be a
+                # fiction -- and the most flattering one available. Dry run
+                # reports it as resting instead. Whether such a quote would
+                # actually trade is a queue-position question that only the
+                # backtester models.
+                return OrderResult(
+                    client_order_id=order.client_order_id,
+                    exchange_order_id=f"sim-{order.client_order_id}",
+                    market_id=order.market_id,
+                    token_id=order.token_id,
+                    side=order.side,
+                    status=OrderStatus.SUBMITTED,
+                    accepted=True,
+                    message="simulated_resting_quote",
+                    signal_id=order.signal_id,
+                    strategy_name=order.strategy_name,
+                    requested_size=order.size,
+                    latency_ms=latency_ms,
+                )
             return OrderResult(
                 client_order_id=order.client_order_id,
                 market_id=order.market_id,
@@ -158,6 +192,44 @@ class OrderSubmitter:
         result.signal_id = order.signal_id
         result.strategy_name = order.strategy_name
         return result
+
+    def _remember_submission(self, client_order_id: str) -> None:
+        """Record a submitted id, evicting the oldest beyond the window."""
+
+        self._submitted_ids[client_order_id] = None
+        while len(self._submitted_ids) > SUBMITTED_ID_HISTORY:
+            self._submitted_ids.popitem(last=False)
+
+    async def cancel_order(self, intent: CancelIntent) -> CancelResult:
+        """
+        Cancel exactly one resting order.
+
+        Dry run reports a simulated cancellation so quote lifecycles behave
+        identically in both modes. Live mode delegates to the adapter, which
+        distinguishes an order that already left the book from a genuine
+        refusal.
+        """
+
+        if self._config.bot.mode == Mode.DRY_RUN or not is_live_trading_enabled(
+            self._config
+        ):
+            return CancelResult(
+                client_order_id=intent.client_order_id,
+                exchange_order_id=intent.exchange_order_id,
+                outcome=CancelOutcome.SIMULATED,
+                message="simulated_cancellation",
+            )
+        try:
+            return await asyncio.to_thread(
+                self._clob_client.cancel_resting_order, intent
+            )
+        except ClobAdapterError as exc:
+            return CancelResult(
+                client_order_id=intent.client_order_id,
+                exchange_order_id=intent.exchange_order_id,
+                outcome=CancelOutcome.FAILED,
+                message=str(exc),
+            )
 
     async def cancel_all_open_orders(self) -> bool:
         """Cancel every known open order through the adapter."""
