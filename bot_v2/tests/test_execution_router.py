@@ -60,6 +60,9 @@ def live_config(*, cap: str = "1", max_position: str = "2") -> AppConfig:
             "max_single_position_size": max_position,
             "max_total_exposure": max_position,
             "min_top_of_book_liquidity": "1",
+            # These tests predate the edge gate and exercise router/sizing
+            # plumbing, not cost; the synthetic signal cannot clear cost.
+            "edge_gate_mode": "off",
         },
     )
 
@@ -293,7 +296,15 @@ async def test_signal_is_risked_against_its_own_book_not_the_callers() -> None:
 
     config = AppConfig(
         bot={"mode": Mode.DRY_RUN},
-        risk={"min_top_of_book_liquidity": "1", "max_entry_spread_bps": 600},
+        risk={
+            "min_top_of_book_liquidity": "1",
+            "max_entry_spread_bps": 600,
+            # This test targets the entry_spread check's own reason string
+            # specifically, to prove the *correct* book was risked; the edge
+            # gate would now refuse this same broken book first, masking the
+            # check under test, so it is disabled here.
+            "edge_gate_mode": "off",
+        },
     )
     state = InMemoryStateStore(mode=Mode.DRY_RUN)
     now = datetime.now(tz=UTC)

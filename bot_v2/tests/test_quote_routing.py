@@ -85,6 +85,12 @@ def mm_config() -> AppConfig:
             "max_total_exposure": "500",
             "max_open_orders": "10",
             "min_top_of_book_liquidity": "1",
+            # These tests predate the edge gate and are about cancel-before
+            # -replace quote routing, not cost. Maker-quote signals always
+            # carry observed_move_bps=0 (see strategies/market_maker.py),
+            # which the cost formula never clears -- see the report's
+            # concerns section.
+            "edge_gate_mode": "off",
         },
     )
 

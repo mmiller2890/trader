@@ -117,6 +117,10 @@ class DryRunLifecycleHarness:
             risk={
                 "min_top_of_book_liquidity": "1",
                 "duplicate_signal_window_seconds": 0,
+                # This harness predates the edge gate and is about position
+                # lifecycle (entries, exits, retries), not cost; its
+                # synthetic signals cannot clear cost.
+                "edge_gate_mode": "off",
             },
         )
         self.state = InMemoryStateStore(mode=Mode.DRY_RUN)

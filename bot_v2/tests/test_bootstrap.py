@@ -33,6 +33,10 @@ execution:
   allow_live_trading: false
 spike_strategy:
   target_token_ids: ["900", "901"]
+risk:
+  # These tests predate the edge gate and exercise wiring/discovery/routing
+  # plumbing, not cost; their synthetic signals cannot clear cost.
+  edge_gate_mode: "off"
 """.strip(),
         encoding="utf-8",
     )

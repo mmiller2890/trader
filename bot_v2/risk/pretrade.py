@@ -11,6 +11,7 @@ from models.market import MarketSnapshot
 from models.operations import OperationalState
 from models.risk import RiskAction, RiskCheckResult, RiskDecision
 from models.signal import TradeSignal
+from risk.edge import EdgeDecision, assess_edge
 from risk.policy import PreTradeRiskPolicy
 from state.store import InMemoryStateStore
 
@@ -74,6 +75,7 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
             )
         )
         checks.append(self._slippage_check(signal, snapshot, proposed_price))
+        checks.append(self._edge_gate_check(signal, snapshot, proposed_price))
         checks.append(self._entry_spread_check(signal, snapshot))
 
         failed = [check for check in checks if not check.passed]
@@ -441,4 +443,56 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
             check_name="slippage",
             passed=passed,
             reason="slippage_within_limit" if passed else f"slippage_limit:{slippage_bps:.2f}>{self._config.risk.max_slippage_bps:.2f}",
+        )
+
+    def _edge_gate_check(
+        self,
+        signal: TradeSignal,
+        snapshot: MarketSnapshot | None,
+        proposed_price: Decimal,
+    ) -> RiskCheckResult:
+        """
+        Refuse signals whose expected edge cannot clear fees plus spread.
+
+        Shadow mode passes the check while still reporting what enforce mode
+        would have done, so the numbers accumulate without the gate starving
+        the fill data needed to calibrate it.
+        """
+
+        mode = self._config.risk.edge_gate_mode
+        if mode == "off":
+            return RiskCheckResult(
+                check_name="edge_gate", passed=True, reason="edge_gate_disabled"
+            )
+        if snapshot is None:
+            return RiskCheckResult(
+                check_name="edge_gate", passed=False, reason="market_snapshot_missing"
+            )
+        if snapshot.best_ask <= 0:
+            return RiskCheckResult(
+                check_name="edge_gate", passed=False, reason="edge_gate_book_one_sided"
+            )
+
+        spread_bps = (
+            (snapshot.best_ask - snapshot.best_bid) / snapshot.best_ask
+        ) * Decimal("10000")
+        assessment = assess_edge(
+            edge_bps=Decimal(str(signal.observed_move_bps)),
+            price=proposed_price,
+            spread_bps=spread_bps,
+            fee_rate=self._config.execution.fee_rate,
+            is_maker_entry=signal.is_maker_quote,
+            safety_margin_bps=self._config.risk.safety_margin_bps,
+        )
+        approved = assessment.decision is EdgeDecision.APPROVE
+        if mode == "shadow":
+            return RiskCheckResult(
+                check_name="edge_gate",
+                passed=True,
+                reason=f"shadow:{assessment.reason}",
+            )
+        return RiskCheckResult(
+            check_name="edge_gate",
+            passed=approved,
+            reason=assessment.reason,
         )

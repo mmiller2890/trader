@@ -216,6 +216,9 @@ async def test_total_exposure_is_marked_notional_not_raw_share_count() -> None:
         risk={
             "max_total_exposure": "51",
             "min_top_of_book_liquidity": "1",
+            # This test predates the edge gate and is about exposure
+            # accounting, not cost; the synthetic signal cannot clear cost.
+            "edge_gate_mode": "off",
         }
     )
     state = InMemoryStateStore(mode=Mode.DRY_RUN)
@@ -300,6 +303,9 @@ async def test_pretrade_allows_bounded_synthetic_short_in_backtest() -> None:
             "max_total_exposure": "10",
             "max_single_position_size": "5",
             "min_top_of_book_liquidity": "1",
+            # This test predates the edge gate and is about position sizing
+            # in backtest mode, not cost; the synthetic signal cannot clear cost.
+            "edge_gate_mode": "off",
         },
     )
     state = InMemoryStateStore(mode=Mode.BACKTEST)
@@ -323,6 +329,10 @@ async def test_pretrade_sell_reduces_total_marked_exposure() -> None:
             "max_total_exposure": "1",
             "max_single_position_size": "1",
             "min_top_of_book_liquidity": "1",
+            # This test predates the edge gate and is about exposure
+            # accounting on a sell, not cost; the synthetic signal cannot
+            # clear cost.
+            "edge_gate_mode": "off",
         }
     )
     state = InMemoryStateStore(mode=Mode.DRY_RUN)
@@ -365,7 +375,11 @@ def exit_signal(*, size: str) -> TradeSignal:
 
 @pytest.mark.asyncio
 async def test_reduce_only_sell_requires_exact_inventory() -> None:
-    config = AppConfig(risk={"min_top_of_book_liquidity": "1"})
+    # This test predates the edge gate and is about inventory accounting on a
+    # reduce-only sell, not cost; the synthetic exit signal cannot clear cost.
+    config = AppConfig(
+        risk={"min_top_of_book_liquidity": "1", "edge_gate_mode": "off"}
+    )
     state = InMemoryStateStore(mode=Mode.DRY_RUN)
     await state.set_position(
         Position(
@@ -466,7 +480,11 @@ def maker_quote(
 @pytest.mark.asyncio
 async def test_maker_quote_is_not_blocked_by_its_own_previous_quote() -> None:
     store = ready_state_store()
-    engine = risk_engine(store)
+    # This test predates the edge gate and is about duplicate_guard
+    # exemption, not cost; the synthetic maker quote carries no edge.
+    engine = PreTradeRiskEngine(
+        config=AppConfig(risk={"edge_gate_mode": "off"}), state_store=store
+    )
     first = maker_quote()
     await store.add_signal(first)
 
@@ -487,7 +505,11 @@ async def test_maker_quote_is_not_blocked_by_its_own_previous_quote() -> None:
 @pytest.mark.asyncio
 async def test_maker_quote_does_not_require_opposing_liquidity() -> None:
     store = ready_state_store()
-    engine = risk_engine(store)
+    # This test predates the edge gate and is about top_of_book_liquidity
+    # exemption, not cost; the synthetic maker quote carries no edge.
+    engine = PreTradeRiskEngine(
+        config=AppConfig(risk={"edge_gate_mode": "off"}), state_store=store
+    )
     empty_book = fresh_snapshot().model_copy(
         update={"top_ask_size": Decimal("0"), "top_bid_size": Decimal("0")}
     )
@@ -505,7 +527,11 @@ async def test_maker_quote_does_not_require_opposing_liquidity() -> None:
 @pytest.mark.asyncio
 async def test_maker_quote_is_exempt_from_taker_slippage() -> None:
     store = ready_state_store()
-    engine = risk_engine(store)
+    # This test predates the edge gate and is about slippage exemption, not
+    # cost; the synthetic maker quote carries no edge.
+    engine = PreTradeRiskEngine(
+        config=AppConfig(risk={"edge_gate_mode": "off"}), state_store=store
+    )
 
     decision = await engine.evaluate(
         signal=maker_quote(limit_price="0.30"),
@@ -688,7 +714,13 @@ async def test_a_book_too_wide_to_cross_is_refused() -> None:
     """
 
     store = ready_state_store()
-    engine = risk_engine(store)
+    # This test predates the edge gate and targets the entry_spread check's
+    # own reason string specifically; the edge gate would now refuse this
+    # same trade first (it also catches wide-spread cost), which masks the
+    # check under test, so it is disabled here.
+    engine = PreTradeRiskEngine(
+        config=AppConfig(risk={"edge_gate_mode": "off"}), state_store=store
+    )
 
     decision = await engine.evaluate(
         signal=make_signal(),
@@ -751,7 +783,11 @@ async def test_exits_are_never_blocked_by_a_wide_book() -> None:
 async def test_maker_quotes_are_exempt_from_the_spread_guard() -> None:
     # A wide book is exactly where resting a quote is worth most.
     store = ready_state_store()
-    engine = risk_engine(store)
+    # This test predates the edge gate and is about the entry_spread
+    # exemption, not cost; the synthetic maker quote carries no edge.
+    engine = PreTradeRiskEngine(
+        config=AppConfig(risk={"edge_gate_mode": "off"}), state_store=store
+    )
 
     decision = await engine.evaluate(
         signal=maker_quote(limit_price="0.40"),
@@ -781,3 +817,60 @@ async def test_spread_guard_can_be_disabled() -> None:
         check for check in decision.checks if check.check_name == "entry_spread"
     )
     assert spread.passed is True
+
+
+@pytest.mark.asyncio
+async def test_a_signal_that_cannot_clear_cost_is_refused() -> None:
+    store = ready_state_store()
+    engine = PreTradeRiskEngine(
+        config=AppConfig(risk={"edge_gate_mode": "enforce"}), state_store=store
+    )
+
+    decision = await engine.evaluate(
+        signal=make_signal(),
+        snapshot=fresh_snapshot(),
+        proposed_size=Decimal("1"),
+        proposed_price=Decimal("0.46"),
+    )
+
+    assert decision.approved is False
+    assert "edge" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_records_the_refusal_but_approves() -> None:
+    store = ready_state_store()
+    engine = PreTradeRiskEngine(
+        config=AppConfig(risk={"edge_gate_mode": "shadow"}), state_store=store
+    )
+
+    decision = await engine.evaluate(
+        signal=make_signal(),
+        snapshot=fresh_snapshot(),
+        proposed_size=Decimal("1"),
+        proposed_price=Decimal("0.46"),
+    )
+
+    gate = next(c for c in decision.checks if c.check_name == "edge_gate")
+    assert gate.passed is True
+    assert "shadow" in gate.reason
+    assert decision.approved is True
+
+
+@pytest.mark.asyncio
+async def test_the_gate_can_be_switched_off_entirely() -> None:
+    store = ready_state_store()
+    engine = PreTradeRiskEngine(
+        config=AppConfig(risk={"edge_gate_mode": "off"}), state_store=store
+    )
+
+    decision = await engine.evaluate(
+        signal=make_signal(),
+        snapshot=fresh_snapshot(),
+        proposed_size=Decimal("1"),
+        proposed_price=Decimal("0.46"),
+    )
+
+    gate = next(c for c in decision.checks if c.check_name == "edge_gate")
+    assert gate.passed is True
+    assert "disabled" in gate.reason

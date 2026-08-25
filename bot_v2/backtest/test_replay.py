@@ -109,6 +109,9 @@ async def test_backtest_fills_signals_and_marks_open_position() -> None:
     config = AppConfig(
         bot={"mode": Mode.BACKTEST},
         execution={"default_order_size": "5", "min_order_size": "1", "max_order_size": "25"},
+        # This test predates the edge gate and is about backtest fill/PnL
+        # mechanics, not cost; the synthetic signal cannot clear cost.
+        risk={"edge_gate_mode": "off"},
     )
     engine = BacktestEngine(config=config)
 
@@ -152,7 +155,9 @@ async def test_backtest_records_a_risk_rejection_without_a_fill() -> None:
 @pytest.mark.asyncio
 async def test_backtest_realizes_pnl_when_a_position_is_closed() -> None:
     started_at = datetime(2025, 1, 1, tzinfo=UTC)
-    config = AppConfig(bot={"mode": Mode.BACKTEST})
+    # This test predates the edge gate and is about realized-PnL accounting,
+    # not cost; the synthetic signal cannot clear cost.
+    config = AppConfig(bot={"mode": Mode.BACKTEST}, risk={"edge_gate_mode": "off"})
     engine = BacktestEngine(config=config)
 
     result = await engine.run(
@@ -200,7 +205,11 @@ async def test_backtest_uses_snapshot_time_for_strategy_cooldown_and_duplicate_r
 @pytest.mark.asyncio
 async def test_backtest_processes_unsorted_snapshots_in_historical_order() -> None:
     started_at = datetime(2025, 1, 1, tzinfo=UTC)
-    engine = BacktestEngine(config=AppConfig(bot={"mode": Mode.BACKTEST}))
+    # This test predates the edge gate and is about historical-order
+    # processing, not cost; the synthetic signal cannot clear cost.
+    engine = BacktestEngine(
+        config=AppConfig(bot={"mode": Mode.BACKTEST}, risk={"edge_gate_mode": "off"})
+    )
 
     result = await engine.run(
         strategy=BuyOnceStrategy(),
@@ -256,7 +265,14 @@ async def test_backtest_consumes_depth_and_records_partial_fill_and_fees() -> No
         bot={"mode": Mode.BACKTEST},
         execution={"default_order_size": "5", "max_slippage_bps": 300, "time_in_force": "IOC"},
         backtest={"starting_cash": "100", "fee_rate": "0.07"},
-        risk={"min_top_of_book_liquidity": "1", "max_slippage_bps": 100},
+        risk={
+            "min_top_of_book_liquidity": "1",
+            "max_slippage_bps": 100,
+            # This test predates the edge gate and is about depth
+            # consumption, partial fills, and fee accounting, not the gate;
+            # the synthetic signal cannot clear cost.
+            "edge_gate_mode": "off",
+        },
     )
     engine = BacktestEngine(config=config)
     result = await engine.run_events(
@@ -317,7 +333,11 @@ async def test_legacy_snapshots_assign_sequence_after_source_ordering() -> None:
     earlier = snapshot(price="0.50", at=received).model_copy(
         update={"source_ts": received + timedelta(seconds=1)}
     )
-    engine = BacktestEngine(config=AppConfig(bot={"mode": Mode.BACKTEST}))
+    # This test predates the edge gate and is about source-ts ordering, not
+    # cost; the synthetic signal cannot clear cost.
+    engine = BacktestEngine(
+        config=AppConfig(bot={"mode": Mode.BACKTEST}, risk={"edge_gate_mode": "off"})
+    )
     result = await engine.run(
         strategy=FixedIdBuyOnceStrategy(),
         snapshots=[later, earlier],
@@ -454,7 +474,14 @@ async def test_book_delta_changes_next_strategy_snapshot_and_fill_depth() -> Non
         bot={"mode": Mode.BACKTEST},
         execution={"default_order_size": "5", "max_slippage_bps": 500},
         backtest={"starting_cash": "100"},
-        risk={"min_top_of_book_liquidity": "1", "duplicate_signal_window_seconds": 0},
+        risk={
+            "min_top_of_book_liquidity": "1",
+            "duplicate_signal_window_seconds": 0,
+            # This test predates the edge gate and is about book-delta
+            # application and fill depth, not cost; the synthetic signal
+            # cannot clear cost.
+            "edge_gate_mode": "off",
+        },
     )
     engine = BacktestEngine(config=config)
     result = await engine.run_events(
@@ -502,7 +529,13 @@ async def test_synthetic_short_reserves_collateral() -> None:
         bot={"mode": Mode.BACKTEST},
         execution={"default_order_size": "5"},
         backtest={"starting_cash": "10", "fee_rate": "0"},
-        risk={"min_top_of_book_liquidity": "1"},
+        risk={
+            "min_top_of_book_liquidity": "1",
+            # This test predates the edge gate and is about short-position
+            # collateral reservation, not cost; the synthetic signal cannot
+            # clear cost.
+            "edge_gate_mode": "off",
+        },
     )
     engine = BacktestEngine(config=config)
     events = [
