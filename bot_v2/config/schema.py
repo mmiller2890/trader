@@ -111,6 +111,7 @@ class ExecutionConfig(BaseModel):
     max_live_order_notional: Decimal = Field(default=Decimal("1"), gt=Decimal("0"))
     default_tick_size: Decimal = Field(default=Decimal("0.01"), gt=Decimal("0"))
     post_only_maker_quotes: bool = True
+    fee_rate: Decimal = Field(default=DEFAULT_FEE_RATE, ge=Decimal("0"), le=Decimal("1"))
 
     @model_validator(mode="after")
     def validate_order_size_bounds(self) -> Self:

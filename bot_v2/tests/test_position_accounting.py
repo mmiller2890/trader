@@ -291,3 +291,76 @@ async def test_checkpoint_and_lifecycle_accessors_round_trip() -> None:
     await restored.restore_position_lifecycle(lifecycles[0])
     assert await restored.get_fill_checkpoints() == checkpoints
     assert await restored.get_position_lifecycles() == lifecycles
+
+
+@pytest.mark.asyncio
+async def test_realised_pnl_is_net_of_taker_fees() -> None:
+    """A round trip that looks flat gross is a loss once fees are charged."""
+
+    from decimal import Decimal
+
+    from config.schema import Mode
+    from models.order import OrderResult, OrderSide, OrderStatus
+    from state.store import InMemoryStateStore
+
+    store = InMemoryStateStore(mode=Mode.DRY_RUN, fee_rate=Decimal("0.07"))
+    now = datetime.now(tz=UTC)
+
+    buy = OrderResult(
+        client_order_id="fee-buy-000001",
+        market_id="m1", token_id="t1", side=OrderSide.BUY,
+        status=OrderStatus.FILLED, accepted=True,
+        requested_size=Decimal("100"), filled_size=Decimal("100"),
+        avg_fill_price=Decimal("0.50"),
+    )
+    await store.apply_confirmed_fill(
+        buy, market_end_at=None, confirmed_at=now, confirmation_grace_seconds=30
+    )
+
+    sell = OrderResult(
+        client_order_id="fee-sell-00001",
+        market_id="m1", token_id="t1", side=OrderSide.SELL,
+        status=OrderStatus.FILLED, accepted=True,
+        requested_size=Decimal("100"), filled_size=Decimal("100"),
+        avg_fill_price=Decimal("0.50"),
+    )
+    await store.apply_confirmed_fill(
+        sell, market_end_at=None, confirmed_at=now, confirmation_grace_seconds=30
+    )
+
+    # The round trip sells the position back to zero, which closes it (see
+    # test_sell_to_zero_closes_position_and_retains_close_record) — so the
+    # realised P&L is read off the closed lifecycle, not an active position.
+    lifecycle = await store.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    # Flat on price, but two taker fills at 0.50 cost 1.75 each.
+    assert lifecycle.closed_realized_pnl == Decimal("-3.5000")
+
+
+@pytest.mark.asyncio
+async def test_maker_fills_are_charged_nothing() -> None:
+    from decimal import Decimal
+
+    from config.schema import Mode
+    from models.order import OrderResult, OrderSide, OrderStatus
+    from state.store import InMemoryStateStore
+
+    store = InMemoryStateStore(mode=Mode.DRY_RUN, fee_rate=Decimal("0.07"))
+    now = datetime.now(tz=UTC)
+
+    for side, cid in ((OrderSide.BUY, "mk-buy-0000001"), (OrderSide.SELL, "mk-sell-000001")):
+        await store.apply_confirmed_fill(
+            OrderResult(
+                client_order_id=cid,
+                market_id="m1", token_id="t1", side=side,
+                status=OrderStatus.FILLED, accepted=True,
+                requested_size=Decimal("100"), filled_size=Decimal("100"),
+                avg_fill_price=Decimal("0.50"), liquidity="maker",
+            ),
+            market_end_at=None, confirmed_at=now, confirmation_grace_seconds=30,
+        )
+
+    # As above, the round trip closes the position, so check the lifecycle.
+    lifecycle = await store.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    assert lifecycle.closed_realized_pnl == Decimal("0")

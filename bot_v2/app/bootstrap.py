@@ -272,6 +272,7 @@ async def bootstrap_app(
     state_store = InMemoryStateStore(
         mode=config.bot.mode,
         kill_switch_active=config.bot.kill_switch_on_startup,
+        fee_rate=config.execution.fee_rate,
     )
     await snapshots.restore_into_state(
         state_store,

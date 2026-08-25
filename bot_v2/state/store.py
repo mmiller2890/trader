@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from config.schema import Mode
+from models.fees import maker_fee, taker_fee
 from models.market import MarketSnapshot, OrderBookUpdate
 from models.order import OrderResult, OrderSide, OrderStatus
 from models.position import (
@@ -40,12 +41,19 @@ class PositionAccountingError(RuntimeError):
 class InMemoryStateStore:
     """Holds runtime state for strategy/risk/execution components."""
 
-    def __init__(self, *, mode: Mode, kill_switch_active: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        mode: Mode,
+        kill_switch_active: bool = False,
+        fee_rate: Decimal = Decimal("0"),
+    ) -> None:
         self._mode = mode
         self._kill_switch_active = kill_switch_active
         self._kill_switch_reason = (
             "kill_switch_on_startup" if kill_switch_active else None
         )
+        self._fee_rate = fee_rate
         self._lock = asyncio.Lock()
 
         self._orderbooks: dict[MarketTokenKey, OrderBookUpdate] = {}
@@ -440,6 +448,16 @@ class InMemoryStateStore:
         realized_pnl = existing.realized_pnl if existing is not None else Decimal("0")
         delta_price = delta_notional / delta_size
 
+        # The exchange charges a fee on every fill, not just reducing ones. An
+        # opening (BUY) fill produces no gross realised P&L of its own, but the
+        # fee it incurs is a real, immediate cost, so it is charged straight
+        # into realized_pnl on both sides rather than silently dropped.
+        fee = (
+            maker_fee(delta_size, result.avg_fill_price, self._fee_rate)
+            if result.liquidity == "maker"
+            else taker_fee(delta_size, result.avg_fill_price, self._fee_rate)
+        )
+
         if result.side == OrderSide.BUY:
             new_quantity = quantity + delta_size
             new_entry_price = (
@@ -447,14 +465,14 @@ class InMemoryStateStore:
                 if new_quantity != 0
                 else Decimal("0")
             )
-            new_realized = realized_pnl
-            realized_delta = Decimal("0")
+            realized_delta = -fee
+            new_realized = realized_pnl + realized_delta
         else:
             if delta_size > quantity:
                 raise PositionAccountingError("sell_exceeds_inventory")
             new_quantity = quantity - delta_size
             new_entry_price = entry_price if new_quantity != 0 else Decimal("0")
-            realized_delta = (delta_price - entry_price) * delta_size
+            realized_delta = (delta_price - entry_price) * delta_size - fee
             new_realized = realized_pnl + realized_delta
 
         position = Position(

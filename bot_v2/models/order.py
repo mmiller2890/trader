@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -81,6 +82,7 @@ class OrderResult(BaseModel):
     requested_size: Decimal = Field(gt=Decimal("0"))
     filled_size: Decimal = Field(default=Decimal("0"), ge=Decimal("0"))
     avg_fill_price: Decimal | None = Field(default=None, gt=Decimal("0"), le=Decimal("1"))
+    liquidity: Literal["taker", "maker"] = "taker"
     latency_ms: int | None = Field(default=None, ge=0)
     created_at: datetime = Field(default_factory=utc_now)
 
