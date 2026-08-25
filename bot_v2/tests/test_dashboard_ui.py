@@ -106,3 +106,45 @@ async def test_dashboard_javascript_renders_managed_positions_safely() -> None:
     assert "state.closed_positions" in javascript.text
     assert "replaceChildren" in javascript.text
     assert "innerHTML" not in javascript.text
+
+
+@pytest.mark.asyncio
+async def test_dashboard_page_has_operations_health_regions() -> None:
+    app = create_app(controller=object(), operator_token="ui-test-token")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/")
+
+    assert response.status_code == 200
+    page = response.text
+    for region in (
+        'id="ops-state-badge"',
+        'id="ops-telegram-backlog"',
+        'id="ops-rest-fallback"',
+        'id="ops-lease-warning"',
+        'id="ops-task-health-body"',
+    ):
+        assert region in page
+
+
+@pytest.mark.asyncio
+async def test_dashboard_javascript_renders_operational_health_safely() -> None:
+    app = create_app(controller=object(), operator_token="ui-test-token")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        javascript = await client.get("/static/dashboard.js")
+
+    assert javascript.status_code == 200
+    for reference in (
+        "state.task_health",
+        "state.market_data_source",
+        "state.outbox_pending",
+        "state.lease_remaining_seconds",
+        "Running",
+        "Degraded",
+        "Halted",
+        "Telegram backlog",
+        "REST fallback",
+    ):
+        assert reference in javascript.text
+    assert "innerHTML" not in javascript.text

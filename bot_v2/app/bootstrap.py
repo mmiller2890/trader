@@ -34,6 +34,7 @@ from notifications.outbox import (
     TelegramTransport,
 )
 from persistence.db import KeyValueSqliteStore
+from persistence.health import HealthSnapshotStore
 from persistence.journal import JsonlJournal
 from persistence.operations import OperationsRepository
 from persistence.retention import RetentionManager
@@ -127,6 +128,7 @@ class AppServices:
     alert_service: AlertService
     notification_worker: NotificationWorker
     retention_manager: RetentionManager
+    health_store: HealthSnapshotStore
     reconciliation: ReconciliationService
     market_rotator: Btc15mMarketRotator | None = None
 
@@ -341,6 +343,7 @@ async def bootstrap_app(
             config.notifications.delivered_outbox_retention_days
         ),
     )
+    health_store = HealthSnapshotStore(data_dir / "health" / "runtime.json")
 
     async def emit_event(event: BotEvent) -> None:
         await journal.append(event)
@@ -488,6 +491,7 @@ async def bootstrap_app(
             alert_service=alert_service,
             notification_worker=notification_worker,
             retention_manager=retention_manager,
+            health_store=health_store,
             reconciliation=reconciliation,
             market_rotator=market_rotator,
         )

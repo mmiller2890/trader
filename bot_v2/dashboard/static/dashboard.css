@@ -148,6 +148,37 @@ h2 { margin-bottom: 0; font-size: 1.05rem; letter-spacing: -0.015em; }
   background: var(--surface);
   font: 650 0.72rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
+.count-pill-warn {
+  border-color: rgb(214 158 46 / 65%);
+  color: #e8b45a;
+}
+.count-pill-bad {
+  border-color: rgb(196 74 64 / 75%);
+  color: #e0705f;
+}
+
+.ops-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 16px;
+}
+.ops-badge {
+  padding: 7px 12px;
+  border-radius: 999px;
+  font: 700 0.74rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.04em;
+}
+.ops-badge-running { background: rgb(38 102 84 / 30%); color: #6fd3a8; }
+.ops-badge-degraded,
+.ops-badge-starting,
+.ops-badge-stopping { background: rgb(122 92 28 / 32%); color: #e8b45a; }
+.ops-badge-halted,
+.ops-badge-halting,
+.ops-badge-failed { background: rgb(120 40 34 / 34%); color: #ef8271; }
+.ops-badge-stopped,
+.ops-badge-unknown { background: var(--surface); color: var(--muted); }
 
 .control-grid { flex-wrap: wrap; gap: 10px; }
 .button {

@@ -267,6 +267,7 @@ class BotRuntime:
 
     def _default_loop_specs(self, services: Any) -> list[TaskSpec]:
         from app.loops import (
+            health_report_loop,
             notification_delivery_loop,
             position_exit_loop,
             reconciliation_loop,
@@ -308,6 +309,19 @@ class BotRuntime:
                 svc, stop, lambda: asyncio.sleep(0), reporter
             ),
         }
+
+        async def health_report_with_runtime(
+            stop_event: asyncio.Event, heartbeat: Any
+        ) -> None:
+            await health_report_loop(
+                services,
+                stop_event,
+                heartbeat,
+                reporter,
+                runtime=self,
+            )
+
+        factories["health-report-loop"] = health_report_with_runtime
         if self._loop_factories is not None:
             factories = dict(self._loop_factories)
         specs: list[TaskSpec] = []

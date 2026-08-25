@@ -114,6 +114,18 @@
           <span id="websocket-state" class="count-pill">WebSocket —</span>
         </div>
         <div id="heartbeat-grid" class="metric-grid"></div>
+        <div class="ops-strip" aria-label="Unattended operations status">
+          <span id="ops-state-badge" class="ops-badge ops-badge-unknown">—</span>
+          <span id="ops-rest-fallback" class="count-pill">REST fallback off</span>
+          <span id="ops-telegram-backlog" class="count-pill">Telegram backlog 0</span>
+          <span id="ops-lease-warning" class="count-pill" hidden></span>
+        </div>
+        <table class="data-table" aria-label="Supervised task health">
+          <thead>
+            <tr><th>Task</th><th>Status</th><th>Restarts</th><th>Failures</th></tr>
+          </thead>
+          <tbody id="ops-task-health-body"></tbody>
+        </table>
       </section>
 
       <section id="market-rotation-panel" class="panel panel-wide" aria-labelledby="market-rotation-title">

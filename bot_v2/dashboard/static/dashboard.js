@@ -88,6 +88,80 @@
     grid.replaceChildren(...cards);
   };
 
+  const renderOperationalHealth = (state) => {
+    const badge = byId("ops-state-badge");
+    const phase = state.runtime.phase;
+    const labels = {
+      running: "Running",
+      degraded: "Degraded",
+      halting: "Halting",
+      halted: "Halted",
+      failed: "Failed",
+      starting: "Starting",
+      stopping: "Stopping",
+      stopped: "Stopped",
+    };
+    badge.textContent = `${labels[phase] || phase} · ${state.market_data_source || "unavailable"}`;
+    badge.className = `ops-badge ops-badge-${phase || "unknown"}`;
+
+    const fallback = byId("ops-rest-fallback");
+    const onFallback = state.market_data_source === "rest_fallback";
+    fallback.textContent = onFallback ? "REST fallback active" : "REST fallback off";
+    fallback.classList.toggle("count-pill-warn", onFallback);
+
+    const backlog = byId("ops-telegram-backlog");
+    const pending = Number(state.outbox_pending || 0);
+    backlog.textContent = `Telegram backlog ${pending}`;
+    const oldestAge = state.oldest_outbox_age_seconds;
+    backlog.classList.toggle(
+      "count-pill-warn",
+      pending > 0 && oldestAge !== null && oldestAge >= 120,
+    );
+
+    const leaseWarning = byId("ops-lease-warning");
+    const remaining = state.lease_remaining_seconds;
+    if (remaining !== null && remaining !== undefined) {
+      leaseWarning.hidden = false;
+      const hours = remaining / 3600;
+      leaseWarning.textContent = hours <= 1
+        ? "Lease expiring within 1 hour"
+        : hours <= 24
+          ? `Lease expiring in ${Math.floor(hours)}h`
+          : `Lease ${Math.floor(hours)}h remaining`;
+      leaseWarning.classList.toggle("count-pill-warn", hours <= 24);
+      leaseWarning.classList.toggle("count-pill-bad", hours <= 1);
+    } else {
+      leaseWarning.hidden = true;
+      leaseWarning.textContent = "";
+    }
+
+    const body = byId("ops-task-health-body");
+    const tasks = Array.isArray(state.task_health) ? state.task_health : [];
+    const rows = tasks.map((task) => {
+      const row = document.createElement("tr");
+      const name = document.createElement("td");
+      name.textContent = task.name;
+      const statusCell = document.createElement("td");
+      statusCell.textContent = task.running ? "healthy" : "down";
+      statusCell.className = task.running ? "positive" : "negative";
+      const restarts = document.createElement("td");
+      restarts.textContent = String(task.restart_count ?? 0);
+      const failures = document.createElement("td");
+      failures.textContent = String(task.consecutive_failures ?? 0);
+      row.append(name, statusCell, restarts, failures);
+      return row;
+    });
+    if (!rows.length) {
+      const row = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.colSpan = 4;
+      cell.textContent = "No supervised tasks reported.";
+      row.append(cell);
+      rows.push(row);
+    }
+    body.replaceChildren(...rows);
+  };
+
   const renderReadiness = (items) => {
     const list = byId("readiness-list");
     const rows = items.map((item) => {
@@ -369,6 +443,7 @@
     connection.append(dot, label);
 
     renderHeartbeats(state.heartbeats);
+    renderOperationalHealth(state);
     renderMarketRotation(state.market_rotation);
     renderReadiness(state.readiness);
     renderOrders(state.open_orders);

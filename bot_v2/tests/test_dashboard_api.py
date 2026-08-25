@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from app.runtime import ControlResult, RuntimePhase, RuntimeStatus
@@ -10,6 +12,8 @@ from config.schema import AppConfig, Mode
 from dashboard.app import create_app
 from dashboard.config_editor import EditableConfig
 from dashboard.models import DashboardState, EventTail, PreflightView
+from models.operations import OperationalState
+from persistence.health import RuntimeHealthSnapshot
 
 
 class ApiController:
@@ -248,3 +252,117 @@ def test_dashboard_main_rejects_non_loopback_host() -> None:
     assert browser_origin("::1", 8000) == "http://[::1]:8000"
     with pytest.raises(ValueError, match="loopback"):
         validate_host("0.0.0.0")
+
+
+# --- health endpoints --------------------------------------------------------
+
+
+def make_health_snapshot(**overrides: object) -> RuntimeHealthSnapshot:
+    values: dict[str, object] = {
+        "process_live": True,
+        "service_ready": True,
+        "trading_ready": True,
+        "state": OperationalState.RUNNING,
+        "reason": None,
+        "tasks": [],
+        "websocket": {
+            "connected": True,
+            "task_running": True,
+            "last_heartbeat": None,
+            "disconnected_since": None,
+            "connection_attempts": 0,
+            "last_error": None,
+        },
+        "market_data_source": "websocket",
+        "last_reconciliation_at": None,
+        "outbox_pending": 0,
+        "oldest_outbox_age_seconds": None,
+        "disk_percent": 30.0,
+        "lease_expires_at": None,
+        "updated_at": datetime.now(tz=UTC),
+    }
+    values.update(overrides)
+    return RuntimeHealthSnapshot(**values)
+
+
+class FakeHealthStore:
+    def __init__(self, snapshot: RuntimeHealthSnapshot | None) -> None:
+        self.snapshot = snapshot
+
+    async def load(self) -> RuntimeHealthSnapshot | None:
+        return self.snapshot
+
+
+def health_app(
+    snapshot: RuntimeHealthSnapshot | None,
+) -> FastAPI:
+    controller = ApiController()
+    return create_app(
+        controller=controller,
+        operator_token="test-token",
+        trusted_origins={"http://127.0.0.1:8000"},
+        health_store=FakeHealthStore(snapshot),
+    )
+
+
+@pytest.mark.asyncio
+async def test_health_endpoints_distinguish_liveness_readiness_trading() -> None:
+    app = health_app(
+        make_health_snapshot(
+            state=OperationalState.DEGRADED,
+            reason="authoritative_state_stale",
+            service_ready=True,
+            trading_ready=False,
+            outbox_pending=4,
+        )
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        live = await client.get("/api/health/live")
+        ready = await client.get("/api/health/ready")
+        trading = await client.get("/api/health/trading")
+
+    assert live.status_code == 200
+    assert live.json()["ok"] is True
+    assert live.json()["state"] == "degraded"
+    assert ready.status_code == 200
+    assert ready.json()["ok"] is True
+    assert trading.json()["ok"] is False
+    assert trading.json()["reason"] == "authoritative_state_stale"
+
+
+@pytest.mark.asyncio
+async def test_health_endpoints_return_200_with_ok_false_when_unhealthy() -> None:
+    app = health_app(
+        make_health_snapshot(
+            process_live=False,
+            service_ready=False,
+            trading_ready=False,
+            state=OperationalState.FAILED,
+            reason="supervisor_fatal",
+        )
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        for path in ("/api/health/live", "/api/health/ready", "/api/health/trading"):
+            response = await client.get(path)
+            assert response.status_code == 200
+            assert response.json()["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_health_endpoints_derive_answers_without_health_file() -> None:
+    app = health_app(None)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        live = await client.get("/api/health/live")
+        ready = await client.get("/api/health/ready")
+
+    assert live.json()["ok"] is True
+    assert live.json()["state"] == "stopped"
+    assert ready.json()["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_health_endpoints_never_expose_operator_token() -> None:
+    app = health_app(make_health_snapshot())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        response = await client.get("/api/health/live")
+    assert "test-token" not in response.text

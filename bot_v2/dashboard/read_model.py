@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from app.runtime import BotRuntime
+from clients.ws_client import WebSocketHealth
 from config.schema import AppConfig
 from dashboard.models import (
     ClosedPositionView,
@@ -20,7 +21,9 @@ from dashboard.models import (
     ReadinessItem,
 )
 from models.events import BotEvent
+from models.operations import OperationalState, TaskHealth
 from models.position import Position, PositionLifecycle
+from persistence.health import HealthSnapshotStore, RuntimeHealthSnapshot
 from persistence.snapshots import SnapshotStore
 from portfolio.exposure import total_marked_exposure
 
@@ -90,6 +93,14 @@ class DashboardReadModel:
         services = self._runtime.services
         source = "live" if services is not None else "historical"
         warnings: list[str] = []
+        task_health: list[TaskHealth] = []
+        market_data_source: str = "unavailable"
+        outbox_pending = 0
+        oldest_outbox_age_seconds: float | None = None
+        disk_percent = 0.0
+        lease_expires_at: datetime | None = None
+        last_reconciliation_at: datetime | None = None
+        auto_resume_eligible = False
 
         if services is not None:
             state = services.state_store
@@ -103,11 +114,60 @@ class DashboardReadModel:
             closed_lifecycles = await state.get_closed_position_lifecycles()
             realized_pnl_by_day = await state.get_realized_pnl_by_day()
             ws_manager = getattr(services, "ws_manager", None)
+            ws_health: WebSocketHealth | None = None
+            if ws_manager is not None and hasattr(ws_manager, "health"):
+                try:
+                    ws_health = ws_manager.health()
+                except Exception:
+                    ws_health = None
             websocket_connected = bool(
-                ws_manager is not None
-                and getattr(ws_manager, "is_connected", False)
+                getattr(ws_health, "connected", False)
+                or (
+                    ws_manager is not None
+                    and not hasattr(ws_manager, "health")
+                    and getattr(ws_manager, "is_connected", False)
+                )
             )
+            supervisor = getattr(self._runtime, "_supervisor", None)
+            if supervisor is not None and hasattr(supervisor, "health"):
+                try:
+                    task_health = list(await supervisor.health())
+                except Exception:
+                    task_health = []
+            repository = getattr(services, "operations_repository", None)
+            if repository is not None:
+                try:
+                    outbox_pending, oldest_outbox_age_seconds = (
+                        await repository.outbox_stats(now=self._now())
+                    )
+                    lease = await repository.get_active_lease()
+                    lease_expires_at = lease.expires_at if lease else None
+                except Exception:
+                    outbox_pending = 0
+                    oldest_outbox_age_seconds = None
+                    lease_expires_at = None
+            reconciliation_ts = await state.get_heartbeat("reconciliation")
+            if reconciliation_ts is None:
+                reconciliation_ts = await state.get_heartbeat("app")
+            last_reconciliation_at = reconciliation_ts
+            if websocket_connected:
+                market_data_source = "websocket"
+            else:
+                market_data_source = await self._live_fallback_source(state)
         else:
+            historical = await self._load_historical_health()
+            open_orders, positions, balances, heartbeats = [], [], [], {}
+            kill_switch, kill_switch_reason = False, None
+            lifecycles, closed_lifecycles, realized_pnl_by_day = [], [], {}
+            websocket_connected = False
+            if historical is not None:
+                task_health = list(historical.tasks)
+                market_data_source = historical.market_data_source
+                outbox_pending = historical.outbox_pending
+                oldest_outbox_age_seconds = historical.oldest_outbox_age_seconds
+                disk_percent = historical.disk_percent
+                lease_expires_at = historical.lease_expires_at
+                last_reconciliation_at = historical.last_reconciliation_at
             try:
                 snapshot = await SnapshotStore(
                     self._data_dir / "snapshots" / "state.json"
@@ -115,18 +175,16 @@ class DashboardReadModel:
             except Exception:
                 snapshot = None
                 warnings.append("snapshot_unreadable")
-            open_orders = snapshot.open_orders if snapshot else []
-            positions = snapshot.positions if snapshot else []
-            balances = snapshot.balances if snapshot else []
-            heartbeats = snapshot.heartbeats if snapshot else {}
-            kill_switch = snapshot.kill_switch_active if snapshot else False
-            kill_switch_reason = snapshot.kill_switch_reason if snapshot else None
-            lifecycles = snapshot.position_lifecycles if snapshot else []
-            closed_lifecycles = (
-                snapshot.closed_position_lifecycles if snapshot else []
-            )
-            realized_pnl_by_day = snapshot.realized_pnl_by_day if snapshot else {}
-            websocket_connected = False
+            if snapshot is not None:
+                open_orders = snapshot.open_orders
+                positions = snapshot.positions
+                balances = snapshot.balances
+                heartbeats = snapshot.heartbeats
+                kill_switch = snapshot.kill_switch_active
+                kill_switch_reason = snapshot.kill_switch_reason
+                lifecycles = snapshot.position_lifecycles
+                closed_lifecycles = snapshot.closed_position_lifecycles
+                realized_pnl_by_day = snapshot.realized_pnl_by_day
 
         now = self._now()
         managed_positions, closed_positions = self._build_position_views(
@@ -279,6 +337,11 @@ class DashboardReadModel:
             (position.unrealized_pnl for position in positions),
             start=Decimal("0"),
         )
+        lease_remaining_seconds = (
+            max(0.0, (lease_expires_at - now).total_seconds())
+            if lease_expires_at is not None
+            else None
+        )
         return DashboardState(
             source=source,
             runtime=self._runtime.status(),
@@ -300,7 +363,44 @@ class DashboardReadModel:
             total_pnl=total_pnl,
             readiness=readiness,
             warnings=warnings,
+            task_health=task_health,
+            market_data_source=market_data_source,
+            last_reconciliation_at=last_reconciliation_at,
+            outbox_pending=outbox_pending,
+            oldest_outbox_age_seconds=oldest_outbox_age_seconds,
+            disk_percent=disk_percent,
+            lease_expires_at=lease_expires_at,
+            lease_remaining_seconds=lease_remaining_seconds,
+            auto_resume_eligible=auto_resume_eligible,
         )
+
+    def _fallback_source(self) -> str:
+        return "unavailable"
+
+    async def _live_fallback_source(
+        self, state: InMemoryStateStore
+    ) -> str:
+        try:
+            stale_after = self._config.market_data.stale_after_seconds
+            now = self._now()
+            for key in await state.copy_snapshot_keys():
+                snapshot = await state.get_market_snapshot(*key)
+                if snapshot is None:
+                    continue
+                age = (now - snapshot.received_ts).total_seconds()
+                if 0 <= age <= stale_after:
+                    return "rest_fallback"
+        except Exception:
+            return "unavailable"
+        return "unavailable"
+
+    async def _load_historical_health(self) -> RuntimeHealthSnapshot | None:
+        try:
+            return await HealthSnapshotStore(
+                self._data_dir / "health" / "runtime.json"
+            ).load()
+        except Exception:
+            return None
 
     def _build_position_views(
         self,

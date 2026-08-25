@@ -22,6 +22,9 @@ from dashboard.controller import (
     DashboardController,
     PreflightBusyError,
 )
+from datetime import UTC, datetime
+from models.operations import OperationalState
+from persistence.health import HealthAnswer, HealthSnapshotStore
 
 
 class ConfirmationRequest(BaseModel):
@@ -48,6 +51,7 @@ def create_app(
     controller: DashboardController,
     operator_token: str | None = None,
     trusted_origins: set[str] | None = None,
+    health_store: HealthSnapshotStore | None = None,
 ) -> FastAPI:
     """Create one dashboard app with a per-process mutation token."""
 
@@ -105,6 +109,55 @@ def create_app(
     @app.get("/api/state")
     async def state():  # type: ignore[no-untyped-def]
         return await controller.state()
+
+    def _fallback_answer_sync(kind: str, phase: OperationalState) -> HealthAnswer:
+        ok_by_kind = {
+            "live": True,
+            "ready": False,
+            "trading": phase == OperationalState.RUNNING,
+        }
+        reason_by_kind = {
+            "live": "process_serving",
+            "ready": "health_snapshot_unavailable",
+            "trading": "trading_state_unknown",
+        }
+        return HealthAnswer(
+            ok=ok_by_kind[kind],
+            state=phase,
+            reason=reason_by_kind[kind],
+            generated_at=datetime.now(tz=UTC),
+        )
+
+    async def _health_answer(kind: str, ok_field: str) -> HealthAnswer:
+        if health_store is not None:
+            snapshot = await health_store.load()
+        else:
+            snapshot = None
+        if snapshot is None:
+            try:
+                current = await controller.state()
+                phase = OperationalState(current.runtime.phase.value)
+            except Exception:
+                phase = OperationalState.STOPPED
+            return _fallback_answer_sync(kind, phase)
+        return HealthAnswer(
+            ok=bool(getattr(snapshot, ok_field)),
+            state=snapshot.state,
+            reason=snapshot.reason or "healthy",
+            generated_at=datetime.now(tz=UTC),
+        )
+
+    @app.get("/api/health/live")
+    async def health_live():  # type: ignore[no-untyped-def]
+        return await _health_answer("live", "process_live")
+
+    @app.get("/api/health/ready")
+    async def health_ready():  # type: ignore[no-untyped-def]
+        return await _health_answer("ready", "service_ready")
+
+    @app.get("/api/health/trading")
+    async def health_trading():  # type: ignore[no-untyped-def]
+        return await _health_answer("trading", "trading_ready")
 
     @app.get("/api/events")
     async def events(limit: int = Query(default=100, ge=1, le=100)):  # type: ignore[no-untyped-def]

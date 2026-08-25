@@ -12,6 +12,7 @@ from app.runtime import RuntimeStatus
 from clients.market_rotation import MarketRotationState
 from config.schema import Mode
 from models.events import BotEvent
+from models.operations import TaskHealth
 from models.order import OrderResult
 from models.position import Balance, ExitReason, Position, PositionLifecycle
 
@@ -158,3 +159,15 @@ class DashboardState(BaseModel):
     total_pnl: Decimal = Decimal("0")
     readiness: list[ReadinessItem] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    task_health: list[TaskHealth] = Field(default_factory=list)
+    market_data_source: Literal["websocket", "rest_fallback", "unavailable"] = (
+        "unavailable"
+    )
+    last_reconciliation_at: datetime | None = None
+    outbox_pending: int = 0
+    oldest_outbox_age_seconds: float | None = None
+    disk_percent: float = 0.0
+    lease_expires_at: datetime | None = None
+    lease_remaining_seconds: float | None = None
+    auto_resume_eligible: bool = False
+    open_urgent_incidents: int = 0

@@ -10,11 +10,14 @@ import pytest
 from app.runtime import BotRuntime, RuntimePhase
 from clients.gamma_markets import DiscoveredMarket, MarketOutcome
 from clients.market_rotation import MarketRotationState, MarketRotationStatus
+from clients.ws_client import WebSocketHealth
 from config.schema import AppConfig, Mode
 from dashboard.read_model import DashboardReadModel, tail_events
 from models.events import BotEvent, EventType
+from models.operations import OperationalState, TaskHealth
 from models.order import OrderResult, OrderStatus
 from models.position import ExitReason, Position, PositionLifecycle
+from persistence.health import RuntimeHealthSnapshot, build_runtime_health
 from persistence.journal import JsonlJournal
 from persistence.snapshots import SnapshotStore
 from state.store import InMemoryStateStore
@@ -388,3 +391,226 @@ def test_tail_events_redacts_known_secrets_in_valid_events(tmp_path: Path) -> No
 
     assert "api-secret-value" not in result.model_dump_json()
     assert "[REDACTED]" in result.model_dump_json()
+
+
+# --- runtime health snapshot builder ----------------------------------------
+
+
+def _ws_health(**overrides: object) -> WebSocketHealth:
+    values: dict[str, object] = {
+        "connected": True,
+        "task_running": True,
+        "last_heartbeat": NOW,
+        "disconnected_since": None,
+        "connection_attempts": 0,
+        "last_error": None,
+    }
+    values.update(overrides)
+    return WebSocketHealth(**values)
+
+
+def _task(name: str, *, running: bool = True) -> TaskHealth:
+    return TaskHealth(name=name, running=running, started_at=NOW)
+
+
+async def _build_health(**overrides: object) -> RuntimeHealthSnapshot:
+    values: dict[str, object] = {
+        "operational_state": OperationalState.RUNNING,
+        "reason": None,
+        "tasks": [_task("reconciliation-loop"), _task("snapshot-loop")],
+        "supervisor_alive": True,
+        "websocket": _ws_health(),
+        "data_path": Path("/tmp"),
+        "disk_usage": lambda _path: 42.0,
+        "now": NOW,
+    }
+    values.update(overrides)
+    return await build_runtime_health(**values)
+
+
+@pytest.mark.asyncio
+async def test_degraded_supervised_runtime_is_live_and_ready_not_trading(
+    tmp_path: Path,
+) -> None:
+    snapshot = await _build_health(
+        operational_state=OperationalState.DEGRADED,
+        reason="authoritative_state_stale",
+        data_path=tmp_path,
+    )
+
+    assert snapshot.process_live is True
+    assert snapshot.service_ready is True
+    assert snapshot.trading_ready is False
+    assert snapshot.state == OperationalState.DEGRADED
+
+
+@pytest.mark.asyncio
+async def test_dead_supervisor_is_not_live(tmp_path: Path) -> None:
+    snapshot = await _build_health(
+        supervisor_alive=False,
+        tasks=[_task("reconciliation-loop", running=False)],
+        data_path=tmp_path,
+    )
+
+    assert snapshot.process_live is False
+    assert snapshot.trading_ready is False
+
+
+@pytest.mark.asyncio
+async def test_startup_without_tasks_is_live_but_not_service_or_trading_ready(
+    tmp_path: Path,
+) -> None:
+    snapshot = await _build_health(
+        operational_state=OperationalState.STARTING,
+        reason="startup_reconciliation_pending",
+        tasks=[],
+        data_path=tmp_path,
+    )
+
+    assert snapshot.process_live is True
+    assert snapshot.service_ready is False
+    assert snapshot.trading_ready is False
+
+
+@pytest.mark.asyncio
+async def test_halted_process_can_be_live_and_service_ready_but_not_trading(
+    tmp_path: Path,
+) -> None:
+    snapshot = await _build_health(
+        operational_state=OperationalState.HALTED,
+        reason="operator_halt",
+        data_path=tmp_path,
+    )
+
+    assert snapshot.process_live is True
+    assert snapshot.service_ready is True
+    assert snapshot.trading_ready is False
+
+
+@pytest.mark.asyncio
+async def test_rest_fallback_source_wins_when_websocket_disconnected(
+    tmp_path: Path,
+) -> None:
+    fallback_snapshot = await _build_health(
+        websocket=_ws_health(connected=False, task_running=True),
+        rest_fallback_active=True,
+        data_path=tmp_path,
+    )
+    unavailable_snapshot = await _build_health(
+        websocket=_ws_health(connected=False, task_running=True),
+        rest_fallback_active=False,
+        data_path=tmp_path,
+    )
+
+    assert fallback_snapshot.market_data_source == "rest_fallback"
+    assert unavailable_snapshot.market_data_source == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_running_health_snapshot_reports_outbox_lease_and_disk(
+    tmp_path: Path,
+) -> None:
+    class FakeRepository:
+        async def outbox_stats(self, *, now: datetime) -> tuple[int, float | None]:
+            return 3, 45.5
+
+        async def get_active_lease(self) -> None:
+            return None
+
+    snapshot = await _build_health(
+        repository=FakeRepository(),
+        last_reconciliation_at=NOW - timedelta(seconds=12),
+        data_path=tmp_path,
+    )
+
+    assert snapshot.outbox_pending == 3
+    assert snapshot.oldest_outbox_age_seconds == 45.5
+    assert snapshot.last_reconciliation_at == NOW - timedelta(seconds=12)
+    assert snapshot.disk_percent == 42.0
+    assert snapshot.updated_at == NOW
+
+
+# --- dashboard state operational fields -------------------------------------
+
+
+class FakeWsManager:
+    def health(self) -> WebSocketHealth:
+        return _ws_health()
+
+    @property
+    def is_connected(self) -> bool:
+        return True
+
+
+class FakeOpsRepository:
+    async def outbox_stats(self, *, now: datetime) -> tuple[int, float | None]:
+        return 2, 15.0
+
+    async def get_active_lease(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_live_dashboard_state_exposes_operational_health(tmp_path: Path) -> None:
+    config = AppConfig()
+    state = InMemoryStateStore(mode=Mode.DRY_RUN)
+    runtime = BotRuntime(config_loader=lambda _: config)
+    runtime._phase = RuntimePhase.RUNNING
+    runtime._mode = Mode.DRY_RUN
+    runtime._services = SimpleNamespace(
+        state_store=state,
+        config=config,
+        ws_manager=FakeWsManager(),
+        operations_repository=FakeOpsRepository(),
+    )
+    model = DashboardReadModel(
+        config=config,
+        runtime=runtime,
+        data_dir=tmp_path,
+        now=lambda: NOW,
+    )
+    built = await model.build()
+
+    assert built.market_data_source == "websocket"
+    assert built.outbox_pending == 2
+    assert built.oldest_outbox_age_seconds == 15.0
+    assert built.task_health == []
+    assert built.disk_percent >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_historical_dashboard_state_loads_health_file(tmp_path: Path) -> None:
+    health_dir = tmp_path / "health"
+    health_dir.mkdir(parents=True)
+    snapshot = RuntimeHealthSnapshot(
+        process_live=True,
+        service_ready=False,
+        trading_ready=False,
+        state=OperationalState.HALTED,
+        reason="operator_halt",
+        tasks=[],
+        websocket=_ws_health(connected=False),
+        market_data_source="unavailable",
+        last_reconciliation_at=None,
+        outbox_pending=1,
+        oldest_outbox_age_seconds=90.0,
+        disk_percent=55.0,
+        lease_expires_at=None,
+        updated_at=NOW,
+    )
+    (health_dir / "runtime.json").write_text(snapshot.model_dump_json())
+
+    config = AppConfig()
+    runtime = BotRuntime(config_loader=lambda _: config)
+    model = DashboardReadModel(
+        config=config,
+        runtime=runtime,
+        data_dir=tmp_path,
+        now=lambda: NOW,
+    )
+    built = await model.build()
+
+    assert built.source == "historical"
+    assert built.market_data_source == "unavailable"
+    assert built.outbox_pending == 1
+    assert built.disk_percent == 55.0

@@ -17,6 +17,7 @@ from models.operations import (
     IncidentCategory,
     IncidentSeverity,
     OperationalIncident,
+    OperationalState,
 )
 from reliability.policy import RecoveryAction
 
@@ -352,6 +353,89 @@ async def notification_delivery_loop(
                         "reason": type(exc).__name__,
                     },
                 )
+
+        await _cycle(
+            interval_seconds=5.0,
+            stop_event=stop_event,
+            heartbeat=heartbeat,
+            work=work,
+        )
+
+
+async def health_report_loop(
+    services: object,
+    stop_event: asyncio.Event,
+    heartbeat: Heartbeat,
+    report: Report,
+    *,
+    runtime: object = None,
+) -> None:
+    """Write the atomic runtime health snapshot every five seconds."""
+
+    store = getattr(services, "health_store", None)
+    if store is None:
+        return
+
+    while not stop_event.is_set():
+
+        async def work() -> None:
+            from persistence.health import build_runtime_health
+
+            state_store = getattr(services, "state_store", None)
+            repository = getattr(services, "operations_repository", None)
+            ws_manager = getattr(services, "ws_manager", None)
+            supervisor = getattr(runtime, "_supervisor", None)
+            tasks = []
+            alive = supervisor is not None
+            if supervisor is not None and hasattr(supervisor, "health"):
+                try:
+                    tasks = list(await supervisor.health())
+                except Exception:
+                    tasks = []
+                is_alive = getattr(supervisor, "is_alive", None)
+                if callable(is_alive):
+                    alive = bool(is_alive())
+            websocket = None
+            if ws_manager is not None and hasattr(ws_manager, "health"):
+                try:
+                    websocket = ws_manager.health()
+                except Exception:
+                    websocket = None
+            operational_state = OperationalState.STARTING
+            reason = None
+            status_factory = getattr(runtime, "status", None)
+            if callable(status_factory):
+                try:
+                    status = status_factory()
+                    operational_state = OperationalState(status.phase.value)
+                    reason = status.reason
+                except Exception:
+                    pass
+            try:
+                snapshot = await build_runtime_health(
+                    operational_state=operational_state,
+                    reason=reason,
+                    tasks=tasks,
+                    supervisor_alive=alive,
+                    websocket=websocket,
+                    last_reconciliation_at=(
+                        await state_store.get_heartbeat("reconciliation")
+                        if state_store is not None
+                        else None
+                    ),
+                    repository=repository,
+                    data_path=getattr(services, "data_dir", None),
+                    disk_usage=getattr(services, "disk_usage", None),
+                )
+                await store.save(snapshot)
+            except Exception as exc:
+                incident = _make_incident(
+                    component="health_report",
+                    category=IncidentCategory.PERSISTENCE,
+                    severity=IncidentSeverity.WARNING,
+                    reason=f"health_write_failed:{type(exc).__name__}",
+                )
+                await report(incident)
 
         await _cycle(
             interval_seconds=5.0,

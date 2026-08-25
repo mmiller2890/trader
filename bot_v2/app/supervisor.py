@@ -104,6 +104,11 @@ class RuntimeSupervisor:
             raise RuntimeError("no fatal incident was produced")
         return await self._fatal_future
 
+    def is_alive(self) -> bool:
+        """False once a fatal incident has terminated supervision."""
+
+        return self._fatal_incident is None
+
     async def health(self) -> list[TaskHealth]:
         now = self._now()
         healths: list[TaskHealth] = []
