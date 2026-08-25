@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
@@ -12,8 +13,10 @@ from execution.submitter import OrderSubmitter
 from execution.tracker import OrderTracker
 from models.events import BotEvent, EventType
 from models.market import MarketSnapshot
+from models.order import CancelIntent, CancelResult, OrderRequest, OrderResult
 from models.risk import RiskAction
 from models.signal import TradeSignal
+from strategies.quoting import QuotePlan
 from notifications.events import EventBus
 from persistence.journal import JsonlJournal
 from persistence.snapshots import SnapshotStore
@@ -21,6 +24,14 @@ from portfolio.sizing import fixed_size
 from risk.pretrade import PreTradeRiskEngine
 from state.reconciliation import ReconciliationReport
 from state.store import InMemoryStateStore
+
+
+@dataclass(frozen=True)
+class RoutedOrder:
+    """What a routed signal actually produced, for callers that track quotes."""
+
+    request: OrderRequest
+    result: OrderResult
 
 
 class ExecutionRouter:
@@ -57,8 +68,14 @@ class ExecutionRouter:
         *,
         snapshot: MarketSnapshot | None = None,
         market_end_at: datetime | None = None,
-    ) -> None:
-        """Process one strategy signal through the full safe pipeline."""
+    ) -> RoutedOrder | None:
+        """
+        Process one strategy signal through the full safe pipeline.
+
+        Returns what was actually sent when an order reached the exchange, so
+        a quoting strategy can record the resting order it now owns. Returns
+        ``None`` whenever the signal was rejected before submission.
+        """
 
         await self._state_store.add_signal(signal)
         await self._emit_event(
@@ -75,7 +92,18 @@ class ExecutionRouter:
             )
         )
 
-        current_snapshot = snapshot or await self._state_store.get_market_snapshot(signal.market_id, signal.token_id)
+        # A caller-supplied snapshot is only usable when it describes the book
+        # this signal actually trades. Complement-routed signals are raised
+        # from one outcome token but execute against the other, and risking
+        # the wrong book silently defeats every price and liquidity check.
+        if snapshot is not None and (
+            snapshot.token_id != signal.token_id
+            or snapshot.market_id != signal.market_id
+        ):
+            snapshot = None
+        current_snapshot = snapshot or await self._state_store.get_market_snapshot(
+            signal.market_id, signal.token_id
+        )
         proposed_size = fixed_size(self._config.execution)
         proposed_price = (
             current_snapshot.best_ask if current_snapshot and signal.side.value == "buy"
@@ -106,7 +134,7 @@ class ExecutionRouter:
                         reason=str(exc),
                     )
                 )
-                return
+                return None
             proposed_size = order_request.size
             proposed_price = order_request.price
             executable_liquidity = (
@@ -156,10 +184,10 @@ class ExecutionRouter:
                     )
             else:
                 await self._release_exit_reservation(signal)
-            return
+            return None
 
         if current_snapshot is None or order_request is None:
-            return
+            return None
         await self._emit_event(
             BotEvent(
                 event_type=EventType.ORDER_SUBMITTED,
@@ -270,6 +298,118 @@ class ExecutionRouter:
                 latency_ms=result.latency_ms,
             )
         )
+        return RoutedOrder(request=order_request, result=result)
+
+    async def route_cancel(self, intent: CancelIntent) -> CancelResult:
+        """Cancel one resting order and journal the outcome."""
+
+        result = await self._submitter.cancel_order(intent)
+        await self._emit_event(
+            BotEvent(
+                event_type=(
+                    EventType.QUOTE_CANCELLED
+                    if result.terminal
+                    else EventType.QUOTE_CANCEL_FAILED
+                ),
+                component="router",
+                mode=self._config.bot.mode.value,
+                message=(
+                    "resting quote cancelled"
+                    if result.terminal
+                    else "resting quote cancellation did not confirm"
+                ),
+                market_id=intent.market_id,
+                token_id=intent.token_id,
+                client_order_id=intent.client_order_id,
+                reason=f"{intent.reason}:{result.outcome.value}",
+            )
+        )
+        return result
+
+    async def route_quote_plan(
+        self,
+        plan: QuotePlan,
+        *,
+        strategy: object,
+        snapshot: MarketSnapshot | None = None,
+        market_end_at: datetime | None = None,
+    ) -> None:
+        """
+        Apply one quoting decision: cancel stale orders, then post new ones.
+
+        Cancels run first and to completion. A cancellation that does not
+        confirm leaves the old order live, so the replacement for that side is
+        withheld and the quote is restored to the strategy's book -- posting
+        anyway would double the intended exposure on that side.
+        """
+
+        forget = getattr(strategy, "forget_quote", None)
+        blocked: set[tuple[str, str, str]] = set()
+        for intent in plan.cancels:
+            result = await self.route_cancel(intent)
+            if result.terminal:
+                if callable(forget):
+                    forget(intent.client_order_id)
+                continue
+            # The order may still be live. Leave it tracked and withhold the
+            # replacement for that side.
+            blocked.add((intent.market_id, intent.token_id, intent.side.value))
+
+        for quote_signal in plan.quotes:
+            key = (
+                quote_signal.market_id,
+                quote_signal.token_id,
+                quote_signal.side.value,
+            )
+            if key in blocked:
+                await self._emit_event(
+                    BotEvent(
+                        event_type=EventType.RISK_DECISION,
+                        component="quote_router",
+                        mode=self._config.bot.mode.value,
+                        message="quote withheld while a stale order is still live",
+                        market_id=quote_signal.market_id,
+                        token_id=quote_signal.token_id,
+                        strategy_name=quote_signal.strategy_name,
+                        signal_id=quote_signal.signal_id,
+                        reason="replacement_blocked_by_unconfirmed_cancel",
+                    )
+                )
+                continue
+            routed = await self.route_signal(
+                quote_signal,
+                snapshot=snapshot,
+                market_end_at=market_end_at,
+            )
+            if routed is None or not routed.result.accepted:
+                continue
+            register = getattr(strategy, "register_submission", None)
+            if callable(register):
+                register(
+                    client_order_id=routed.request.client_order_id,
+                    signal=quote_signal,
+                    price=routed.request.price,
+                    size=routed.request.size,
+                )
+            record = getattr(strategy, "record_order_result", None)
+            if callable(record):
+                record(routed.result)
+            await self._emit_event(
+                BotEvent(
+                    event_type=EventType.QUOTE_PLACED,
+                    component="quote_router",
+                    mode=self._config.bot.mode.value,
+                    message="resting quote placed",
+                    market_id=routed.request.market_id,
+                    token_id=routed.request.token_id,
+                    strategy_name=routed.request.strategy_name,
+                    signal_id=routed.request.signal_id,
+                    client_order_id=routed.request.client_order_id,
+                    quantity=routed.request.size,
+                    price=routed.request.price,
+                    reason=quote_signal.reason,
+                )
+            )
 
     async def _reconcile_after_fill(self, result: object) -> None:
         if self._post_fill_reconcile is None:

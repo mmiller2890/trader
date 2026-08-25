@@ -1,0 +1,49 @@
+market_maker:
+  # Disabled by default. Enabling this changes what the bot does with money;
+  # read docs/market-making.md before turning it on, and start in dry_run.
+  enabled: false
+
+  # Total quoted spread in ticks. Each side rests half of this from fair value,
+  # so 2 ticks means bid at fair - 1 tick and ask at fair + 1 tick. Polymarket's
+  # liquidity rewards require quoting inside the program's max spread, so this
+  # must stay at or below that threshold to score at all.
+  quote_spread_ticks: 2
+
+  # Spread used on the reducing side once inventory forces an unwind. Tighter
+  # than the normal spread so the position actually works off.
+  unwind_spread_ticks: 1
+
+  # Largest fair-value skew, in ticks, applied at full inventory. Long inventory
+  # pulls fair value down by up to this much, which lowers both quotes.
+  max_skew_ticks: 2
+
+  # Base size per side before inventory scaling.
+  base_quote_size: 100
+  # Quotes smaller than this are not worth the round trip; the side goes dark.
+  min_quote_size: 5
+
+  # Re-quote once the computed price has moved more than this many ticks.
+  # Cancel-replace forfeits queue position, so do not set this to 0.
+  refresh_move_ticks: 1
+
+  # Fraction of max_position_size beyond which the accumulating side stops
+  # quoting entirely and the reducing side tightens.
+  inventory_unwind_ratio: 0.8
+
+  # Strategy-level inventory cap per token. Keep this at or below
+  # risk.max_single_position_size; the risk engine is the backstop, not this.
+  max_position_size: 200
+
+  # Skip quoting a book thinner than this on either side. 0 disables the check.
+  min_book_liquidity: 0
+
+  # Refresh a resting quote at least this often even in a quiet book, so a
+  # stale order cannot sit through a regime change.
+  quote_ttl_seconds: 30
+
+  # Withdraw all quotes this long before the market closes, so the exit manager
+  # has a clean book to unwind into.
+  stop_quoting_before_end_seconds: 60
+
+  target_market_ids: []
+  target_token_ids: []

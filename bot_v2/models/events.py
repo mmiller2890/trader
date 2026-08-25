@@ -46,6 +46,9 @@ class EventType(str, Enum):
     LIVE_LEASE_EXPIRED = "live_lease_expired"
     AUTO_RESUME_REJECTED = "auto_resume_rejected"
     DAILY_SUMMARY = "daily_summary"
+    QUOTE_PLACED = "quote_placed"
+    QUOTE_CANCELLED = "quote_cancelled"
+    QUOTE_CANCEL_FAILED = "quote_cancel_failed"
 
 
 class BotEvent(BaseModel):

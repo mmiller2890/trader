@@ -278,3 +278,62 @@ async def test_exit_reservation_release_is_saved_immediately(tmp_path) -> None:
     lifecycle = await restored.get_position_lifecycle("m1", "t1")
     assert lifecycle is not None
     assert lifecycle.pending_exit_client_order_id is None
+
+
+@pytest.mark.asyncio
+async def test_signal_is_risked_against_its_own_book_not_the_callers() -> None:
+    """
+    Regression: complement-routed signals were risked against the wrong token.
+
+    The spike strategy observes token A and may route the order to token B.
+    Bootstrap passes A's snapshot to the router, so every price, spread, and
+    liquidity check was evaluated on a book the order never touches -- a
+    tight book vouching for a broken one.
+    """
+
+    config = AppConfig(
+        bot={"mode": Mode.DRY_RUN},
+        risk={"min_top_of_book_liquidity": "1", "max_entry_spread_bps": 600},
+    )
+    state = InMemoryStateStore(mode=Mode.DRY_RUN)
+    now = datetime.now(tz=UTC)
+
+    def book(token: str, bid: str, ask: str) -> MarketSnapshot:
+        return MarketSnapshot(
+            market_id="m1", token_id=token,
+            best_bid=Decimal(bid), best_ask=Decimal(ask),
+            mid_price=(Decimal(bid) + Decimal(ask)) / 2,
+            top_bid_size=Decimal("500"), top_ask_size=Decimal("500"),
+            received_ts=now, source_ts=now,
+        )
+
+    tight = book("t1", "0.49", "0.50")
+    broken = book("t2", "0.09", "0.91")
+    await state.update_market_snapshot(broken)
+
+    submitter = RecordingSubmitter()
+    journal = RecordingJournal()
+    router = ExecutionRouter(
+        config=config,
+        state_store=state,
+        risk_engine=PreTradeRiskEngine(config=config, state_store=state),
+        order_builder=OrderBuilder(config),
+        submitter=submitter,
+        tracker=OrderTracker(state),
+        journal=journal,
+        event_bus=EventBus(),
+    )
+
+    signal = TradeSignal(
+        strategy_name="spike", market_id="m1", token_id="t2",
+        side=SignalSide.BUY, reference_price=Decimal("0.50"),
+        target_price=Decimal("0.91"), observed_move_bps=100,
+        reason="spike_up_via_complement",
+    )
+
+    # Caller hands over t1's tight book while the order trades t2's broken one.
+    await router.route_signal(signal, snapshot=tight)
+
+    assert submitter.orders == []
+    reasons = [getattr(e, "reason", "") or "" for e in journal.events]
+    assert any("entry_spread_too_wide" in r for r in reasons)
