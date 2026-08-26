@@ -295,6 +295,36 @@ The fill-rate axis is now measured and clears the bar. **The P&L axis is not
 measured yet**, and the two live quadrants point opposite ways, so maker entry
 is not yet shown to be viable — only not yet falsified.
 
+### How often the gate actually refuses
+
+Shadow mode exists to answer one question — how often would the edge gate
+abstain? — and it does not need the bot running to answer it: `assess_edge` is
+a pure function of price and spread, both of which are in every recorded book.
+
+```bash
+.venv/bin/python -m scripts.measure_edge_gate --input data/research/books.jsonl
+```
+
+Across 161,883 observations, with the shipped `fee_rate: 0.07` and
+`safety_margin_bps: 50`, the fraction of book states that can support a trade:
+
+| assumed edge | maker entry | taker entry |
+|---|---|---|
+| 120 bps (average directional edge) | 6.4% | 0.0% |
+| 187 bps (measured spike edge) | 25.6% | 0.8% |
+| 600 bps | 71.6% | 46.4% |
+
+The median book demands **264 bps** to justify a maker entry and **1033 bps**
+for a taker one. Two things follow. **Taker entry is dead at any plausible
+edge** — the gate refuses essentially all of it, which is the plan working as
+designed rather than a misconfiguration. And **maker entry at the strategy's
+own measured 187 bps clears on about a quarter of books**, so enforcing the
+gate is binding without being prohibitive: the bot still trades, selectively.
+
+Read this per *observed book*, not per signal — signal arrival is a property of
+the strategy, not the book — and note it assumes one edge for every book, while
+a spike's edge is not the average edge. `--edge-bps` tests the sensitivity.
+
 ## Before running it live
 
 The bot ships in `dry_run` with all three live gates closed. Dry run exercises
