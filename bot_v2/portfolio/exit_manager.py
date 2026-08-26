@@ -10,7 +10,7 @@ from uuid import uuid4
 from config.schema import AppConfig
 from models.events import BotEvent, EventType
 from models.market import MarketSnapshot
-from models.order import OrderTimeInForce
+from models.order import CancelIntent, CancelResult, OrderSide, OrderTimeInForce
 from models.position import ExitReason, Position, PositionLifecycle
 from models.signal import SignalSide, SignalType, TradeSignal
 from persistence.snapshots import SnapshotStore
@@ -37,6 +37,7 @@ class PositionExitManager:
         policy: PositionExitPolicy,
         now: Callable[[], datetime] = utc_now,
         on_event: Callable[[BotEvent], Awaitable[None]] | None = None,
+        cancel_order: Callable[[CancelIntent], Awaitable[CancelResult]] | None = None,
     ) -> None:
         self._config = config
         self._state_store = state_store
@@ -44,6 +45,7 @@ class PositionExitManager:
         self._policy = policy
         self._now = now
         self._on_event = on_event
+        self._cancel_order = cancel_order
         self._dust_notified: set[tuple[str, str]] = set()
 
     def set_clock(self, now: Callable[[], datetime]) -> None:
@@ -73,6 +75,7 @@ class PositionExitManager:
             )
             if lifecycle is None:
                 continue
+            lifecycle = await self._sweep_stale_maker_exit(lifecycle)
             decision = self._policy.evaluate(
                 position=position,
                 lifecycle=lifecycle,
@@ -108,6 +111,8 @@ class PositionExitManager:
                 reason=decision.reason,
                 requested_size=decision.requested_size,
                 market_end_at=market_end_at,
+                snapshot=snapshot,
+                use_maker=decision.use_maker,
             )
             if signal is not None:
                 signals.append(signal)
@@ -164,6 +169,7 @@ class PositionExitManager:
             )
             if lifecycle is None:
                 continue
+            lifecycle = await self._sweep_stale_maker_exit(lifecycle)
             market_end_at = market_end_lookup(position.market_id)
             if market_end_at is not None and lifecycle.market_end_at != market_end_at:
                 lifecycle = lifecycle.model_copy(update={"market_end_at": market_end_at})
@@ -184,10 +190,86 @@ class PositionExitManager:
                 reason=decision.reason,
                 requested_size=decision.requested_size,
                 market_end_at=market_end_at,
+                snapshot=snapshot,
+                use_maker=decision.use_maker,
             )
             if signal is not None:
                 signals.append(signal)
         return signals
+
+    async def _sweep_stale_maker_exit(
+        self, lifecycle: PositionLifecycle
+    ) -> PositionLifecycle:
+        """
+        Pull a maker exit that has rested past its deadline, so it can escalate.
+
+        Nothing else releases the exit reservation for a post-only GTC order
+        that the venue accepts and that then simply sits on the book: the
+        router releases only on a fill, a rejection, or a failure. Left alone,
+        the reservation is held forever, ``_emit_exit`` short-circuits on every
+        later pass, and the ``maker_exit_deadline_seconds`` escalation in
+        ``PositionExitPolicy._use_maker`` can never run -- a stop-loss would
+        rest at the ask and ride an arbitrarily large adverse move, which is
+        the exact failure this deadline exists to prevent.
+
+        The reservation is released only when the cancel is terminal. A refused
+        cancel may have left the order resting, and releasing on that would let
+        a second exit go out against inventory the first one already owns.
+        """
+
+        client_order_id = lifecycle.pending_exit_client_order_id
+        attempted_at = lifecycle.last_exit_attempt_at
+        if (
+            not lifecycle.pending_exit_is_maker
+            or client_order_id is None
+            or attempted_at is None
+            or self._cancel_order is None
+        ):
+            return lifecycle
+        deadline = self._config.position_management.maker_exit_deadline_seconds
+        if (self._now() - attempted_at).total_seconds() < deadline:
+            return lifecycle
+
+        result = await self._cancel_order(
+            CancelIntent(
+                client_order_id=client_order_id,
+                market_id=lifecycle.market_id,
+                token_id=lifecycle.token_id,
+                side=OrderSide.SELL,
+                reason="maker_exit_deadline_elapsed",
+            )
+        )
+        await self._emit_event(
+            BotEvent(
+                event_type=(
+                    EventType.QUOTE_CANCELLED
+                    if result.terminal
+                    else EventType.QUOTE_CANCEL_FAILED
+                ),
+                component="exit_manager",
+                mode=self._config.bot.mode.value,
+                message=(
+                    "resting maker exit pulled for taker escalation"
+                    if result.terminal
+                    else "resting maker exit could not be pulled; reservation held"
+                ),
+                market_id=lifecycle.market_id,
+                token_id=lifecycle.token_id,
+                client_order_id=client_order_id,
+                reason=f"maker_exit_deadline_elapsed:{result.outcome.value}",
+            )
+        )
+        if not result.terminal:
+            return lifecycle
+        await self._state_store.release_exit(
+            lifecycle.market_id,
+            lifecycle.token_id,
+            client_order_id=client_order_id,
+        )
+        refreshed = await self._state_store.get_position_lifecycle(
+            lifecycle.market_id, lifecycle.token_id
+        )
+        return refreshed if refreshed is not None else lifecycle
 
     async def _emit_exit(
         self,
@@ -197,6 +279,8 @@ class PositionExitManager:
         reason: ExitReason,
         requested_size: Decimal,
         market_end_at: datetime | None,
+        snapshot: MarketSnapshot | None = None,
+        use_maker: bool = False,
     ) -> TradeSignal | None:
         effective_size = (
             requested_size
@@ -214,6 +298,17 @@ class PositionExitManager:
             if self._now() < retry_after:
                 return None
 
+        # A maker exit rests a post-only SELL at the ask instead of crossing
+        # down to the bid as IOC. Only take this path when the policy asked
+        # for it *and* the resting price is a valid limit price; otherwise
+        # fall back to the existing taker signal rather than emit an invalid
+        # one (or silently rest at a nonsensical price).
+        maker_limit_price: Decimal | None = None
+        if use_maker and snapshot is not None:
+            candidate_price = snapshot.best_ask
+            if Decimal("0") < candidate_price < Decimal("1"):
+                maker_limit_price = candidate_price
+
         signal_id = uuid4().hex
         client_order_id = (
             f"{self._config.execution.client_order_id_prefix}-{signal_id[:18]}"
@@ -224,6 +319,7 @@ class PositionExitManager:
             client_order_id=client_order_id,
             reason=reason,
             attempted_at=self._now(),
+            mark_maker_attempt=maker_limit_price is not None,
         )
         if not reserved:
             return None
@@ -256,7 +352,13 @@ class PositionExitManager:
             reason=f"position_exit:{reason.value}",
             requested_size=effective_size,
             reduce_only=True,
-            time_in_force=self._config.position_management.exit_time_in_force,
+            post_only=maker_limit_price is not None,
+            limit_price=maker_limit_price,
+            time_in_force=(
+                OrderTimeInForce.GTC
+                if maker_limit_price is not None
+                else self._config.position_management.exit_time_in_force
+            ),
         )
 
     async def _emit_event(self, event: BotEvent) -> None:

@@ -427,14 +427,23 @@ class PreTradeRiskEngine(PreTradeRiskPolicy):
     ) -> RiskCheckResult:
         if snapshot is None:
             return RiskCheckResult(check_name="slippage", passed=False, reason="market_snapshot_missing")
-        if signal.is_maker_quote:
+        if signal.is_maker_quote or signal.reduce_only:
             # Slippage measures how far a taker pays through the touch. A
             # maker quote sits away from the touch on purpose, and the order
-            # builder already clamped it so it cannot cross.
+            # builder already clamped it so it cannot cross. A reduce-only
+            # exit is exempt for the same reason a taker exit never tripped
+            # this check before maker-first exits existed: it priced at the
+            # near-touch reference and showed zero distance. A maker-first
+            # exit instead rests at the *far* side of the spread on purpose
+            # (see PositionExitManager._emit_exit), so it needs the same
+            # exemption already granted to reduce-only signals elsewhere in
+            # this file (duplicate_guard, entry_spread).
             return RiskCheckResult(
                 check_name="slippage",
                 passed=True,
-                reason="maker_quote_prices_are_intentional",
+                reason="maker_quote_prices_are_intentional"
+                if signal.is_maker_quote
+                else "reduce_only_prices_are_intentional",
             )
         reference = snapshot.best_ask if signal.side.value == "buy" else snapshot.best_bid
         slippage_bps = _bps_distance(reference, proposed_price)

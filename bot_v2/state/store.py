@@ -518,6 +518,7 @@ class InMemoryStateStore:
                     "confirmation_deadline": confirmed_at
                     + timedelta(seconds=confirmation_grace_seconds),
                     "pending_exit_client_order_id": None,
+                    "pending_exit_is_maker": False,
                 }
             )
             self._positions.pop(key, None)
@@ -675,8 +676,17 @@ class InMemoryStateStore:
         client_order_id: str,
         reason: ExitReason,
         attempted_at: datetime,
+        mark_maker_attempt: bool = False,
     ) -> bool:
-        """Reserve one exit attempt; returns False when already reserved."""
+        """
+        Reserve one exit attempt; returns False when already reserved.
+
+        When ``mark_maker_attempt`` is True and the lifecycle has not yet
+        recorded a maker exit attempt, ``exit_first_attempted_at`` is stamped
+        with ``attempted_at``. It is left untouched on every later call so a
+        taker escalation attempt never resets the maker-exit deadline clock,
+        and it stays None for a position whose exits have always been taker.
+        """
 
         async with self._lock:
             lifecycle = self._lifecycles.get((market_id, token_id))
@@ -684,14 +694,16 @@ class InMemoryStateStore:
                 return False
             if lifecycle.pending_exit_client_order_id is not None:
                 return False
-            self._lifecycles[(market_id, token_id)] = lifecycle.model_copy(
-                update={
-                    "pending_exit_client_order_id": client_order_id,
-                    "last_exit_reason": reason,
-                    "last_exit_attempt_at": attempted_at,
-                    "exit_attempt_count": lifecycle.exit_attempt_count + 1,
-                }
-            )
+            update: dict[str, object] = {
+                "pending_exit_client_order_id": client_order_id,
+                "last_exit_reason": reason,
+                "last_exit_attempt_at": attempted_at,
+                "exit_attempt_count": lifecycle.exit_attempt_count + 1,
+                "pending_exit_is_maker": mark_maker_attempt,
+            }
+            if mark_maker_attempt and lifecycle.exit_first_attempted_at is None:
+                update["exit_first_attempted_at"] = attempted_at
+            self._lifecycles[(market_id, token_id)] = lifecycle.model_copy(update=update)
             return True
 
     async def release_exit(
@@ -710,7 +722,10 @@ class InMemoryStateStore:
             if lifecycle.pending_exit_client_order_id != client_order_id:
                 return False
             self._lifecycles[(market_id, token_id)] = lifecycle.model_copy(
-                update={"pending_exit_client_order_id": None}
+                update={
+                    "pending_exit_client_order_id": None,
+                    "pending_exit_is_maker": False,
+                }
             )
             return True
 

@@ -8,7 +8,7 @@ import pytest
 
 from config.schema import AppConfig, Mode
 from models.market import MarketSnapshot
-from models.order import OrderTimeInForce
+from models.order import CancelIntent, CancelOutcome, CancelResult, OrderTimeInForce
 from models.position import ExitReason, Position, PositionLifecycle
 from models.signal import SignalSide, SignalType, TradeSignal
 from persistence.snapshots import SnapshotStore
@@ -58,16 +58,21 @@ def make_exit_manager(
     *,
     now: object = lambda: NOW,
     tmp_path: object | None = None,
+    position_management_overrides: dict | None = None,
+    cancel_order: object | None = None,
 ) -> PositionExitManager:
+    position_management = {
+        "take_profit_bps": "300",
+        "stop_loss_bps": "200",
+        "max_hold_seconds": 180,
+        "exit_retry_interval_seconds": 2,
+        "max_exit_attempts": 3,
+    }
+    if position_management_overrides:
+        position_management.update(position_management_overrides)
     config = AppConfig(
         bot={"mode": Mode.DRY_RUN},
-        position_management={
-            "take_profit_bps": "300",
-            "stop_loss_bps": "200",
-            "max_hold_seconds": 180,
-            "exit_retry_interval_seconds": 2,
-            "max_exit_attempts": 3,
-        },
+        position_management=position_management,
     )
     policy = PositionExitPolicy(
         config.position_management,
@@ -81,13 +86,18 @@ def make_exit_manager(
         snapshots=snapshots,
         policy=policy,
         now=now,
+        cancel_order=cancel_order,
     )
 
 
 @pytest.mark.asyncio
 async def test_take_profit_emits_one_reserved_full_position_exit() -> None:
     state = state_with_position(quantity="2.5", average="0.40")
-    manager = make_exit_manager(state=state, now=lambda: NOW)
+    manager = make_exit_manager(
+        state=state,
+        now=lambda: NOW,
+        position_management_overrides={"exit_style": "taker"},
+    )
     first = await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
     second = await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
     assert len(first) == 1 and second == []
@@ -322,3 +332,233 @@ async def test_non_full_liquidation_uses_bounded_default_attempt_size() -> None:
 
     assert len(signals) == 1
     assert signals[0].requested_size == Decimal("1")
+
+
+@pytest.mark.asyncio
+async def test_use_maker_exit_rests_post_only_at_the_best_ask() -> None:
+    state = state_with_position(quantity="2.5", average="0.40")
+    manager = make_exit_manager(state=state, now=lambda: NOW)
+    market_snapshot = snapshot(best_bid="0.42")
+    signals = await manager.on_market_update(market_snapshot, market_end_at=END_AT)
+    assert len(signals) == 1
+    signal = signals[0]
+    assert signal.signal_type == SignalType.POSITION_EXIT
+    assert signal.reduce_only is True
+    assert signal.post_only is True
+    assert signal.time_in_force == OrderTimeInForce.GTC
+    assert signal.limit_price == market_snapshot.best_ask
+
+
+@pytest.mark.asyncio
+async def test_taker_exit_style_produces_the_existing_taker_signal() -> None:
+    state = state_with_position(quantity="2.5", average="0.40")
+    manager = make_exit_manager(
+        state=state,
+        now=lambda: NOW,
+        position_management_overrides={"exit_style": "taker"},
+    )
+    signals = await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
+    assert len(signals) == 1
+    signal = signals[0]
+    assert signal.post_only is False
+    assert signal.limit_price is None
+    assert signal.time_in_force == OrderTimeInForce.IOC
+
+
+@pytest.mark.asyncio
+async def test_first_maker_exit_attempt_sets_exit_first_attempted_at_once() -> None:
+    state = state_with_position(quantity="2.5", average="0.40")
+    clock = {"now": NOW}
+
+    def now() -> datetime:
+        return clock["now"]
+
+    manager = make_exit_manager(state=state, now=now)
+
+    first = await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
+    assert len(first) == 1
+    lifecycle = await state.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    assert lifecycle.exit_first_attempted_at == NOW
+
+    client_order_id = f"pm-bot-{first[0].signal_id[:18]}"
+    await state.release_exit("m1", "t1", client_order_id=client_order_id)
+    clock["now"] = NOW + timedelta(seconds=5)
+
+    second = await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
+    assert len(second) == 1
+    assert second[0].post_only is True
+    lifecycle = await state.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    assert lifecycle.exit_first_attempted_at == NOW
+
+
+@pytest.mark.asyncio
+async def test_taker_exit_leaves_exit_first_attempted_at_none() -> None:
+    state = state_with_position(quantity="2.5", average="0.40")
+    manager = make_exit_manager(
+        state=state,
+        now=lambda: NOW,
+        position_management_overrides={"exit_style": "taker"},
+    )
+    signals = await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
+    assert len(signals) == 1
+    lifecycle = await state.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    assert lifecycle.exit_first_attempted_at is None
+
+
+@pytest.mark.asyncio
+async def test_maker_exit_escalates_to_taker_after_deadline_elapses() -> None:
+    state = state_with_position(quantity="2.5", average="0.40")
+    clock = {"now": NOW}
+
+    def now() -> datetime:
+        return clock["now"]
+
+    manager = make_exit_manager(
+        state=state,
+        now=now,
+        position_management_overrides={"maker_exit_deadline_seconds": 5.0},
+    )
+
+    first = await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
+    assert len(first) == 1
+    assert first[0].post_only is True
+    client_order_id = f"pm-bot-{first[0].signal_id[:18]}"
+    await state.release_exit("m1", "t1", client_order_id=client_order_id)
+
+    # Past both the retry interval and the maker deadline: escalate to taker.
+    clock["now"] = NOW + timedelta(seconds=10)
+    second = await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
+    assert len(second) == 1
+    assert second[0].post_only is False
+    assert second[0].limit_price is None
+    assert second[0].time_in_force == OrderTimeInForce.IOC
+
+    lifecycle = await state.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    assert lifecycle.exit_first_attempted_at == NOW
+
+
+@pytest.mark.asyncio
+async def test_resting_maker_exit_is_cancelled_and_escalated_after_deadline() -> None:
+    """
+    A maker exit that rests unfilled past the deadline must be pulled off the
+    book and re-sent as a taker cross.
+
+    Nothing in the runtime releases the exit reservation for a post-only GTC
+    order that is accepted and simply sits there: the router releases only on
+    a fill, a rejection, or a failure. Without this sweep the reservation is
+    held forever, `_emit_exit` short-circuits on every later pass, and the
+    maker_exit_deadline_seconds escalation in PositionExitPolicy._use_maker is
+    unreachable -- a stop-loss would rest at the ask and ride the adverse move
+    indefinitely.
+    """
+
+    state = state_with_position(quantity="2.5", average="0.40")
+    clock = {"now": NOW}
+    cancels: list[CancelIntent] = []
+
+    async def cancel_order(intent: CancelIntent) -> CancelResult:
+        cancels.append(intent)
+        return CancelResult(
+            client_order_id=intent.client_order_id,
+            outcome=CancelOutcome.CANCELLED,
+        )
+
+    manager = make_exit_manager(
+        state=state,
+        now=lambda: clock["now"],
+        position_management_overrides={"maker_exit_deadline_seconds": 5.0},
+        cancel_order=cancel_order,
+    )
+
+    first = await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
+    assert len(first) == 1
+    assert first[0].post_only is True
+    resting_client_order_id = f"pm-bot-{first[0].signal_id[:18]}"
+
+    # The order is accepted and rests: no fill, no rejection, so the router
+    # never releases the reservation.
+    lifecycle = await state.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    assert lifecycle.pending_exit_client_order_id == resting_client_order_id
+
+    clock["now"] = NOW + timedelta(seconds=10)
+    second = await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
+
+    assert [intent.client_order_id for intent in cancels] == [resting_client_order_id]
+    assert cancels[0].reason == "maker_exit_deadline_elapsed"
+    assert len(second) == 1
+    assert second[0].post_only is False
+    assert second[0].limit_price is None
+    assert second[0].time_in_force == OrderTimeInForce.IOC
+
+
+@pytest.mark.asyncio
+async def test_resting_maker_exit_is_left_alone_before_the_deadline() -> None:
+    state = state_with_position(quantity="2.5", average="0.40")
+    clock = {"now": NOW}
+    cancels: list[CancelIntent] = []
+
+    async def cancel_order(intent: CancelIntent) -> CancelResult:
+        cancels.append(intent)
+        return CancelResult(
+            client_order_id=intent.client_order_id,
+            outcome=CancelOutcome.CANCELLED,
+        )
+
+    manager = make_exit_manager(
+        state=state,
+        now=lambda: clock["now"],
+        position_management_overrides={"maker_exit_deadline_seconds": 30.0},
+        cancel_order=cancel_order,
+    )
+
+    first = await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
+    assert len(first) == 1
+
+    clock["now"] = NOW + timedelta(seconds=10)
+    second = await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
+
+    assert cancels == []
+    assert second == []
+
+
+@pytest.mark.asyncio
+async def test_failed_cancel_keeps_the_reservation_rather_than_double_exiting() -> None:
+    """
+    If the venue refuses the cancel the order may still be resting, so the
+    reservation must be held. Releasing it would let a second exit go out
+    against inventory that is already committed to the first one.
+    """
+
+    state = state_with_position(quantity="2.5", average="0.40")
+    clock = {"now": NOW}
+
+    async def cancel_order(intent: CancelIntent) -> CancelResult:
+        return CancelResult(
+            client_order_id=intent.client_order_id,
+            outcome=CancelOutcome.FAILED,
+            message="venue_refused",
+        )
+
+    manager = make_exit_manager(
+        state=state,
+        now=lambda: clock["now"],
+        position_management_overrides={"maker_exit_deadline_seconds": 5.0},
+        cancel_order=cancel_order,
+    )
+
+    first = await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
+    assert len(first) == 1
+    resting_client_order_id = f"pm-bot-{first[0].signal_id[:18]}"
+
+    clock["now"] = NOW + timedelta(seconds=10)
+    second = await manager.on_market_update(snapshot(best_bid="0.42"), market_end_at=END_AT)
+
+    assert second == []
+    lifecycle = await state.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    assert lifecycle.pending_exit_client_order_id == resting_client_order_id

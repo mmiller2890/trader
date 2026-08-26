@@ -391,3 +391,33 @@ def test_maker_quote_price_off_grid_is_snapped_passively() -> None:
         snapshot=_book(),
     )
     assert ask_order.price == Decimal("0.47")
+
+
+def test_post_only_position_exit_rests_at_its_limit_price_not_repriced_as_taker() -> None:
+    # A maker-first exit (POSITION_EXIT with post_only + limit_price) must take
+    # the maker pricing path, not be repriced onto the crossing taker price.
+    builder = OrderBuilder(AppConfig())
+    signal = TradeSignal(
+        signal_id="signal12345678",
+        strategy_name="position_exit",
+        signal_type=SignalType.POSITION_EXIT,
+        market_id="m1",
+        token_id="t1",
+        side=SignalSide.SELL,
+        reference_price=Decimal("0.40"),
+        target_price=Decimal("0.45"),
+        observed_move_bps=0,
+        reason="position_exit:take_profit",
+        requested_size=Decimal("2.5"),
+        reduce_only=True,
+        post_only=True,
+        limit_price=Decimal("0.45"),
+        time_in_force=OrderTimeInForce.GTC,
+    )
+
+    order = builder.build(signal=signal, snapshot=_book(bid="0.44", ask="0.45"))
+
+    assert order.post_only is True
+    assert order.price == Decimal("0.45")
+    assert order.size == Decimal("2.5")
+    assert order.time_in_force == OrderTimeInForce.GTC

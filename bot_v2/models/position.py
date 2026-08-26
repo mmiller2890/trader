@@ -80,9 +80,16 @@ class PositionLifecycle(BaseModel):
     last_exit_reason: ExitReason | None = None
     pending_exit_client_order_id: str | None = None
     last_exit_attempt_at: datetime | None = None
-    # Set by the exit manager the first time it attempts a maker exit for the
-    # current exit episode. Not yet written by any producer as of this task
-    # (see task-8 report); None means "no maker attempt has been made yet".
+    # Set by PositionExitManager._emit_exit the first time it attempts a
+    # maker exit for the current exit episode; left unchanged on every later
+    # attempt (maker or taker) and stays None while every exit attempt has
+    # been taker. Consulted by PositionExitPolicy._use_maker to bound how
+    # long an exit is allowed to rest before escalating to a taker cross.
+    # True while the currently reserved exit order is a resting post-only
+    # maker order. Lets the exit manager tell a resting maker exit (which
+    # must be swept once it outlives its deadline) apart from a taker
+    # escalation that is already crossing and must be left alone.
+    pending_exit_is_maker: bool = False
     exit_first_attempted_at: datetime | None = None
     exit_attempt_count: int = Field(default=0, ge=0)
     confirmation_deadline: datetime | None = None

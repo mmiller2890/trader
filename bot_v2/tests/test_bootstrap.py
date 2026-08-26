@@ -509,3 +509,23 @@ def test_complement_lookup_is_none_without_any_market() -> None:
     from app.bootstrap import _complement_token
 
     assert _complement_token(None, None, market_id="m", token_id="t") is None
+
+
+@pytest.mark.asyncio
+async def test_exit_manager_can_cancel_its_own_resting_maker_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The maker-exit deadline sweep is inert unless bootstrap hands the exit
+    manager a canceller. Task 8 shipped a policy field that nothing consumed;
+    this asserts the same gap cannot reopen for the escalation path.
+    """
+
+    monkeypatch.setenv("BOT_DATA_DIR", str(tmp_path / "data"))
+    config_dir = tmp_path / "config"
+    write_config(config_dir, automatic=False)
+
+    services = await bootstrap_app(config_dir)
+
+    assert services.exit_manager._cancel_order is not None
+    assert services.exit_manager._cancel_order == services.submitter.cancel_order

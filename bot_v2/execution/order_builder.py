@@ -54,7 +54,7 @@ class OrderBuilder:
             and not self._config.execution.dry_run_force
         )
 
-        if signal.is_maker_quote:
+        if signal.post_only and signal.limit_price is not None:
             return self._build_maker_quote(
                 signal=signal,
                 snapshot=snapshot,

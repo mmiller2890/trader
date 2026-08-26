@@ -552,6 +552,7 @@ async def bootstrap_app(
         snapshots=snapshots,
         policy=exit_policy,
         on_event=emit_event,
+        cancel_order=submitter.cancel_order,
     )
     async def on_snapshot(snapshot) -> None:  # type: ignore[no-untyped-def]
         market_end_at = position_market_end_lookup(
