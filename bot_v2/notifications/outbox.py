@@ -112,7 +112,13 @@ class AlertService:
         now = self._now()
         return await self._repository.enqueue_alert(
             OutboxAlert(
-                alert_id=f"alert-{incident.incident_id}",
+                # record_incident reuses the incident_id for an unresolved
+                # fingerprint, so the id alone repeats on every recurrence and
+                # collided on the outbox primary key. consecutive_count makes
+                # each occurrence its own alert, which is also what an operator
+                # wants to see: a flapping incident should alert each time the
+                # dedup window allows, not once forever.
+                alert_id=f"alert-{incident.incident_id}-{incident.consecutive_count}",
                 incident_fingerprint=incident.fingerprint,
                 severity=incident.severity,
                 text=text,

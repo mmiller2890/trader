@@ -171,6 +171,32 @@ class BotRuntime:
             last_control_error=self._last_control_error,
         )
 
+
+    async def _alert_best_effort(self, alert_service: object, incident: object) -> None:
+        """
+        Send an incident alert without letting it affect control flow.
+
+        handle_incident awaits this between latching the kill switch and
+        cancelling open orders. An exception here -- a duplicate outbox row, a
+        locked database -- used to abort the halt before the cancel-all, which
+        left live orders resting during a safety halt. Alerting is never
+        allowed to outrank the safety ordering.
+        """
+
+        if alert_service is None:
+            return
+        try:
+            await alert_service.enqueue_incident(incident)
+        except Exception:
+            logger.critical(
+                "failed to enqueue incident alert; continuing safety ordering",
+                extra={
+                    "component": "runtime",
+                    "event_type": "incident_alert_enqueue_failed",
+                    "reason": getattr(incident, "reason", None),
+                },
+            )
+
     async def handle_incident(
         self,
         incident: OperationalIncident,
@@ -202,8 +228,7 @@ class BotRuntime:
         action = force_action or policy.decide(stored_incident, context)
 
         if action == RecoveryAction.RETRY:
-            if alert_service is not None:
-                await alert_service.enqueue_incident(stored_incident)
+            await self._alert_best_effort(alert_service, stored_incident)
             return action
 
         if action == RecoveryAction.DEGRADE:
@@ -217,8 +242,7 @@ class BotRuntime:
             await self._emit_degraded_event(
                 services, stored_incident, recovered=False
             )
-            if alert_service is not None:
-                await alert_service.enqueue_incident(stored_incident)
+            await self._alert_best_effort(alert_service, stored_incident)
             return action
 
         # HALT — centralized safety ordering.
@@ -255,8 +279,7 @@ class BotRuntime:
                         reason=stored_incident.reason,
                     ),
                 )
-            if alert_service is not None:
-                await alert_service.enqueue_incident(stored_incident)
+            await self._alert_best_effort(alert_service, stored_incident)
             if services.config.bot.mode == Mode.LIVE:
                 try:
                     await asyncio.wait_for(

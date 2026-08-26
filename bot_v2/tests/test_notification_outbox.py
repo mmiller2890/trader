@@ -352,3 +352,39 @@ async def test_first_attempt_is_never_scheduled_into_the_future(tmp_path: Path) 
     assert await service.enqueue_event(future_event) is not None
     due = await repository.due_alerts(now=service_clock + timedelta(seconds=1), limit=10)
     assert len(due) == 1, "alert stamped from a future event never became due"
+
+
+@pytest.mark.asyncio
+async def test_a_recurring_incident_does_not_collide_on_alert_id(tmp_path: Path) -> None:
+    """
+    record_incident reuses the stored incident_id for an unresolved
+    fingerprint, so a second occurrence past the dedup window tried to INSERT
+    the same primary key and raised IntegrityError.
+
+    That matters far beyond a lost alert. handle_incident awaits
+    enqueue_incident *between* latching the kill switch and cancelling open
+    orders, unguarded, so the exception halted trading and then skipped the
+    cancel-all -- leaving live orders resting on the book during a safety
+    halt.
+    """
+
+    repository = OperationsRepository(tmp_path / "bot.sqlite3")
+    service = AlertService(repository, config(), now=lambda: NOW)
+
+    first = warning_incident()
+    stored_first = await repository.record_incident(first)
+    assert await service.enqueue_incident(stored_first) is not None
+
+    # Same fingerprint, six hours later: record_incident returns the original
+    # incident_id with consecutive_count incremented.
+    later = NOW + timedelta(hours=6)
+    repeat = warning_incident().model_copy(
+        update={"first_seen_at": later, "last_seen_at": later}
+    )
+    stored_repeat = await repository.record_incident(repeat)
+    assert stored_repeat.incident_id == stored_first.incident_id
+    assert stored_repeat.consecutive_count > stored_first.consecutive_count
+
+    service_later = AlertService(repository, config(), now=lambda: later)
+    # Must not raise; the dedup window has long passed so this is a real alert.
+    assert await service_later.enqueue_incident(stored_repeat) is not None

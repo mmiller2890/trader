@@ -748,3 +748,55 @@ async def test_runtime_risk_allows_market_data_startup_grace() -> None:
         check.reason == "transport_heartbeat_stale"
         for check in expired.checks
     )
+
+
+@pytest.mark.asyncio
+async def test_alert_failure_does_not_abort_the_safety_halt(tmp_path: Path) -> None:
+    """
+    Alerting sits between latching the kill switch and cancelling open orders.
+    An exception there used to abort handle_incident and skip the cancel-all,
+    leaving live orders resting on the book during a safety halt.
+
+    The real trigger was a duplicate outbox primary key on a flapping
+    incident, but any failure -- a locked database, a full disk -- had the
+    same effect. Alerting must never outrank the safety ordering.
+    """
+
+    calls: list[str] = []
+    services = fake_services(Mode.LIVE, calls)
+    repository = OperationsRepository(tmp_path / "bot.sqlite3")
+
+    class Snapshots:
+        async def save_from_state(self, state_store: object) -> None:
+            calls.append("snapshot")
+
+    class BrokenAlerts:
+        async def enqueue_incident(self, incident: OperationalIncident) -> None:
+            calls.append("alert_attempted")
+            raise RuntimeError("UNIQUE constraint failed: notification_outbox.alert_id")
+
+    services.operations_repository = repository
+    services.alert_service = BrokenAlerts()
+    services.snapshots = Snapshots()
+    runtime = make_runtime(services, calls, config_loader=lambda _: services.config)
+    runtime._services = services
+    runtime._phase = RuntimePhase.RUNNING
+    incident = OperationalIncident(
+        incident_id="incident-accounting-0002",
+        fingerprint="runtime_risk:accounting:invariant",
+        component="runtime_risk",
+        category=IncidentCategory.ACCOUNTING,
+        severity=IncidentSeverity.URGENT,
+        reason="accounting_invariant",
+        first_seen_at=datetime(2026, 8, 24, tzinfo=UTC),
+        last_seen_at=datetime(2026, 8, 24, tzinfo=UTC),
+    )
+
+    action = await runtime.handle_incident(incident)
+
+    assert action == "halt"
+    assert await services.state_store.is_kill_switch_active() is True
+    assert "alert_attempted" in calls
+    # The whole point: the cancel-all still ran.
+    assert "cancel_all" in calls
+    assert calls.index("cancel_all") > calls.index("alert_attempted")
