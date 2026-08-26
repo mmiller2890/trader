@@ -902,3 +902,37 @@ async def test_a_reconciled_maker_fill_is_not_charged_as_taker() -> None:
 
     assert applied, "the remote fill was never applied"
     assert applied[0].liquidity == "maker"
+
+
+@pytest.mark.asyncio
+async def test_a_hung_venue_read_does_not_block_reconciliation_forever() -> None:
+    """
+    reconcile_startup runs inside live bootstrap, which is otherwise unbounded:
+    the SDK sets no explicit http timeout and polls for transaction hashes for
+    up to 30s. A hung CLOB could block BotRuntime.start indefinitely.
+    """
+
+    import time
+
+    class HangingOrdersReader:
+        def get_open_orders(self, market_id: str | None = None) -> list[OrderResult]:
+            # Long enough to outlast the timeout, short enough that the
+            # uncancellable thread does not hold up interpreter teardown.
+            time.sleep(1.0)
+            return []
+
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    service = ReconciliationService(
+        state_store=state,
+        mode=Mode.LIVE,
+        open_orders_reader=HangingOrdersReader(),
+        positions_reader=None,
+        request_timeout_seconds=0.05,
+    )
+
+    started = datetime.now(tz=UTC)
+    report = await service.reconcile_startup()
+    elapsed = (datetime.now(tz=UTC) - started).total_seconds()
+
+    assert elapsed < 0.5, f"reconciliation waited {elapsed:.2f}s on a hung read"
+    assert any("remote_open_orders_fetch_failed" in e for e in report.errors)

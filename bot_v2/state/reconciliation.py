@@ -7,7 +7,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Protocol
+from typing import Any, Protocol
 
 from config.schema import Mode
 from models.order import OrderResult, OrderStatus
@@ -71,6 +71,7 @@ class ReconciliationService:
         require_position_market_end: bool = False,
         min_order_size: Decimal = Decimal("1"),
         min_size_provider: Callable[[str], Decimal] | None = None,
+        request_timeout_seconds: float = 30.0,
     ) -> None:
         self._state_store = state_store
         self._mode = mode
@@ -83,6 +84,24 @@ class ReconciliationService:
         self._require_position_market_end = require_position_market_end
         self._min_order_size = min_order_size
         self._min_size_provider = min_size_provider
+        self._request_timeout_seconds = request_timeout_seconds
+
+    async def _read(self, call: Callable[[], Any], *args: Any) -> Any:
+        """
+        Run a blocking venue read with a bound on how long it may take.
+
+        reconcile_startup runs inside live bootstrap, which is not otherwise
+        bounded: the SDK's http client sets no explicit timeout and its
+        transaction-hash resolution polls for up to 30s, so a hung CLOB could
+        block BotRuntime.start indefinitely with no way to intervene. The
+        thread is not cancellable, but the caller stops waiting and the read
+        is reported as a failure like any other.
+        """
+
+        return await asyncio.wait_for(
+            asyncio.to_thread(call, *args),
+            timeout=self._request_timeout_seconds,
+        )
 
     def _minimum_tradeable_size(self, market_id: str) -> Decimal:
         """
@@ -130,9 +149,7 @@ class ReconciliationService:
             errors.append("open_orders_reader_not_configured")
         else:
             try:
-                remote = await asyncio.to_thread(
-                    self._open_orders_reader.get_open_orders
-                )
+                remote = await self._read(self._open_orders_reader.get_open_orders)
             except Exception as exc:
                 errors.append(
                     f"remote_open_orders_fetch_failed:{type(exc).__name__}"
@@ -150,10 +167,13 @@ class ReconciliationService:
                 unresolved_missing.append(order_id)
                 continue
             try:
-                latest = await asyncio.to_thread(
-                    get_order,
-                    order_id,
-                    client_order_id=local_order.client_order_id,
+                latest = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        get_order,
+                        order_id,
+                        client_order_id=local_order.client_order_id,
+                    ),
+                    timeout=self._request_timeout_seconds,
                 )
             except Exception as exc:
                 errors.append(
@@ -211,9 +231,8 @@ class ReconciliationService:
         if self._positions_reader is not None:
             positions_fetch_succeeded = False
             try:
-                remote_positions = await asyncio.to_thread(
-                    self._positions_reader.get_positions,
-                    self._funder_address or "",
+                remote_positions = await self._read(
+                    self._positions_reader.get_positions, self._funder_address or ""
                 )
                 positions_fetch_succeeded = True
             except Exception as exc:

@@ -364,6 +364,9 @@ async def bootstrap_app(
                         if is_live_mode(config.bot.mode)
                         else None
                     ),
+                    request_timeout_seconds=(
+                        config.reliability.rest_fallback_after_seconds
+                    ),
                 )
             except Exception as exc:
                 raise LivePreflightError(("client_initialization",)) from exc
@@ -539,6 +542,7 @@ async def bootstrap_app(
             if is_live_mode(config.bot.mode)
             else None
         ),
+        request_timeout_seconds=config.reliability.rest_fallback_after_seconds,
     )
     router = ExecutionRouter(
         config=config,
