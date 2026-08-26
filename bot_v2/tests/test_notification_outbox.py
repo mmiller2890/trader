@@ -303,3 +303,52 @@ async def test_an_undelivered_test_still_dedupes(tmp_path: Path) -> None:
 
     queued = await repository.due_alerts(now=NOW, limit=20)
     assert len(queued) == 1
+
+
+@pytest.mark.asyncio
+async def test_first_attempt_is_never_scheduled_into_the_future(tmp_path: Path) -> None:
+    """
+    An alert must be due the moment it is enqueued, under either clock.
+
+    The event's timestamp and the AlertService's clock are independent, and a
+    caller may inject either one. Stamping next_attempt_at from the service
+    clock alone let a daily summary emitted on an injected clock land in the
+    real future, where it never became due. That only turned the suite red
+    once wall-clock time crossed the test's query point, hours after the
+    change responsible -- so this pins it with fixed timestamps instead.
+
+    The service clock here is deliberately the REAL one, which is what makes
+    this reproduce: the event's timeline is the injected one, and the two
+    disagree.
+    """
+
+    stamped = datetime(2020, 1, 1, tzinfo=UTC)
+
+    repository = OperationsRepository(tmp_path / "past.sqlite3")
+    service = AlertService(repository, config())  # real clock, as production
+    past_event = BotEvent(
+        event_type=EventType.RUNTIME_RECOVERED,
+        component="supervisor",
+        mode="dry_run",
+        message="recovered",
+        created_at=stamped,
+    )
+    assert await service.enqueue_event(past_event) is not None
+    due = await repository.due_alerts(now=stamped + timedelta(seconds=1), limit=10)
+    assert len(due) == 1, (
+        "an alert enqueued from an event on another timeline never became due"
+    )
+
+    # Mirror case: injected service clock, event stamped in the real present.
+    service_clock = datetime(2020, 6, 1, tzinfo=UTC)
+    repository = OperationsRepository(tmp_path / "future.sqlite3")
+    service = AlertService(repository, config(), now=lambda: service_clock)
+    future_event = BotEvent(
+        event_type=EventType.RUNTIME_RECOVERED,
+        component="supervisor",
+        mode="dry_run",
+        message="recovered",
+    )
+    assert await service.enqueue_event(future_event) is not None
+    due = await repository.due_alerts(now=service_clock + timedelta(seconds=1), limit=10)
+    assert len(due) == 1, "alert stamped from a future event never became due"

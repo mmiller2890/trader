@@ -149,7 +149,13 @@ class AlertService:
                 severity=severity,
                 text=text,
                 created_at=event.created_at,
-                next_attempt_at=now,
+                # A first delivery attempt must never be scheduled into the
+                # future. The event's timestamp and this service's clock are
+                # independent -- callers inject one or the other -- so taking
+                # the earlier keeps the alert due under both. Stamping only
+                # ``now`` let a summary emitted on an injected clock land in
+                # the real future and never become due.
+                next_attempt_at=min(now, event.created_at),
             ),
             dedupe_after=(
                 now
