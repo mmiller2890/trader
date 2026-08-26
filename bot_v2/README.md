@@ -13,6 +13,7 @@ Implemented today:
 - inventory-skewed post-only market making with cancel-before-replace quoting;
 - momentum/reversion spike trading with complement-token routing, spread guards, and tick-floored exits;
 - book recording and reversion measurement tooling for offline strategy research;
+- fee-aware execution: post-only maker entries, maker-first exits that escalate to a taker cross on a deadline, and an edge gate that refuses signals which cannot clear fees plus the spread;
 - exchange tick-size and lot-size quantization on every submitted price;
 - WebSocket order-book ingestion with reconnect backoff;
 - spike-strategy signals with liquidity, exposure, slippage, and duplicate guards;
@@ -63,6 +64,32 @@ position exit policy ─────────────────► exec
 ```
 
 All order intents go through the same risk and accounting boundaries. Live mode adds credentials and exchange submission; it does not bypass risk checks.
+
+## Execution model: why orders rest
+
+Polymarket charges the taker `shares × 0.07 × p × (1 - p)` — about **350 bps of
+notional at even odds**, against a measured directional edge of about **120
+bps**. Crossing the spread costs roughly 7x the edge being captured, so the bot
+rests rather than crosses wherever it safely can. Makers pay nothing.
+
+| Behaviour | Setting |
+|---|---|
+| Entries rest inside the spread as post-only quotes | `spike_strategy.entry_style: maker` |
+| Exits rest at the ask before crossing | `position_management.exit_style: maker_first` |
+| A resting exit is cancelled and crossed after this long | `position_management.maker_exit_deadline_seconds: 30` |
+| Signals that cannot clear fees + spread are refused | `risk.edge_gate_mode: enforce` |
+
+Two exemptions are deliberate: **exits are never gated**, because refusing an
+exit strands inventory into resolution, and an exit at **market expiry always
+crosses**, because an unfilled resting exit at resolution leaves the full
+notional on a coin flip.
+
+The tradeoff resting makes is a certain cost for an uncertain fill. Offline
+replay of recorded books puts the fill rate at 70.7% (median 3.0s), but that
+ignores queue position and is an upper bound — and **dry run cannot measure
+fill rate at all**, since post-only orders there never fill by design. See
+[docs/spike-trading.md](docs/spike-trading.md) for the full argument and the
+pre-registered decision rule.
 
 ## Requirements
 
@@ -377,6 +404,21 @@ A quiet bot can be correct behavior: risk rejection is preferable to forcing a l
 ### An order receives HTTP 400
 
 Inspect the sanitized journal reason and verify token ID, side, price precision, tick size, minimum order/notional, time in force, balance, allowance, signature type, funder address, and whether the market is still accepting orders. Do not retry malformed orders blindly.
+
+**This is not hypothetical.** The only live session to date (2026-08-24) failed
+**110 of 110 orders**: 86 HTTP 400, 21 FOK partial-fill invariant violations,
+and 1 unknown outcome that produced a real local/exchange divergence, leaving
+two positions open on Polymarket. Tick-size, signing-option and post-only fixes
+have landed since and are believed to address it, but **none of them has been
+proven against the live venue**, and that session's journal has since rotated
+away, so the exact 400 bodies are no longer recoverable.
+
+Treat the live path as unproven. The first live session after this should be
+run at `max_live_order_notional: 2` with the journal preserved — copy
+`data/journal/events.jsonl` somewhere durable before and after — so that the
+`order_result` reasons survive for diagnosis whichever way it goes. A green
+test suite is evidence of wiring only: 589 mocked unit tests did not catch a
+78% live rejection rate.
 
 ### WebSocket data stops
 

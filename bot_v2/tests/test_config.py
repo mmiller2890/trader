@@ -323,3 +323,24 @@ def test_brackets_are_wider_than_the_mean_continuation() -> None:
     # data but 13/13 in the bot's own trades.
     assert policy.take_profit_bps > Decimal("400")
     assert policy.stop_loss_bps > Decimal("400")
+
+
+def test_shipped_config_prices_fees_correctly() -> None:
+    config = load_config(PROJECT_ROOT / "config")
+
+    assert config.execution.fee_rate == Decimal("0.07")
+    assert config.backtest.fee_rate == Decimal("0.07")
+
+
+def test_shipped_config_enters_as_maker_and_exits_maker_first() -> None:
+    config = load_config(PROJECT_ROOT / "config")
+
+    assert config.spike_strategy.entry_style == "maker"
+    assert config.position_management.exit_style == "maker_first"
+
+
+def test_shipped_edge_gate_is_enforcing() -> None:
+    config = load_config(PROJECT_ROOT / "config")
+
+    # Shadow mode is a measurement tool, never the shipped default.
+    assert config.risk.edge_gate_mode == "enforce"

@@ -56,6 +56,11 @@ execution:
   # Fallback tick grid when the exchange lookup is unavailable. Live mode reads
   # the real tick size per token from the CLOB.
   default_tick_size: 0.01
+  # Per-share taker fee rate. The real Polymarket charge is
+  # rate * p * (1 - p) per share, ~350 bps of notional at p=0.50, against a
+  # measured directional edge of ~120 bps. Makers pay zero, which is the
+  # entire reason entries rest and exits try maker first.
+  fee_rate: 0.07
   post_only_maker_quotes: true
 
 exchange:

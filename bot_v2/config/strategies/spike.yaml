@@ -58,3 +58,11 @@ spike_strategy:
   maker_offset_ticks: 1
   quote_ttl_seconds: 30
   maker_quote_size: 5
+
+  # Rest entries inside the spread as post-only quotes instead of crossing.
+  # A taker entry pays ~350 bps at even odds against a ~120 bps edge, so
+  # crossing is structurally unprofitable. Offline replay of 161,881
+  # recorded book observations puts the fill rate for a one-tick-inside
+  # quote at 70.7% with a 3.0s median time to fill -- an upper bound, since
+  # the replay ignores queue position.
+  entry_style: maker

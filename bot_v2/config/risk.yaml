@@ -18,3 +18,11 @@ risk:
   circuit_breaker_failures: 5
   circuit_breaker_window_seconds: 60
   circuit_breaker_cooldown_seconds: 120
+  # Refuse a signal whose expected edge cannot clear fees plus the spread.
+  # "shadow" logs what it would have refused without refusing it, and is a
+  # measurement tool only -- config load rejects it outside dry run, because
+  # an enforcing gate abstains on everything and starves the fill data the
+  # calibration needs. "enforce" is the shipped value.
+  edge_gate_mode: enforce
+  # Cushion added on top of modelled cost before a signal is allowed through.
+  safety_margin_bps: 50

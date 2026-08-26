@@ -37,8 +37,13 @@ run to −70%. Sizing must assume the tail, not the median.
 outcome tokens of a market are the same events counted twice. Below the 100
 the tool itself requires before rendering a verdict.
 
-**Not included:** fees, path-dependent stops, slippage. This is a mid-to-mid
+**Not included:** path-dependent stops and slippage. This is a mid-to-mid
 statistic, and the bot's own realized trades have not reproduced it.
+
+**Fees are now included, and they dominate.** This number is a gross edge of
+roughly +120 bps. Crossing the spread to capture it costs ~350 bps in taker
+fees at even odds. See "Why entries rest" below: the gross edge is real and
+the net edge, taken as a taker, is not.
 
 ### Two measurement bugs that inflated earlier numbers
 
@@ -237,6 +242,58 @@ the guard's absence.
 Two related fixes: the entry price band is judged on the ask you would
 actually pay rather than the mid, and complement-routed signals are risked
 against their own book -- previously a tight book vouched for a broken one.
+
+## Why entries rest
+
+Polymarket charges the taker `shares × 0.07 × p × (1 - p)`. At p=0.50 that is
+about **350 bps of notional**, against a measured directional edge of about
+**120 bps**. Paying it is a ~7x loss on the thing being captured, so a strategy
+that crosses to enter cannot be profitable no matter how good the signal is.
+Makers pay nothing.
+
+Everything below follows from that one arithmetic fact:
+
+| Behaviour | Setting | Effect |
+|---|---|---|
+| Entries rest inside the spread as post-only quotes | `spike_strategy.entry_style: maker` | Pays no fee; risks not filling |
+| Exits rest at the ask before crossing | `position_management.exit_style: maker_first` | Pays no fee when it fills in time |
+| A resting exit escalates to a taker cross | `maker_exit_deadline_seconds: 30` | Bounds how long an exit may hang |
+| Signals that cannot clear fees + spread are refused | `risk.edge_gate_mode: enforce` | Blocks structurally unprofitable trades |
+
+Two exemptions are deliberate. **Exits are never gated** — refusing an exit
+strands inventory into resolution, which is worse than paying to leave. And an
+exit at **market expiry always crosses**, because an unfilled resting exit at
+resolution leaves the full notional on a coin flip.
+
+### What the fill rate has to be
+
+Resting instead of crossing trades a certain 350 bps cost for an uncertain
+fill. Replaying 161,881 recorded book observations puts the fill rate for a
+one-tick-inside quote at **70.7%**, median **3.0s** to fill:
+
+```bash
+.venv/bin/python -m scripts.measure_fill_rate --input data/research/books.jsonl
+```
+
+Treat that as an **upper bound**: the replay ignores queue position, so a real
+quote fills less often. Failing this measurement is conclusive; passing it is
+not. Note also that **dry run cannot measure fill rate at all** — post-only
+orders there return `filled_size=0` permanently by design, so a clean dry-run
+session is evidence about wiring, never about fills.
+
+The measurement answers only half the question. The decision rule fixed before
+the number was known:
+
+| fill rate | P&L | meaning |
+|---|---|---|
+| >=20% | positive | thesis holds, proceed |
+| >=20% | negative | adverse selection; maker entry dead |
+| <20% | positive | viable but capital-starved |
+| <20% | negative | dead, stop |
+
+The fill-rate axis is now measured and clears the bar. **The P&L axis is not
+measured yet**, and the two live quadrants point opposite ways, so maker entry
+is not yet shown to be viable — only not yet falsified.
 
 ## Before running it live
 
