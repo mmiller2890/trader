@@ -37,6 +37,18 @@ class ClobUncertainOutcomeError(ClobAdapterError):
     """Raised when a submission outcome is unknown (timeout or transport failure)."""
 
 
+class ClobPostOnlyCrossError(ClobAdapterError):
+    """
+    Raised when the venue refuses a post-only order because it would cross.
+
+    This is the venue honouring post-only, not a fault: the book moved between
+    the snapshot the price was built from and the order arriving, so the order
+    would have taken liquidity. The right response is to re-quote on the next
+    book update. Counting it as an execution failure would halt the bot for
+    quoting, which under entry_style: maker is every entry it makes.
+    """
+
+
 class CollateralStatus(BaseModel):
     """Normalized pUSD collateral balance and allowance."""
 
@@ -508,10 +520,14 @@ class ClobClientAdapter:
             raise
         except PolyApiException as exc:
             if exc.status_code is not None:
-                raise ClobAdapterError(
-                    f"order submission rejected:http_{exc.status_code}"
-                    f":{_sanitize_upstream_error(exc.error_msg)}"
-                ) from exc
+                detail = _sanitize_upstream_error(exc.error_msg)
+                message = (
+                    f"order submission rejected:http_{exc.status_code}:{detail}"
+                )
+                lowered = str(detail).lower()
+                if "post-only" in lowered and "cross" in lowered:
+                    raise ClobPostOnlyCrossError(message) from exc
+                raise ClobAdapterError(message) from exc
             raise ClobUncertainOutcomeError(
                 "order submission outcome unknown:PolyApiException"
             ) from exc

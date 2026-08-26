@@ -11,6 +11,7 @@ from clients.auth import is_live_trading_enabled
 from clients.clob_client import (
     ClobAdapterError,
     ClobClientAdapter,
+    ClobPostOnlyCrossError,
     ClobUncertainOutcomeError,
 )
 from config.schema import AppConfig, Mode
@@ -168,6 +169,25 @@ class OrderSubmitter:
                 token_id=order.token_id,
                 side=order.side,
                 status=OrderStatus.UNKNOWN,
+                accepted=False,
+                message=str(exc),
+                signal_id=order.signal_id,
+                strategy_name=order.strategy_name,
+                requested_size=order.size,
+                latency_ms=latency_ms,
+                liquidity=liquidity,
+            )
+        except ClobPostOnlyCrossError as exc:
+            # The venue honoured post-only against a book that moved under us.
+            # Deliberately not a circuit-breaker failure: re-quoting is the
+            # correct response, and counting it would halt the bot for quoting.
+            latency_ms = int((datetime.now(tz=UTC) - started).total_seconds() * 1000)
+            return OrderResult(
+                client_order_id=order.client_order_id,
+                market_id=order.market_id,
+                token_id=order.token_id,
+                side=order.side,
+                status=OrderStatus.REJECTED,
                 accepted=False,
                 message=str(exc),
                 signal_id=order.signal_id,

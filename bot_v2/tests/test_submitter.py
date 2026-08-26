@@ -5,7 +5,11 @@ from decimal import Decimal
 
 import pytest
 
-from clients.clob_client import ClobClientAdapter, ClobUncertainOutcomeError
+from clients.clob_client import (
+    ClobClientAdapter,
+    ClobPostOnlyCrossError,
+    ClobUncertainOutcomeError,
+)
 from config.schema import AppConfig, Mode
 from execution.submitter import OrderSubmitter
 from models.order import (
@@ -318,3 +322,44 @@ async def test_submitted_id_history_is_bounded() -> None:
     # The oldest ids are evicted, the newest retained.
     assert "order-00000000" not in submitter._submitted_ids
     assert f"order-{SUBMITTED_ID_HISTORY + 49:08d}" in submitter._submitted_ids
+
+
+class PostOnlyCrossAdapter(RecordingAdapter):
+    def submit_order(self, order: OrderRequest) -> OrderResult:
+        self.submitted.append(order)
+        raise ClobPostOnlyCrossError(
+            "order submission rejected:http_400:invalid post-only order: "
+            "order crosses book"
+        )
+
+
+@pytest.mark.asyncio
+async def test_post_only_cross_is_rejected_without_tripping_the_breaker() -> None:
+    """
+    A post-only order refused for crossing is the venue doing its job, not a
+    fault. The book moved between the snapshot the price was built from and
+    the moment it arrived, so the order would have taken liquidity and was
+    correctly refused.
+
+    Counting that toward the circuit breaker halts the bot for quoting, which
+    with entry_style: maker is every entry it makes. Two of these arrived in
+    the first live session on 2026-08-26 and would have halted it at five.
+    """
+
+    adapter = PostOnlyCrossAdapter()
+    submitter = make_submitter(adapter)
+
+    for index in range(4):
+        # Under the notional cap so the request reaches the adapter, and with a
+        # distinct id so the duplicate guard does not record the failure first.
+        request = buy_request(size="2", price="0.50")
+        request = request.model_copy(update={"client_order_id": f"cross-{index:04d}"})
+        result = await submitter.submit(request)
+        assert result.status == OrderStatus.REJECTED
+        assert result.accepted is False
+        assert "post-only" in result.message
+
+    # Threshold is 3; a genuine fault sequence would have tripped it by now.
+    state = submitter._circuit_breaker.state()
+    assert state.tripped is False
+    assert state.failures_in_window == 0
