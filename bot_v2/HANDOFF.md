@@ -18,8 +18,8 @@ over anything else, including this document.
 ## State right now
 
 - Branch: **main** (the operator explicitly chose main over a worktree)
-- HEAD: **f683231**
-- Suite: **823 passing** (`-W error::RuntimeWarning`, compileall clean)
+- HEAD: **8a93347**
+- Suite: **874 passing** (`-W error::RuntimeWarning`, compileall clean)
 - Working tree: **clean**
 
 Two background processes are running and should be left alone unless you mean
@@ -159,6 +159,33 @@ handler around `post_order` would have turned that `ValueError` into
 `ClobUncertainOutcomeError`, recording a deterministic local bug as an *unknown
 outcome*. That is the category that produced the one real divergence on
 2026-08-24. Now refused at both `TradeSignal` validation and the adapter.
+
+## What is verified offline, and what still is not
+
+`py_clob_client_v2` carries the venue's order rules as pure functions, so they
+can be asserted with no network and no credentials. `8a93347` pins:
+
+- `SUPPORTED_TICK_SIZES` against the SDK's `ROUNDING_CONFIG` keys, so a tick
+  size we accept but it does not (a `KeyError` during order creation) fails in
+  the suite, and an SDK upgrade that changes the venue grid is caught.
+- Every price the builder emits, run through the SDK's own `price_valid` across
+  all six tick sizes and the full book range, plus exact tick-grid and the
+  two-decimal size rule.
+
+That closes the specific defect behind the 86 HTTP 400s against the venue's own
+validator rather than against our reading of it. **It is not evidence the live
+path works.** These three remain unprovable without a real submission:
+
+1. whether the order, once signed, is accepted -- signing needs a key and the
+   network;
+2. the `makingAmount`/`takingAmount` unit reading, which only a real fill
+   settles (guarded in the dangerous direction, see above);
+3. balance, allowance and funder-address correctness, which is what
+   `scripts/live_preflight.py` exists to check and which nobody has run since
+   the fixes landed.
+
+**Run the preflight before anything else live.** It is read-only and needs no
+order.
 
 ## What Task 8b was for
 
