@@ -251,7 +251,7 @@ class InMemoryStateStore:
         now: datetime,
         market_end_lookup: Callable[[str, str], datetime | None] | None = None,
         dust_threshold: Decimal = Decimal("0"),
-        dust_threshold_for: Callable[[str], Decimal] | None = None,
+        dust_thresholds: dict[str, Decimal] | None = None,
     ) -> PositionMergeResult:
         """
         Merge remote truth while preserving pending confirmed local fills.
@@ -261,11 +261,12 @@ class InMemoryStateStore:
         cannot be traded away by anyone, so it is retired as dust instead of
         being deferred and then reported as a divergence on every later pass.
 
-        ``dust_threshold_for`` resolves that floor per market, because the venue
-        publishes it per market. The larger of the two wins, so a looser local
-        setting cannot leave unsellable inventory looking like a divergence. A
-        lookup failure falls back to ``dust_threshold`` rather than disabling
-        dust handling.
+        ``dust_thresholds`` carries that floor per market, because the venue
+        publishes it per market, and the larger of the two wins. It is a plain
+        mapping rather than a callable on purpose: resolving it can require a
+        venue round trip, and this method holds the state lock for its whole
+        body. Callers resolve the thresholds first and pass the result in, so
+        no HTTP ever happens while every other reader of this store is blocked.
         """
 
         async with self._lock:
@@ -320,11 +321,10 @@ class InMemoryStateStore:
                             )
                         continue
                 effective_dust = dust_threshold
-                if dust_threshold_for is not None:
-                    try:
-                        effective_dust = max(effective_dust, dust_threshold_for(key[0]))
-                    except Exception:
-                        effective_dust = dust_threshold
+                if dust_thresholds:
+                    effective_dust = max(
+                        effective_dust, dust_thresholds.get(key[0], dust_threshold)
+                    )
                 if (
                     effective_dust > 0
                     and local_quantity < effective_dust

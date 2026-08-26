@@ -84,6 +84,25 @@ class ReconciliationService:
         self._min_order_size = min_order_size
         self._min_size_provider = min_size_provider
 
+    def _minimum_tradeable_size(self, market_id: str) -> Decimal:
+        """
+        The smallest quantity anyone can put in an order for this market.
+
+        The venue publishes it per market and the configured value is a floor,
+        so the larger binds. Every decision about whether inventory is
+        tradeable must come through here: when the dust retirement and the
+        sellable set disagreed about this number, a position between the two
+        was retired as dust and counted sellable at the same time, raising
+        position_market_window_unknown on every pass.
+        """
+
+        if self._min_size_provider is None:
+            return self._min_order_size
+        try:
+            return max(self._min_order_size, self._min_size_provider(market_id))
+        except Exception:
+            return self._min_order_size
+
     async def reconcile_startup(self) -> ReconciliationReport:
         """Run conservative startup reconciliation."""
 
@@ -198,6 +217,17 @@ class ReconciliationService:
             if positions_fetch_succeeded and (
                 authoritative_positions or not local_positions
             ):
+                # Resolve every floor before the merge, which holds the
+                # state lock for its whole body. Doing the venue lookup inside
+                # it would stall snapshot ingest and fill accounting for a
+                # network round trip.
+                threshold_markets = {
+                    position.market_id for position in remote_positions
+                } | {position.market_id for position in local_positions}
+                dust_thresholds = {
+                    market_id: self._minimum_tradeable_size(market_id)
+                    for market_id in threshold_markets
+                }
                 merge = await self._state_store.merge_authoritative_positions(
                     remote_positions,
                     now=self._now(),
@@ -208,7 +238,7 @@ class ReconciliationService:
                     # is published per market, so resolve it per market and fall
                     # back to the configured value when the lookup fails.
                     dust_threshold=self._min_order_size,
-                    dust_threshold_for=self._min_size_provider,
+                    dust_thresholds=dust_thresholds,
                 )
                 deferred_positions = merge.deferred_keys
                 for key in merge.expired_keys:
@@ -217,7 +247,8 @@ class ReconciliationService:
                     sellable = {
                         f"{position.market_id}:{position.token_id}"
                         for position in remote_positions
-                        if position.quantity >= self._min_order_size
+                        if position.quantity
+                        >= self._minimum_tradeable_size(position.market_id)
                     }
                     for key in merge.unknown_market_keys:
                         if key in sellable:
@@ -319,13 +350,7 @@ class ReconciliationService:
         for key, quantity in list(local_map.items()):
             if key in remote_map:
                 continue
-            threshold = self._min_order_size
-            if self._min_size_provider is not None:
-                try:
-                    threshold = max(threshold, self._min_size_provider(key[0]))
-                except Exception:
-                    threshold = self._min_order_size
-            if quantity < threshold:
+            if quantity < self._minimum_tradeable_size(key[0]):
                 local_map.pop(key)
                 continue
             lifecycle = await self._state_store.get_position_lifecycle(*key)

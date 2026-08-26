@@ -783,3 +783,65 @@ async def test_live_market_position_mismatch_still_blocks_live_startup() -> None
 
     assert "position_mismatch" in report.errors
     assert report.ok is False
+
+
+@pytest.mark.asyncio
+async def test_sellable_uses_the_same_floor_as_dust_retirement() -> None:
+    """
+    merge_authoritative_positions retires dust at max(config, venue), but the
+    sellable set that drives position_market_window_unknown used the config
+    minimum alone.
+
+    A remote position between the two is retired as dust and simultaneously
+    counted sellable, so the error is raised on every pass, ok stays False,
+    and the runtime halts over inventory it already decided nobody can trade.
+    """
+
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    remote = Position(
+        market_id="thin",
+        token_id="t1",
+        quantity=Decimal("2"),
+        average_entry_price=Decimal("0.40"),
+    )
+    service = ReconciliationService(
+        state_store=state,
+        mode=Mode.LIVE,
+        open_orders_reader=FakeOrdersReader([]),
+        positions_reader=FakePositionsReader([remote]),
+        market_end_lookup=lambda market_id, token_id: None,
+        require_position_market_end=True,
+        min_order_size=Decimal("1"),
+        min_size_provider=lambda market_id: Decimal("5"),
+    )
+
+    report = await service.reconcile_runtime()
+
+    assert not any("position_market_window_unknown" in e for e in report.errors), (
+        f"unexpected errors: {report.errors}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failing_venue_lookup_falls_back_to_the_configured_floor() -> None:
+    """
+    Thresholds are resolved before the state lock is taken, so a venue lookup
+    failure has to degrade there. It must fall back to the configured minimum
+    rather than disabling dust handling, which would restore the halt loop.
+    """
+
+    state = InMemoryStateStore(mode=Mode.LIVE)
+
+    def broken(market_id: str) -> Decimal:
+        raise RuntimeError("venue lookup failed")
+
+    service = ReconciliationService(
+        state_store=state,
+        mode=Mode.LIVE,
+        open_orders_reader=FakeOrdersReader([]),
+        positions_reader=FakePositionsReader([]),
+        min_order_size=Decimal("5"),
+        min_size_provider=broken,
+    )
+
+    assert service._minimum_tradeable_size("anything") == Decimal("5")

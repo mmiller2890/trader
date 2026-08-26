@@ -511,7 +511,7 @@ async def test_dust_threshold_follows_the_venue_minimum_per_market() -> None:
         [],
         now=now,
         dust_threshold=Decimal("5"),
-        dust_threshold_for=lambda market_id: Decimal("50"),
+        dust_thresholds={"thin": Decimal("50")},
     )
 
     # 20 clears the configured 5 but not this market's floor of 50.
@@ -521,8 +521,12 @@ async def test_dust_threshold_follows_the_venue_minimum_per_market() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dust_threshold_lookup_failure_falls_back_to_the_configured_floor() -> None:
-    """A venue lookup failure must not silently disable dust handling."""
+async def test_market_absent_from_the_threshold_map_uses_the_configured_floor() -> None:
+    """
+    A market with no resolved venue floor still gets dust handling at the
+    configured minimum, so a lookup failure upstream cannot silently disable
+    it. The upstream fallback itself is pinned in test_reconciliation.
+    """
 
     state = InMemoryStateStore(mode=Mode.LIVE)
     now = datetime(2026, 8, 26, 8, 5, tzinfo=UTC)
@@ -540,11 +544,8 @@ async def test_dust_threshold_lookup_failure_falls_back_to_the_configured_floor(
         confirmation_deadline=now - timedelta(seconds=1),
     )
 
-    def broken(market_id: str) -> Decimal:
-        raise RuntimeError("venue lookup failed")
-
     result = await state.merge_authoritative_positions(
-        [], now=now, dust_threshold=Decimal("5"), dust_threshold_for=broken
+        [], now=now, dust_threshold=Decimal("5"), dust_thresholds={"other": Decimal("50")}
     )
 
     assert result.dust_keys == ["m1:t1"]
