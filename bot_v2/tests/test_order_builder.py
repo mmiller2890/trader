@@ -12,6 +12,7 @@ from execution.order_builder import OrderBuilder
 from models.market import MarketSnapshot
 from models.order import OrderTimeInForce
 from models.signal import SignalSide, SignalType, TradeSignal
+from models.tick import SUPPORTED_TICK_SIZES
 
 
 def test_order_builder_creates_deterministic_request() -> None:
@@ -451,3 +452,147 @@ def test_post_only_signal_cannot_carry_a_killing_time_in_force() -> None:
             limit_price=Decimal("0.49"),
             time_in_force=OrderTimeInForce.IOC,
         )
+
+
+def test_our_supported_tick_sizes_match_the_sdk_rounding_table() -> None:
+    """
+    The SDK indexes ROUNDING_CONFIG by tick size and raises KeyError for any
+    key it does not carry, so a tick size we accept but it does not is an
+    order that dies during creation. This pins the two lists together, and
+    fails if an SDK upgrade changes the venue's supported grid.
+    """
+
+    from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG
+
+    assert {str(tick) for tick in SUPPORTED_TICK_SIZES} == set(ROUNDING_CONFIG)
+
+
+@pytest.mark.parametrize("tick", [str(tick) for tick in SUPPORTED_TICK_SIZES])
+@pytest.mark.parametrize(
+    "best_bid",
+    ["0.0001", "0.001", "0.01", "0.10", "0.50", "0.90", "0.99", "0.9999"],
+)
+def test_every_built_price_satisfies_the_venue_price_rule(
+    tick: str, best_bid: str
+) -> None:
+    """
+    Cross-check the order builder against the venue's own validator instead of
+    against our reading of it.
+
+    ``py_clob_client_v2.create_order`` refuses any price outside
+    [tick, 1 - tick] with a PolyException before signing, and rejects any price
+    off the tick grid. Prices built from raw best_bid/best_ask without snapping
+    to that grid are the identified cause of the 86 HTTP 400s on 2026-08-24, so
+    this asserts the property directly, at the extremes of the book where the
+    clamp actually has to do something.
+    """
+
+    from py_clob_client_v2.utilities import price_valid
+
+    tick_size = Decimal(tick)
+    # Keep the book representable for this tick: a one-tick spread has to fit
+    # inside [tick, 1 - tick], which pins the widest usable bid at 1 - 2*tick.
+    bid = min(max(Decimal(best_bid), tick_size), Decimal("1") - 2 * tick_size)
+    ask = bid + tick_size
+    snapshot = MarketSnapshot(
+        market_id="m1",
+        token_id="t1",
+        best_bid=bid,
+        best_ask=ask,
+        mid_price=(bid + ask) / 2,
+        top_bid_size=Decimal("100"),
+        top_ask_size=Decimal("100"),
+    )
+    builder = OrderBuilder(AppConfig(), tick_size_provider=lambda _: tick_size)
+
+    for side in (SignalSide.BUY, SignalSide.SELL):
+        signal = TradeSignal(
+            signal_id=uuid4().hex,
+            strategy_name="spike",
+            signal_type=(
+                SignalType.PRICE_SPIKE
+                if side == SignalSide.BUY
+                else SignalType.POSITION_EXIT
+            ),
+            side=side,
+            market_id="m1",
+            token_id="t1",
+            reference_price=Decimal("0.50"),
+            target_price=Decimal("0.50"),
+            observed_move_bps=100,
+            reason="test",
+            reduce_only=side == SignalSide.SELL,
+        )
+        order = builder.build(signal=signal, snapshot=snapshot)
+
+        assert price_valid(float(order.price), tick), (
+            f"{side.value} price {order.price} outside [{tick}, {1 - tick_size}]"
+        )
+        assert order.price % tick_size == 0, (
+            f"{side.value} price {order.price} is off the {tick} grid"
+        )
+        # The venue rounds every size to two decimals regardless of tick size.
+        assert order.size == order.size.quantize(Decimal("0.01"))
+
+
+@pytest.mark.parametrize(
+    ("best_bid", "best_ask", "side"),
+    [
+        # Aggressive BUY rounds the ask UP; off-grid near the ceiling that
+        # lands on 1.00, which pays out and which the venue refuses.
+        ("0.9950", "0.9990", SignalSide.BUY),
+        # Aggressive SELL rounds the bid DOWN; off-grid near the floor that
+        # lands on 0.00.
+        ("0.0050", "0.0090", SignalSide.SELL),
+    ],
+)
+def test_prices_at_the_payout_bounds_are_clamped_into_venue_range(
+    best_bid: str, best_ask: str, side: SignalSide
+) -> None:
+    """
+    Tick snapping alone can push a price past the payout bounds.
+
+    Rounding a marketable order toward the market is what keeps it fillable,
+    but at the edge of the book that rounding lands on 1.00 or 0.00 -- prices
+    the venue refuses, since ``price_valid`` requires [tick, 1 - tick]. The
+    clamp in quantize_price is what stops it, and only an off-grid book at the
+    boundary exercises it.
+    """
+
+    from py_clob_client_v2.utilities import price_valid
+
+    tick_size = Decimal("0.01")
+    snapshot = MarketSnapshot(
+        market_id="m1",
+        token_id="t1",
+        best_bid=Decimal(best_bid),
+        best_ask=Decimal(best_ask),
+        mid_price=(Decimal(best_bid) + Decimal(best_ask)) / 2,
+        top_bid_size=Decimal("100"),
+        top_ask_size=Decimal("100"),
+    )
+    builder = OrderBuilder(AppConfig(), tick_size_provider=lambda _: tick_size)
+    signal = TradeSignal(
+        signal_id=uuid4().hex,
+        strategy_name="spike",
+        signal_type=(
+            SignalType.PRICE_SPIKE
+            if side == SignalSide.BUY
+            else SignalType.POSITION_EXIT
+        ),
+        side=side,
+        market_id="m1",
+        token_id="t1",
+        reference_price=Decimal("0.50"),
+        target_price=Decimal("0.50"),
+        observed_move_bps=100,
+        reason="test",
+        reduce_only=side == SignalSide.SELL,
+    )
+
+    order = builder.build(signal=signal, snapshot=snapshot)
+
+    assert price_valid(float(order.price), "0.01"), (
+        f"{side.value} price {order.price} is outside the venue's [0.01, 0.99]"
+    )
+    assert Decimal("0.01") <= order.price <= Decimal("0.99")
