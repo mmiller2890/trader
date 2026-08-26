@@ -71,7 +71,8 @@ def _paste_mode(env_path: Path) -> int:
     and invalidate the working set.
     """
 
-    from getpass import getpass
+    import sys
+    from getpass import GetPassWarning, getpass
 
     prompts = (
         ("PRIVATE_KEY", "Private key"),
@@ -79,16 +80,38 @@ def _paste_mode(env_path: Path) -> int:
         ("CLOB_SECRET", "Secret"),
         ("CLOB_PASSPHRASE", "Passphrase"),
     )
-    print("Paste each value; input is hidden. Blank leaves that entry unchanged.\n")
+    print("Paste each value and press Enter. Input is hidden.")
+    print("Press Enter on its own to leave that entry unchanged.\n")
+    sys.stdout.flush()
 
     values: dict[str, str] = {}
     for key, label in prompts:
-        entered = getpass(f"  {label}: ").strip()
+        # getpass writes straight to the tty while print() buffers, so without
+        # this flush the prompts appear out of order and the whole thing looks
+        # like it hung on the wrong field.
+        sys.stdout.flush()
+        try:
+            import warnings
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", GetPassWarning)
+                entered = getpass(f"  {label}: ").strip()
+        except (GetPassWarning, Exception):  # noqa: BLE001
+            # No usable tty (piped stdin, some IDE consoles). Fall back to a
+            # visible read rather than silently reading nothing.
+            print(f"  {label} (VISIBLE - no hidden input available): ", end="")
+            sys.stdout.flush()
+            entered = (sys.stdin.readline() or "").strip()
         if entered:
             values[key] = entered
+            print(f"    ok - {len(entered)} characters")
+        else:
+            print("    skipped")
+        sys.stdout.flush()
 
     if not values:
         print("\nnothing entered; .env unchanged.")
+        print("If the prompts did not accept your paste, run with --visible.")
         return 0
 
     if env_path.exists():
