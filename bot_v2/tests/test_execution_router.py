@@ -348,3 +348,109 @@ async def test_signal_is_risked_against_its_own_book_not_the_callers() -> None:
     assert submitter.orders == []
     reasons = [getattr(e, "reason", "") or "" for e in journal.events]
     assert any("entry_spread_too_wide" in r for r in reasons)
+
+
+async def _reserved_exit_state() -> InMemoryStateStore:
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    await state.set_position(
+        Position(
+            market_id="m1",
+            token_id="t1",
+            quantity=Decimal("5"),
+            average_entry_price=Decimal("0.40"),
+        )
+    )
+    state._lifecycles[("m1", "t1")] = PositionLifecycle(
+        market_id="m1",
+        token_id="t1",
+        opened_at=datetime.now(tz=UTC),
+        last_fill_at=datetime.now(tz=UTC),
+    )
+    assert await state.reserve_exit(
+        "m1",
+        "t1",
+        client_order_id="pm-bot-signal12345678",
+        reason=ExitReason.TAKE_PROFIT,
+        attempted_at=datetime.now(tz=UTC),
+    )
+    return state
+
+
+def _exit_signal():  # type: ignore[no-untyped-def]
+    return signal().model_copy(
+        update={
+            "side": SignalSide.SELL,
+            "signal_type": SignalType.POSITION_EXIT,
+            "reduce_only": True,
+            "requested_size": Decimal("2"),
+            "reason": "position_exit:take_profit",
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_exit_reservation_is_released_when_no_snapshot_is_available() -> None:
+    """
+    Reachable from exit_manager.on_timer, which passes whatever snapshot the
+    store has. Returning without releasing leaves
+    pending_exit_client_order_id set forever, and every later exit for that
+    position short-circuits on it -- the position can never be exited again.
+    """
+
+    config = live_config()
+    state = await _reserved_exit_state()
+    submitter = RecordingSubmitter()
+    execution_router = ExecutionRouter(
+        config=config,
+        state_store=state,
+        risk_engine=PreTradeRiskEngine(config=config, state_store=state),
+        order_builder=OrderBuilder(config),
+        submitter=submitter,
+        tracker=OrderTracker(state),
+        journal=RecordingJournal(),
+        event_bus=EventBus(),
+    )
+
+    await execution_router.route_signal(_exit_signal(), snapshot=None)
+
+    assert submitter.orders == []
+    lifecycle = await state.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    assert lifecycle.pending_exit_client_order_id is None
+
+
+@pytest.mark.asyncio
+async def test_exit_reservation_is_released_when_risk_halts() -> None:
+    """
+    A risk HALT rejects the signal before submission, so the reservation it
+    holds is for an order that will never exist. Keeping it means that after
+    clear_halt every future exit for the position short-circuits on
+    pending_exit_client_order_id and the position can never be exited.
+
+    Observed live on 2026-08-26: the kill switch latched at 08:30:50, the
+    stop-loss exits at 08:31:04 and 08:31:34 were rejected with
+    kill_switch_active, and the snapshot kept pending_exit_client_order_id set.
+    """
+
+    config = live_config()
+    state = await _reserved_exit_state()
+    await state.set_kill_switch(True, reason="test_halt")
+
+    submitter = RecordingSubmitter()
+    execution_router = ExecutionRouter(
+        config=config,
+        state_store=state,
+        risk_engine=PreTradeRiskEngine(config=config, state_store=state),
+        order_builder=OrderBuilder(config),
+        submitter=submitter,
+        tracker=OrderTracker(state),
+        journal=RecordingJournal(),
+        event_bus=EventBus(),
+    )
+
+    await execution_router.route_signal(_exit_signal(), snapshot=snapshot())
+
+    assert submitter.orders == []
+    lifecycle = await state.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    assert lifecycle.pending_exit_client_order_id is None

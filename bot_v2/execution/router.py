@@ -182,11 +182,16 @@ class ExecutionRouter:
                             reason=risk_decision.reason,
                         )
                     )
-            else:
-                await self._release_exit_reservation(signal)
+            # Released on every rejection, halt included. The signal never
+            # reaches submission, so the reservation is held for an order that
+            # will never exist -- and once the halt is cleared it would block
+            # every future exit for this position on
+            # pending_exit_client_order_id, leaving it permanently unexitable.
+            await self._release_exit_reservation(signal)
             return None
 
         if current_snapshot is None or order_request is None:
+            await self._release_exit_reservation(signal)
             return None
         await self._emit_event(
             BotEvent(
