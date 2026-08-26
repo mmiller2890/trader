@@ -521,6 +521,18 @@ class ClobClientAdapter:
                 fill_notional = taking_amount
             if filled_size <= 0:
                 raise ClobAdapterError("matched submission response has zero fill size")
+            # A venue cannot fill more than was asked for, so a fill that
+            # exceeds the request is a unit misread rather than a real fill.
+            # These amounts were parsed as six-decimal fixed point until
+            # 2026-08-25 and as plain decimals since, and that reading has
+            # never been confirmed against the live venue -- getting it wrong
+            # this way turns one share into a million in position accounting.
+            # Fail closed so reconciliation resolves it against the exchange.
+            if filled_size > order.size:
+                raise ClobAdapterError(
+                    f"matched fill size {filled_size} exceeds requested size "
+                    f"{order.size}"
+                )
             avg_fill_price = fill_notional / filled_size
             status = (
                 OrderStatus.FILLED

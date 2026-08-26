@@ -979,3 +979,38 @@ def test_cancel_without_exchange_id_is_not_found() -> None:
     )
     result = adapter.cancel_resting_order(cancel_intent(order_id=None))
     assert result.outcome == CancelOutcome.NOT_FOUND
+
+
+def test_submit_order_refuses_a_matched_fill_larger_than_the_order() -> None:
+    """
+    A fill can never exceed the size requested, so one that does means the
+    response amounts were parsed in the wrong units -- not that a huge fill
+    happened.
+
+    This adapter read makingAmount/takingAmount as six-decimal fixed point
+    until 2026-08-25 and reads them as plain decimals now. That change has
+    never been checked against the live venue. If it is wrong in this
+    direction a 1-share order books as 1,000,000 shares, and the divergence
+    is written straight into position accounting. Failing closed sends it to
+    reconciliation instead.
+    """
+
+    class OverfilledClient(FakeV2Client):
+        def post_order(self, order: object, order_type: object = "GTC", post_only: bool = False, defer_exec: bool = False) -> dict[str, object]:
+            return {
+                "success": True,
+                "orderID": "0xoverfill",
+                "status": "matched",
+                # What a six-decimal venue would return for 1 share at 0.50.
+                "makingAmount": "500000",
+                "takingAmount": "1000000",
+                "errorMsg": "",
+            }
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=OverfilledClient,
+    )
+    with pytest.raises(ClobAdapterError, match="exceeds requested size"):
+        adapter.submit_order(buy_request(size="1", price="0.50"))
