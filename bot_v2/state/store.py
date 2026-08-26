@@ -315,10 +315,19 @@ class InMemoryStateStore:
                     if market_end_at is not None and now >= market_end_at:
                         settled.append(f"{key[0]}:{key[1]}")
                         self._positions.pop(key, None)
-                        if lifecycle.confirmation_deadline is not None:
-                            self._lifecycles[key] = lifecycle.model_copy(
-                                update={"confirmation_deadline": None}
-                            )
+                        # Release the exit reservation too. The exit manager
+                        # sweeps resting maker exits only for positions, and
+                        # the position is what just went away -- so a still
+                        # reserved order would be cancelled by nobody and could
+                        # fill into a market that can no longer be traded out
+                        # of. Releasing lets the stale-order sweep retire it.
+                        self._lifecycles[key] = lifecycle.model_copy(
+                            update={
+                                "confirmation_deadline": None,
+                                "pending_exit_client_order_id": None,
+                                "pending_exit_is_maker": False,
+                            }
+                        )
                         continue
                 effective_dust = dust_threshold
                 if dust_thresholds:

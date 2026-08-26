@@ -618,3 +618,41 @@ async def test_fee_is_charged_on_the_incremental_fill_price() -> None:
     assert abs(position.realized_pnl - expected) < Decimal("0.0000001"), (
         f"charged {position.realized_pnl}, correct is {expected}"
     )
+
+
+@pytest.mark.asyncio
+async def test_settled_retirement_clears_the_pending_exit_reservation() -> None:
+    """
+    The settled branch popped the position but left
+    pending_exit_client_order_id set. Nothing then cancels that order: the exit
+    manager's sweep only runs for positions, which is gone, and the stale-order
+    sweep deliberately protects pending exits. The resting exit stays on the
+    book and can fill into a market nobody can trade out of.
+    """
+
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    now = datetime(2026, 8, 26, 9, 16, tzinfo=UTC)
+    state._positions[("ended", "t1")] = Position(
+        market_id="ended",
+        token_id="t1",
+        quantity=Decimal("5"),
+        average_entry_price=Decimal("0.60"),
+    )
+    state._lifecycles[("ended", "t1")] = PositionLifecycle(
+        market_id="ended",
+        token_id="t1",
+        opened_at=now - timedelta(hours=1),
+        last_fill_at=now - timedelta(hours=1),
+        market_end_at=now - timedelta(minutes=30),
+        pending_exit_client_order_id="pm-bot-exit00000001",
+        pending_exit_is_maker=True,
+    )
+
+    result = await state.merge_authoritative_positions([], now=now, dust_threshold=Decimal("5"))
+
+    assert result.settled_keys == ["ended:t1"]
+    lifecycle = await state.get_position_lifecycle("ended", "t1")
+    assert lifecycle is not None
+    # Released, so the stale-order sweep is free to cancel it.
+    assert lifecycle.pending_exit_client_order_id is None
+    assert lifecycle.pending_exit_is_maker is False

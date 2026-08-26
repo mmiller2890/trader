@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 
 from app.supervisor import Heartbeat
 from models.operations import (
@@ -201,7 +202,9 @@ async def position_exit_loop(
         )
 
 
-async def sweep_stale_resting_orders(services: object) -> list[str]:
+async def sweep_stale_resting_orders(
+    services: object, *, now: datetime | None = None
+) -> list[str]:
     """
     Cancel resting maker entries that have outlived their TTL or their market.
 
@@ -244,14 +247,36 @@ async def sweep_stale_resting_orders(services: object) -> list[str]:
         for lifecycle in lifecycles
     }
 
+    # A resting entry has no position, so it has no lifecycle either -- which
+    # is exactly the order this sweep exists for. Lifecycles alone therefore
+    # answer None for it and the market-ended branch could never fire. Fall
+    # back to the market the rotator is actually on.
+    current_market = None
+    rotator = getattr(services, "market_rotator", None)
+    if rotator is not None:
+        try:
+            current_market = getattr(rotator.status(), "current_market", None)
+        except Exception:
+            current_market = None
+
+    def market_end_for(market_id: str, token_id: str) -> datetime | None:
+        known = market_ends.get((market_id, token_id))
+        if known is not None:
+            return known
+        if current_market is None:
+            return None
+        if market_id == getattr(current_market, "condition_id", None) or token_id in (
+            getattr(current_market, "asset_ids", None) or []
+        ):
+            return getattr(current_market, "end_at", None)
+        return None
+
     intents = stale_resting_orders(
         open_orders=open_orders,
-        now=_utc_now(),
+        now=now or _utc_now(),
         ttl_seconds=ttl,
         protected_client_order_ids=protected,
-        market_end_lookup=lambda market_id, token_id: market_ends.get(
-            (market_id, token_id)
-        ),
+        market_end_lookup=market_end_for,
     )
     if not intents:
         return []

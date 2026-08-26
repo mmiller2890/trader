@@ -178,7 +178,9 @@ async def test_sweep_cancels_a_stale_order_and_clears_it_locally() -> None:
     submitter = RecordingSubmitter()
     config = AppConfig(spike_strategy={"quote_ttl_seconds": 30.0})
 
-    cancelled = await sweep_stale_resting_orders(Services(state, submitter, config))
+    cancelled = await sweep_stale_resting_orders(
+        Services(state, submitter, config), now=NOW
+    )
 
     assert cancelled == ["pm-bot-resting0001"]
     assert submitter.cancelled == ["pm-bot-resting0001"]
@@ -200,8 +202,48 @@ async def test_sweep_leaves_a_pending_exit_order_alone() -> None:
     submitter = RecordingSubmitter()
     config = AppConfig(spike_strategy={"quote_ttl_seconds": 30.0})
 
-    cancelled = await sweep_stale_resting_orders(Services(state, submitter, config))
+    cancelled = await sweep_stale_resting_orders(
+        Services(state, submitter, config), now=NOW
+    )
 
     assert cancelled == []
     assert submitter.cancelled == []
     assert len(await state.get_open_orders()) == 1
+
+
+@pytest.mark.asyncio
+async def test_market_ended_sweep_works_for_an_entry_with_no_position() -> None:
+    """
+    The market-ended branch exists for resting *entries*, which have no
+    position yet -- that is what makes them entries. Building the market-end
+    map from position lifecycles alone returns None for exactly those orders,
+    so the branch can never fire for the case it was written for.
+
+    The clock is injected so only the market-ended branch can cancel here; the
+    TTL has plenty of time left on it.
+    """
+
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    await state.set_order_status(resting(age_seconds=5))
+    submitter = RecordingSubmitter()
+    config = AppConfig(spike_strategy={"quote_ttl_seconds": 600.0})
+
+    class Rotator:
+        def status(self):  # type: ignore[no-untyped-def]
+            class Market:
+                condition_id = "m1"
+                asset_ids = ["t1"]
+                end_at = NOW - timedelta(minutes=1)
+
+            class Status:
+                current_market = Market()
+
+            return Status()
+
+    services = Services(state, submitter, config)
+    services.market_rotator = Rotator()
+
+    cancelled = await sweep_stale_resting_orders(services, now=NOW)
+
+    assert cancelled == ["pm-bot-resting0001"]
+    assert submitter.cancelled == ["pm-bot-resting0001"]
