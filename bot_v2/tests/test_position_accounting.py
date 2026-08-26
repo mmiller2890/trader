@@ -586,3 +586,34 @@ async def test_settled_market_position_is_retired_without_a_timeout_error() -> N
     assert result.expired_keys == []
     assert result.deferred_keys == []
     assert await state.get_position("ended", "t1") is None
+
+
+@pytest.mark.asyncio
+async def test_fee_is_charged_on_the_incremental_fill_price() -> None:
+    """
+    The fee curve is rate*p*(1-p), which is non-linear in p, so charging it at
+    the cumulative average price is not the same as charging each fill at the
+    price it actually traded.
+
+    Two fills of 5 at 0.40 then 5 at 0.60 should cost
+    0.07*5*0.40*0.60 + 0.07*5*0.60*0.40 = 0.168. Charging the second at the
+    running average of 0.50 gives 0.0875 instead of 0.084. The error grows
+    with fill dispersion, and on the reconciliation path avg_fill_price can be
+    the order's limit price rather than any traded price at all.
+    """
+
+    state = InMemoryStateStore(mode=Mode.LIVE, fee_rate=Decimal("0.07"))
+    await state.apply_confirmed_fill(partial_result("5", "0.40"), **APPLY_ARGS)
+    # Cumulative: 10 filled, notional 5.00, so avg_fill_price reports 0.50
+    # while this increment actually traded 5 at 0.60.
+    await state.apply_confirmed_fill(partial_result("10", "0.50"), **APPLY_ARGS)
+
+    position = await state.get_position("m1", "t1")
+    assert position is not None
+    expected = -(
+        Decimal("0.07") * Decimal("5") * Decimal("0.40") * Decimal("0.60")
+        + Decimal("0.07") * Decimal("5") * Decimal("0.60") * Decimal("0.40")
+    )
+    assert abs(position.realized_pnl - expected) < Decimal("0.0000001"), (
+        f"charged {position.realized_pnl}, correct is {expected}"
+    )

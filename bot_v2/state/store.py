@@ -519,10 +519,16 @@ class InMemoryStateStore:
         # opening (BUY) fill produces no gross realised P&L of its own, but the
         # fee it incurs is a real, immediate cost, so it is charged straight
         # into realized_pnl on both sides rather than silently dropped.
+        # Charge at the price this increment actually traded, not the running
+        # average. The fee curve is rate*p*(1-p) and non-linear in p, so the
+        # two differ whenever fills are dispersed -- and on the reconciliation
+        # path avg_fill_price can be the order's limit price rather than any
+        # traded price at all. delta_price is the notional this delta moved
+        # divided by its size, which is exactly the price it filled at.
         fee = (
-            maker_fee(delta_size, result.avg_fill_price, self._fee_rate)
+            maker_fee(delta_size, delta_price, self._fee_rate)
             if result.liquidity == "maker"
-            else taker_fee(delta_size, result.avg_fill_price, self._fee_rate)
+            else taker_fee(delta_size, delta_price, self._fee_rate)
         )
 
         if result.side == OrderSide.BUY:
