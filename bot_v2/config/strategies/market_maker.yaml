@@ -1,6 +1,17 @@
 market_maker:
   # Disabled by default. Enabling this changes what the bot does with money;
   # read docs/market-making.md before turning it on, and start in dry_run.
+  # KNOWN ISSUE, unfixed, read before enabling: MarketMakerStrategy._resting
+  # and ._pending are mutated without a lock, from on_snapshot (the websocket
+  # task) and from strategy_timer_loop -> plan_maintenance concurrently, while
+  # plan_quotes awaits position_reader mid-decision. TTL expiry and a
+  # price-move refresh can both plan a cancel for the same quote: one forgets
+  # it, the other re-cancels an order the venue no longer has and still posts
+  # its replacement, leaving two quotes on one side.
+  #
+  # Serialising plan -> route -> register spans this strategy and the router,
+  # so it is a real design change and is deliberately not attempted while this
+  # is false and the code never runs. Fix it before flipping this.
   enabled: false
 
   # Total quoted spread in ticks. Each side rests half of this from fair value,

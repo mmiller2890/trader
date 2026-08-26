@@ -284,6 +284,30 @@ class ReconciliationService:
                 local_positions,
                 remote_positions,
             ):
+                # Name what diverged. A local position with no lifecycle can
+                # never be recognised as settled and will block startup until
+                # someone looks, so "position_mismatch" alone leaves the
+                # operator with nothing to act on.
+                remote_keys = {
+                    (position.market_id, position.token_id)
+                    for position in remote_positions
+                }
+                logger.error(
+                    "local and remote positions disagree",
+                    extra={
+                        "component": "reconciliation",
+                        "event_type": "position_mismatch_detail",
+                        "local_only": sorted(
+                            f"{position.market_id}:{position.token_id}"
+                            f"={position.quantity}"
+                            for position in local_positions
+                            if (position.market_id, position.token_id)
+                            not in remote_keys
+                        ),
+                        "remote_count": len(remote_positions),
+                        "local_count": len(local_positions),
+                    },
+                )
                 errors.append("position_mismatch")
 
         ok = not errors and not missing_on_remote
