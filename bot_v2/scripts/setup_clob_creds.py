@@ -61,6 +61,48 @@ def _upsert_env(path: Path, values: dict[str, str]) -> list[str]:
     return actions
 
 
+def _paste_mode(env_path: Path) -> int:
+    """
+    Write credentials you already hold into .env.
+
+    Each value is read with getpass, so nothing echoes to the terminal and
+    nothing lands in shell history. Use this when the credentials already
+    exist and only need to be restored -- there is no reason to mint new ones
+    and invalidate the working set.
+    """
+
+    from getpass import getpass
+
+    prompts = (
+        ("PRIVATE_KEY", "Private key"),
+        ("CLOB_API_KEY", "API key"),
+        ("CLOB_SECRET", "Secret"),
+        ("CLOB_PASSPHRASE", "Passphrase"),
+    )
+    print("Paste each value; input is hidden. Blank leaves that entry unchanged.\n")
+
+    values: dict[str, str] = {}
+    for key, label in prompts:
+        entered = getpass(f"  {label}: ").strip()
+        if entered:
+            values[key] = entered
+
+    if not values:
+        print("\nnothing entered; .env unchanged.")
+        return 0
+
+    if env_path.exists():
+        shutil.copyfile(env_path, env_path.with_suffix(".bak"))
+        print(f"\nbacked up {env_path} -> {env_path.with_suffix('.bak')}")
+
+    for action in _upsert_env(env_path, values):
+        print(f"  {action}")
+    env_path.chmod(0o600)
+    print(f"\nwrote {len(values)} value(s) into {env_path} (mode 600).")
+    print("Verify with:  python -m scripts.setup_clob_creds --dry-run")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config-dir", type=Path, default=Path("config"))
@@ -76,7 +118,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="print the signing address and change nothing",
     )
+    parser.add_argument(
+        "--paste",
+        action="store_true",
+        help="prompt for credentials you already hold and write them to .env",
+    )
     args = parser.parse_args(argv)
+
+    if args.paste:
+        return _paste_mode(args.env_file)
 
     config = load_config(args.config_dir)
     private_key = config.secrets.private_key
