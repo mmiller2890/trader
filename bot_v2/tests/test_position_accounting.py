@@ -548,3 +548,41 @@ async def test_dust_threshold_lookup_failure_falls_back_to_the_configured_floor(
     )
 
     assert result.dust_keys == ["m1:t1"]
+
+
+@pytest.mark.asyncio
+async def test_settled_market_position_is_retired_without_a_timeout_error() -> None:
+    """
+    A position whose market has ended has settled, not timed out.
+
+    Remote stops reporting it once it becomes redeemable, so waiting for the
+    confirmation deadline and then recording position_confirmation_timeout
+    describes the wrong thing and feeds a spurious error into the incident
+    path that halts trading.
+    """
+
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    now = datetime(2026, 8, 26, 9, 16, tzinfo=UTC)
+    state._positions[("ended", "t1")] = Position(
+        market_id="ended",
+        token_id="t1",
+        quantity=Decimal("5"),
+        average_entry_price=Decimal("0.60"),
+    )
+    state._lifecycles[("ended", "t1")] = PositionLifecycle(
+        market_id="ended",
+        token_id="t1",
+        opened_at=now - timedelta(hours=1),
+        last_fill_at=now - timedelta(hours=1),
+        market_end_at=now - timedelta(minutes=30),
+        confirmation_deadline=now - timedelta(seconds=1),
+    )
+
+    result = await state.merge_authoritative_positions(
+        [], now=now, dust_threshold=Decimal("5")
+    )
+
+    assert result.settled_keys == ["ended:t1"]
+    assert result.expired_keys == []
+    assert result.deferred_keys == []
+    assert await state.get_position("ended", "t1") is None

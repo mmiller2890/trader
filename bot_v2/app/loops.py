@@ -201,6 +201,78 @@ async def position_exit_loop(
         )
 
 
+async def sweep_stale_resting_orders(services: object) -> list[str]:
+    """
+    Cancel resting maker entries that have outlived their TTL or their market.
+
+    Nothing at the venue expires a post-only order, and until this existed a
+    spike entry rested until it filled -- one sat for 45 minutes on
+    2026-08-26 and filled into a market that had already ended. Exits are
+    excluded: PositionExitManager sweeps those on its own deadline and then
+    escalates to a taker cross, and cancelling one here would race it.
+
+    Returns the client order ids actually cancelled, for the caller to log.
+    """
+
+    from execution.stale_orders import stale_resting_orders
+    from models.order import OrderStatus
+
+    state_store = getattr(services, "state_store", None)
+    submitter = getattr(services, "submitter", None)
+    config = getattr(services, "config", None)
+    if state_store is None or submitter is None or config is None:
+        return []
+    ttl = float(
+        getattr(getattr(config, "spike_strategy", None), "quote_ttl_seconds", 0.0)
+        or 0.0
+    )
+    if ttl <= 0:
+        return []
+
+    open_orders = await state_store.get_open_orders()
+    if not open_orders:
+        return []
+
+    lifecycles = await state_store.get_position_lifecycles()
+    protected = {
+        lifecycle.pending_exit_client_order_id
+        for lifecycle in lifecycles
+        if lifecycle.pending_exit_client_order_id
+    }
+    market_ends = {
+        (lifecycle.market_id, lifecycle.token_id): lifecycle.market_end_at
+        for lifecycle in lifecycles
+    }
+
+    intents = stale_resting_orders(
+        open_orders=open_orders,
+        now=_utc_now(),
+        ttl_seconds=ttl,
+        protected_client_order_ids=protected,
+        market_end_lookup=lambda market_id, token_id: market_ends.get(
+            (market_id, token_id)
+        ),
+    )
+    if not intents:
+        return []
+
+    by_id = {order.client_order_id: order for order in open_orders}
+    cancelled: list[str] = []
+    for intent in intents:
+        result = await submitter.cancel_order(intent)
+        if not getattr(result, "terminal", False):
+            continue
+        cancelled.append(intent.client_order_id)
+        order = by_id.get(intent.client_order_id)
+        if order is not None:
+            # Drop it from the open-order map so the next pass does not try
+            # to cancel an order that is already off the book.
+            await state_store.set_order_status(
+                order.model_copy(update={"status": OrderStatus.CANCELLED})
+            )
+    return cancelled
+
+
 async def strategy_timer_loop(
     services: object,
     stop_event: asyncio.Event,
@@ -224,6 +296,16 @@ async def strategy_timer_loop(
             if strategy is not None:
                 for signal in await strategy.on_timer():
                     await router.route_signal(signal)
+            cancelled = await sweep_stale_resting_orders(services)
+            for client_order_id in cancelled:
+                logger.info(
+                    "cancelled stale resting order",
+                    extra={
+                        "component": "strategy_timer",
+                        "event_type": "stale_resting_order_cancelled",
+                        "client_order_id": client_order_id,
+                    },
+                )
             if market_maker is None:
                 return
             # A latched kill switch means stop quoting entirely; otherwise

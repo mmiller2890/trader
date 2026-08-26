@@ -80,16 +80,16 @@ class PositionLifecycle(BaseModel):
     last_exit_reason: ExitReason | None = None
     pending_exit_client_order_id: str | None = None
     last_exit_attempt_at: datetime | None = None
-    # Set by PositionExitManager._emit_exit the first time it attempts a
-    # maker exit for the current exit episode; left unchanged on every later
-    # attempt (maker or taker) and stays None while every exit attempt has
-    # been taker. Consulted by PositionExitPolicy._use_maker to bound how
-    # long an exit is allowed to rest before escalating to a taker cross.
     # True while the currently reserved exit order is a resting post-only
     # maker order. Lets the exit manager tell a resting maker exit (which
     # must be swept once it outlives its deadline) apart from a taker
     # escalation that is already crossing and must be left alone.
     pending_exit_is_maker: bool = False
+    # Set by PositionExitManager._emit_exit the first time it attempts a
+    # maker exit for the current exit episode; left unchanged on every later
+    # attempt (maker or taker) and stays None while every exit attempt has
+    # been taker. Consulted by PositionExitPolicy._use_maker to bound how
+    # long an exit is allowed to rest before escalating to a taker cross.
     exit_first_attempted_at: datetime | None = None
     exit_attempt_count: int = Field(default=0, ge=0)
     confirmation_deadline: datetime | None = None
@@ -118,6 +118,10 @@ class PositionMergeResult(BaseModel):
     deferred_keys: list[str] = Field(default_factory=list)
     expired_keys: list[str] = Field(default_factory=list)
     unknown_market_keys: list[str] = Field(default_factory=list)
+    # Positions retired because their market has already ended. Remote drops
+    # a resolved position from its view once it becomes redeemable, so waiting
+    # for confirmation describes the wrong thing: nothing is outstanding.
+    settled_keys: list[str] = Field(default_factory=list)
     # Positions retired because both sides hold less than the venue will let
     # anyone trade. Reported so the operator can see it happened, but never as
     # a divergence: no order can close the gap, so raising it every pass would

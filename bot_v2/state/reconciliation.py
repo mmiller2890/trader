@@ -222,7 +222,7 @@ class ReconciliationService:
                     for key in merge.unknown_market_keys:
                         if key in sellable:
                             errors.append(f"position_market_window_unknown:{key}")
-            elif positions_fetch_succeeded and not self._positions_match(
+            elif positions_fetch_succeeded and not await self._positions_match(
                 local_positions,
                 remote_positions,
             ):
@@ -287,11 +287,23 @@ class ReconciliationService:
             return False
         return True
 
-    def _positions_match(
+    async def _positions_match(
         self,
         local: list[Position],
         remote: list[Position],
     ) -> bool:
+        """
+        Compare local and remote holdings, ignoring differences no order could
+        ever close.
+
+        Two kinds of local-only position are not divergences. Inventory below
+        the venue's minimum order size cannot be sold by anyone. And a position
+        whose market has already ended has settled: the data API is queried
+        with redeemable=false, so a resolved position leaves the remote read
+        entirely while local still holds it. Treating either as a mismatch
+        blocks live start over state that no action can reconcile.
+        """
+
         local_map = {
             (position.market_id, position.token_id): position.quantity
             for position in local
@@ -300,6 +312,26 @@ class ReconciliationService:
             (position.market_id, position.token_id): position.quantity
             for position in remote
         }
+        if local_map == remote_map:
+            return True
+
+        now = self._now()
+        for key, quantity in list(local_map.items()):
+            if key in remote_map:
+                continue
+            threshold = self._min_order_size
+            if self._min_size_provider is not None:
+                try:
+                    threshold = max(threshold, self._min_size_provider(key[0]))
+                except Exception:
+                    threshold = self._min_order_size
+            if quantity < threshold:
+                local_map.pop(key)
+                continue
+            lifecycle = await self._state_store.get_position_lifecycle(*key)
+            market_end_at = getattr(lifecycle, "market_end_at", None)
+            if market_end_at is not None and now >= market_end_at:
+                local_map.pop(key)
         return local_map == remote_map
 
 

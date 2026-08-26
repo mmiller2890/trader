@@ -704,3 +704,82 @@ async def test_reconciliation_uses_the_venue_minimum_for_the_dust_threshold() ->
     assert report.deferred_positions == []
     assert not any("position_confirmation_timeout" in e for e in report.errors)
     assert await state.get_position("thin", "t1") is None
+
+
+@pytest.mark.asyncio
+async def test_settled_market_position_does_not_block_live_startup() -> None:
+    """
+    A position whose market has already ended is not a divergence.
+
+    The data API is queried with redeemable=false, so the moment a market
+    resolves its position disappears from the remote read while local still
+    holds it. Startup reconciliation compared the two by strict equality and
+    reported position_mismatch, which failed preflight and blocked live start
+    -- every time a position was held into resolution, which for 15-minute
+    markets is routine. It blocked the 09:16 preflight on 2026-08-26.
+    """
+
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    await state.set_position(
+        Position(
+            market_id="ended",
+            token_id="t1",
+            quantity=Decimal("5"),
+            average_entry_price=Decimal("0.60"),
+        )
+    )
+    state._lifecycles[("ended", "t1")] = PositionLifecycle(
+        market_id="ended",
+        token_id="t1",
+        opened_at=NOW - timedelta(hours=1),
+        last_fill_at=NOW - timedelta(hours=1),
+        market_end_at=NOW - timedelta(minutes=30),
+    )
+    service = ReconciliationService(
+        state_store=state,
+        mode=Mode.LIVE,
+        open_orders_reader=FakeOrdersReader([]),
+        positions_reader=FakePositionsReader([]),
+        now=lambda: NOW,
+        min_order_size=Decimal("5"),
+    )
+
+    report = await service.reconcile_startup()
+
+    assert "position_mismatch" not in report.errors
+    assert report.ok is True
+
+
+@pytest.mark.asyncio
+async def test_live_market_position_mismatch_still_blocks_live_startup() -> None:
+    """Settlement handling must not weaken the guard for a tradeable market."""
+
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    await state.set_position(
+        Position(
+            market_id="live",
+            token_id="t1",
+            quantity=Decimal("5"),
+            average_entry_price=Decimal("0.60"),
+        )
+    )
+    state._lifecycles[("live", "t1")] = PositionLifecycle(
+        market_id="live",
+        token_id="t1",
+        opened_at=NOW,
+        last_fill_at=NOW,
+        market_end_at=NOW + timedelta(minutes=10),
+    )
+    service = ReconciliationService(
+        state_store=state,
+        mode=Mode.LIVE,
+        open_orders_reader=FakeOrdersReader([]),
+        positions_reader=FakePositionsReader([]),
+        now=lambda: NOW,
+        min_order_size=Decimal("5"),
+    )
+
+    report = await service.reconcile_startup()
+
+    assert "position_mismatch" in report.errors
+    assert report.ok is False

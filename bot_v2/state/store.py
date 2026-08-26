@@ -277,6 +277,7 @@ class InMemoryStateStore:
             deferred: list[str] = []
             expired: list[str] = []
             dust: list[str] = []
+            settled: list[str] = []
             for key in sorted(keys):
                 local = self._positions.get(key)
                 remote_position = remote_map.get(key)
@@ -304,6 +305,20 @@ class InMemoryStateStore:
                             )
                     continue
                 lifecycle = self._lifecycles.get(key)
+                # A market that has already ended has settled. Remote stops
+                # reporting the position once it is redeemable, so there is
+                # nothing left to confirm and no order that could close the
+                # gap -- retire it rather than time it out.
+                if remote_position is None and lifecycle is not None:
+                    market_end_at = lifecycle.market_end_at
+                    if market_end_at is not None and now >= market_end_at:
+                        settled.append(f"{key[0]}:{key[1]}")
+                        self._positions.pop(key, None)
+                        if lifecycle.confirmation_deadline is not None:
+                            self._lifecycles[key] = lifecycle.model_copy(
+                                update={"confirmation_deadline": None}
+                            )
+                        continue
                 effective_dust = dust_threshold
                 if dust_threshold_for is not None:
                     try:
@@ -388,6 +403,7 @@ class InMemoryStateStore:
                 expired_keys=expired,
                 unknown_market_keys=unknown_market,
                 dust_keys=dust,
+                settled_keys=settled,
             )
 
     def _adopt_lifecycle_locked(
