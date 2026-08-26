@@ -406,19 +406,31 @@ A quiet bot can be correct behavior: risk rejection is preferable to forcing a l
 Inspect the sanitized journal reason and verify token ID, side, price precision, tick size, minimum order/notional, time in force, balance, allowance, signature type, funder address, and whether the market is still accepting orders. Do not retry malformed orders blindly.
 
 **This is not hypothetical.** The only live session to date (2026-08-24) failed
-**110 of 110 orders**: 86 HTTP 400, 21 FOK partial-fill invariant violations,
-and 1 unknown outcome that produced a real local/exchange divergence, leaving
-two positions open on Polymarket. Tick-size, signing-option and post-only fixes
-have landed since and are believed to address it, but **none of them has been
-proven against the live venue**, and that session's journal has since rotated
-away, so the exact 400 bodies are no longer recoverable.
+**110 of 110 orders**, leaving two positions open on Polymarket. That session's
+journal has since rotated away, so the exact response bodies are gone, but each
+failure class has since been traced to a cause in the code:
 
-Treat the live path as unproven. The first live session after this should be
-run at `max_live_order_notional: 2` with the journal preserved — copy
-`data/journal/events.jsonl` somewhere durable before and after — so that the
-`order_result` reasons survive for diagnosis whichever way it goes. A green
-test suite is evidence of wiring only: 589 mocked unit tests did not catch a
-78% live rejection rate.
+| Failures | Symptom | Cause | Addressed in |
+|---|---|---|---|
+| 86 | HTTP 400 | Prices were sent as raw `best_bid`/`best_ask`, never snapped to the market's tick grid, and `create_order` was called without signing options, so `tick_size` and `neg_risk` never reached the SDK | `f4f7b89` |
+| 21 | `fok_partial_fill_invariant_violation` | `execution.time_in_force` was `FOK`, and fill amounts were divided by 1e6 (`_fixed_six`), so a full match read as a fill 1,000,000x too small and tripped the invariant | `dc9ae35`, `f4f7b89` |
+| 1 | Unknown outcome, local/exchange divergence | Submission outcome genuinely indeterminate; resolved by reconciliation, not prevented | — |
+
+**None of these fixes has been confirmed against the live venue.** In
+particular `f4f7b89` changed how `makingAmount`/`takingAmount` are read — from
+six-decimal fixed point to plain decimals — and if that new reading is wrong,
+fills are booked 1e6 too large. The adapter now refuses any matched fill larger
+than the order that asked for it rather than booking it, so this fails closed
+into reconciliation, but the correct reading is still unverified. It is the
+single highest-risk assumption on the live path, and the first real fill will
+settle it.
+
+Run the next live session at `max_live_order_notional: 2` and **preserve the
+journal** — copy `data/journal/events.jsonl` somewhere durable before and after
+— so the `order_result` reasons survive whichever way it goes. Retention is
+three days and the last session's evidence was lost to rotation. A green test
+suite is evidence of wiring only: 589 mocked unit tests did not catch a 78%
+live rejection rate.
 
 ### WebSocket data stops
 
