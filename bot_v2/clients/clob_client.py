@@ -429,6 +429,18 @@ class ClobClientAdapter:
             OrderTimeInForce.IOC: OrderType.FAK,
             OrderTimeInForce.FOK: OrderType.FOK,
         }[order.time_in_force]
+        # post_only and a killing time-in-force are mutually exclusive: a
+        # post-only order rests by definition, and FOK/FAK cancel whatever does
+        # not fill immediately. The SDK raises ValueError for the combination,
+        # which the generic handler around post_order would turn into
+        # ClobUncertainOutcomeError -- recording a deterministic local bug as an
+        # unknown outcome, the one category that forces divergence handling.
+        # Refuse it here, before anything is signed or sent.
+        if order.post_only and order_type in {OrderType.FOK, OrderType.FAK}:
+            raise ClobAdapterError(
+                f"post_only is not supported with time in force "
+                f"{order.time_in_force.value}"
+            )
         args = OrderArgs(
             token_id=order.token_id,
             price=float(str(order.price)),

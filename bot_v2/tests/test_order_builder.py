@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 from config.schema import AppConfig
 from execution.order_builder import OrderBuilder
@@ -421,3 +423,31 @@ def test_post_only_position_exit_rests_at_its_limit_price_not_repriced_as_taker(
     assert order.price == Decimal("0.45")
     assert order.size == Decimal("2.5")
     assert order.time_in_force == OrderTimeInForce.GTC
+
+
+def test_post_only_signal_cannot_carry_a_killing_time_in_force() -> None:
+    """
+    A post-only order rests by definition and FOK/FAK cancel whatever does not
+    fill immediately, so the combination is contradictory and the venue refuses
+    it. No strategy builds one today -- all three post_only sites leave
+    time_in_force unset -- so this pins the invariant before a regression can
+    reach the adapter.
+    """
+
+    with pytest.raises(ValidationError, match="post_only"):
+        TradeSignal(
+            signal_id=uuid4().hex,
+            strategy_name="test",
+            signal_type=SignalType.MAKER_QUOTE,
+            side=SignalSide.BUY,
+            market_id="m1",
+            token_id="t1",
+            reference_price=Decimal("0.50"),
+            target_price=Decimal("0.49"),
+            observed_move_bps=0.0,
+            reason="test",
+            requested_size=Decimal("5"),
+            post_only=True,
+            limit_price=Decimal("0.49"),
+            time_in_force=OrderTimeInForce.IOC,
+        )

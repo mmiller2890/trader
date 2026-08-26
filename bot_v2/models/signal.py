@@ -78,6 +78,17 @@ class TradeSignal(BaseModel):
                 raise ValueError("maker_quote signals require an explicit requested_size")
             if not self.post_only:
                 raise ValueError("maker_quote signals require post_only=true")
+        # A post-only order rests by definition; FOK and IOC cancel whatever
+        # does not fill immediately. The venue refuses the combination, and
+        # letting it reach the adapter turns a deterministic local bug into an
+        # unknown submission outcome.
+        if self.post_only and self.time_in_force in {
+            OrderTimeInForce.IOC,
+            OrderTimeInForce.FOK,
+        }:
+            raise ValueError(
+                "post_only signals cannot use a killing time_in_force"
+            )
         return self
 
     @property

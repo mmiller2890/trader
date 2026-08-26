@@ -1014,3 +1014,35 @@ def test_submit_order_refuses_a_matched_fill_larger_than_the_order() -> None:
     )
     with pytest.raises(ClobAdapterError, match="exceeds requested size"):
         adapter.submit_order(buy_request(size="1", price="0.50"))
+
+
+def test_submit_order_refuses_post_only_with_a_killing_time_in_force() -> None:
+    """
+    post_only and FOK/FAK are mutually exclusive at the venue, and the SDK
+    raises ValueError for the combination.
+
+    That ValueError would otherwise be swallowed by the generic handler around
+    post_order and re-raised as ClobUncertainOutcomeError, recording a
+    deterministic local bug as an *unknown outcome* -- the one category that
+    forces divergence handling and can leave a position unaccounted for. Fail
+    deterministically instead, before anything is sent.
+    """
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=FakeV2Client,
+    )
+    request = OrderRequest(
+        client_order_id="test-order-0002",
+        market_id="m1",
+        token_id="t1",
+        side=OrderSide.BUY,
+        price=Decimal("0.50"),
+        size=Decimal("1"),
+        time_in_force=OrderTimeInForce.IOC,
+        post_only=True,
+        strategy_name="test",
+    )
+    with pytest.raises(ClobAdapterError, match="post_only"):
+        adapter.submit_order(request)
