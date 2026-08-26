@@ -301,6 +301,16 @@ class InMemoryStateStore:
                     dust_threshold > 0
                     and local_quantity < dust_threshold
                     and remote_quantity < dust_threshold
+                    # Never ahead of the confirmation grace period. That window
+                    # exists to stop a stale remote read from discarding a fill
+                    # the exchange already confirmed to us, and a sub-threshold
+                    # position is still real inventory. While it is open this
+                    # falls through and defers like any other divergence.
+                    and (
+                        lifecycle is None
+                        or lifecycle.confirmation_deadline is None
+                        or now >= lifecycle.confirmation_deadline
+                    )
                 ):
                     # Neither side can place an order in this market, so the
                     # gap is permanent. Take remote as truth, stop the

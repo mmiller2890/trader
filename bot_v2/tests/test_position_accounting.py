@@ -393,7 +393,8 @@ async def test_sub_minimum_residue_is_retired_as_dust_not_deferred() -> None:
         token_id="t1",
         opened_at=now - timedelta(minutes=3),
         last_fill_at=now - timedelta(minutes=2),
-        confirmation_deadline=now + timedelta(seconds=30),
+        # Grace already elapsed: remote has had its chance to catch up.
+        confirmation_deadline=now - timedelta(seconds=1),
     )
 
     result = await state.merge_authoritative_positions(
@@ -437,3 +438,42 @@ async def test_a_sellable_divergence_is_still_deferred() -> None:
 
     assert result.deferred_keys == ["m1:t1"]
     assert result.dust_keys == []
+
+
+@pytest.mark.asyncio
+async def test_dust_does_not_jump_the_confirmation_grace_period() -> None:
+    """
+    Dust retirement must not run ahead of the confirmation deadline.
+
+    That deadline exists to stop a stale remote read from discarding a fill
+    the exchange has already confirmed to us. A sub-threshold position is
+    still real inventory, so while the grace period is open it is deferred
+    like any other divergence; only once remote has had its chance to catch
+    up is it written off as dust.
+    """
+
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    now = datetime(2026, 8, 26, 8, 5, tzinfo=UTC)
+    state._positions[("m1", "t1")] = Position(
+        market_id="m1",
+        token_id="t1",
+        quantity=Decimal("4.995"),
+        average_entry_price=Decimal("0.62"),
+    )
+    state._lifecycles[("m1", "t1")] = PositionLifecycle(
+        market_id="m1",
+        token_id="t1",
+        opened_at=now - timedelta(seconds=5),
+        last_fill_at=now - timedelta(seconds=2),
+        confirmation_deadline=now + timedelta(seconds=25),
+    )
+
+    result = await state.merge_authoritative_positions(
+        [], now=now, dust_threshold=Decimal("5")
+    )
+
+    assert result.dust_keys == []
+    assert result.deferred_keys == ["m1:t1"]
+    held = await state.get_position("m1", "t1")
+    assert held is not None
+    assert held.quantity == Decimal("4.995")
