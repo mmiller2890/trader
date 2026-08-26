@@ -433,6 +433,10 @@ class ClobClientAdapter:
         try:
             value = bool(self._client.get_neg_risk(token_id))
         except Exception as exc:
+            # neg_risk selects the exchange contract the order is signed
+            # against, so guessing it wrong yields a signature for the wrong
+            # domain and a rejection that surfaces only as http_400. It is not
+            # a value that degrades gracefully: fail closed and name it.
             logger.warning(
                 "neg risk lookup failed",
                 extra={
@@ -442,7 +446,9 @@ class ClobClientAdapter:
                     "reason": type(exc).__name__,
                 },
             )
-            return False
+            raise ClobAdapterError(
+                f"neg_risk unavailable for {token_id}: {type(exc).__name__}"
+            ) from exc
         self._neg_risk_cache[token_id] = value
         return value
 

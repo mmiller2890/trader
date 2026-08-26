@@ -1130,3 +1130,29 @@ def test_open_orders_parse_a_full_length_venue_order_id() -> None:
     assert orders[0].exchange_order_id == venue_order_id
     assert orders[0].requested_size == Decimal("5")
     assert orders[0].filled_size == Decimal("0")
+
+
+def test_neg_risk_lookup_failure_fails_closed_instead_of_guessing() -> None:
+    """
+    neg_risk selects which exchange contract the order is signed against, so a
+    wrong value produces a signature for the wrong domain and the venue
+    rejects it -- surfacing only as http_400 with the cause buried in a
+    warning.
+
+    Defaulting to False is right for this bot's current markets, which are all
+    neg_risk False, but it is a guess at a value that cannot be guessed. Fail
+    closed so the reason is named.
+    """
+
+    class BrokenNegRisk(FakeV2Client):
+        def get_neg_risk(self, token_id: str) -> bool:
+            raise RuntimeError("transport exploded")
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=BrokenNegRisk,
+    )
+
+    with pytest.raises(ClobAdapterError, match="neg_risk"):
+        adapter.get_neg_risk("t1")
