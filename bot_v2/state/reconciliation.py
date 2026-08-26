@@ -185,7 +185,15 @@ class ReconciliationService:
             local_order = local_by_identity.get(identity)
             reconciled_order = (
                 remote_order.model_copy(
-                    update={"client_order_id": local_order.client_order_id}
+                    update={
+                        "client_order_id": local_order.client_order_id,
+                        # The read paths cannot report liquidity, so remote
+                        # always says "taker" by default. The local record
+                        # knows what was submitted, and getting this wrong
+                        # books a full taker fee against a maker fill --
+                        # phantom cost straight into realized_pnl.
+                        "liquidity": local_order.liquidity,
+                    }
                 )
                 if local_order is not None
                 else remote_order

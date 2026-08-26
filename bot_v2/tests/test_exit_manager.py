@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from uuid import uuid4
 
 import pytest
 
@@ -562,3 +563,42 @@ async def test_failed_cancel_keeps_the_reservation_rather_than_double_exiting() 
     lifecycle = await state.get_position_lifecycle("m1", "t1")
     assert lifecycle is not None
     assert lifecycle.pending_exit_client_order_id == resting_client_order_id
+
+
+@pytest.mark.asyncio
+async def test_strategy_sell_exit_uses_the_maker_path_when_configured() -> None:
+    """
+    from_strategy_signal called _emit_exit without snapshot or use_maker, so
+    every strategy SELL crossed as an IOC taker even under
+    exit_style: maker_first -- paying ~350 bps on a leg the configuration says
+    should rest first.
+    """
+
+    state = state_with_position(quantity="5", average="0.40")
+    manager = make_exit_manager(
+        state=state,
+        now=lambda: NOW,
+        position_management_overrides={"exit_style": "maker_first"},
+    )
+    sell = TradeSignal(
+        signal_id=uuid4().hex,
+        strategy_name="spike",
+        signal_type=SignalType.POSITION_EXIT,
+        side=SignalSide.SELL,
+        market_id="m1",
+        token_id="t1",
+        reference_price=Decimal("0.42"),
+        target_price=Decimal("0.42"),
+        observed_move_bps=100,
+        reason="strategy_sell",
+        reduce_only=True,
+    )
+
+    converted = await manager.from_strategy_signal(
+        sell, snapshot=snapshot(best_bid="0.42"), market_end_at=END_AT
+    )
+
+    assert converted is not None
+    assert converted.post_only is True
+    assert converted.limit_price == Decimal("0.43")
+    assert converted.time_in_force == OrderTimeInForce.GTC

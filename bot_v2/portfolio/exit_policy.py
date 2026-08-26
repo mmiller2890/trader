@@ -101,6 +101,23 @@ class PositionExitPolicy:
         stop_loss = max([self._config.stop_loss_bps, *stop_floors_bps])
         return take_profit, stop_loss
 
+    def use_maker_for(
+        self,
+        *,
+        lifecycle: PositionLifecycle,
+        reason: ExitReason,
+        now: datetime,
+    ) -> bool:
+        """
+        Whether this exit should rest first, for callers outside ``evaluate``.
+
+        A strategy SELL is converted into an exit without going through
+        ``evaluate``, so it needs the same decision by another route rather
+        than defaulting to a taker cross.
+        """
+
+        return self._use_maker(lifecycle=lifecycle, reason=reason, now=now)
+
     def _use_maker(
         self,
         *,

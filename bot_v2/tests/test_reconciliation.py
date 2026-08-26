@@ -845,3 +845,60 @@ async def test_a_failing_venue_lookup_falls_back_to_the_configured_floor() -> No
     )
 
     assert service._minimum_tradeable_size("anything") == Decimal("5")
+
+
+@pytest.mark.asyncio
+async def test_a_reconciled_maker_fill_is_not_charged_as_taker() -> None:
+    """
+    liquidity is set only on the submit paths; get_open_orders and get_order
+    never set it, and OrderResult defaults to "taker". A maker fill replayed
+    by reconciliation after a restart was therefore charged a full taker fee
+    -- about 350 bps of phantom cost booked straight into realized_pnl.
+
+    The local record knows what was submitted, so carry it across.
+    """
+
+    state = InMemoryStateStore(mode=Mode.LIVE, fee_rate=Decimal("0.07"))
+    local = OrderResult(
+        client_order_id="pm-bot-maker00000001",
+        exchange_order_id="0x" + "b" * 64,
+        market_id="m1",
+        token_id="t1",
+        side=OrderSide.BUY,
+        status=OrderStatus.SUBMITTED,
+        accepted=True,
+        requested_size=Decimal("5"),
+        filled_size=Decimal("0"),
+        liquidity="maker",
+    )
+    await state.set_order_status(local)
+
+    remote_filled = local.model_copy(
+        update={
+            "client_order_id": "0x" + "b" * 64,
+            "status": OrderStatus.FILLED,
+            "filled_size": Decimal("5"),
+            "avg_fill_price": Decimal("0.50"),
+            "liquidity": "taker",  # what the read path reports by default
+        }
+    )
+
+    applied: list[OrderResult] = []
+
+    async def capture(result: OrderResult) -> object:
+        applied.append(result)
+        return await state.apply_confirmed_fill(
+            result, confirmed_at=NOW, confirmation_grace_seconds=30
+        )
+
+    service = ReconciliationService(
+        state_store=state,
+        mode=Mode.LIVE,
+        open_orders_reader=FakeOrdersReader([remote_filled]),
+        positions_reader=None,
+        apply_fill=capture,
+    )
+    await service.reconcile_runtime()
+
+    assert applied, "the remote fill was never applied"
+    assert applied[0].liquidity == "maker"

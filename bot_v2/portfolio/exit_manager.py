@@ -151,6 +151,12 @@ class PositionExitManager:
             reason=ExitReason.STRATEGY_SIGNAL,
             requested_size=position.quantity,
             market_end_at=market_end_at,
+            snapshot=snapshot,
+            use_maker=self._policy.use_maker_for(
+                lifecycle=lifecycle,
+                reason=ExitReason.STRATEGY_SIGNAL,
+                now=self._now(),
+            ),
         )
 
     async def on_timer(
