@@ -1046,3 +1046,43 @@ def test_submit_order_refuses_post_only_with_a_killing_time_in_force() -> None:
     )
     with pytest.raises(ClobAdapterError, match="post_only"):
         adapter.submit_order(request)
+
+
+def test_minimum_order_size_is_read_per_market_and_cached() -> None:
+    """
+    Polymarket publishes minimum_order_size per market and rejects anything
+    under it with `order is invalid. size (N) lower than the minimum: M`. The
+    2026-08-26 live session hit exactly that, because the bot only knew its own
+    configured minimum and never asked the venue.
+    """
+
+    class MarketClient(FakeV2Client):
+        def get_market(self, condition_id: str) -> dict[str, object]:
+            self.calls.append(("get_market", condition_id))
+            return {"minimum_order_size": 5, "minimum_tick_size": "0.01"}
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=MarketClient,
+    )
+    assert adapter.get_minimum_order_size("0xmarket") == Decimal("5")
+    assert adapter.get_minimum_order_size("0xmarket") == Decimal("5")
+    # Immutable for the life of a market, so it must not be re-fetched.
+    lookups = [c for c in adapter._client.calls if isinstance(c, tuple) and c[0] == "get_market"]
+    assert len(lookups) == 1
+
+
+def test_minimum_order_size_falls_back_to_config_when_lookup_fails() -> None:
+    """A transport failure must not block execution; the builder still clamps."""
+
+    class BrokenClient(FakeV2Client):
+        def get_market(self, condition_id: str) -> dict[str, object]:
+            raise RuntimeError("transport exploded")
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=BrokenClient,
+    )
+    assert adapter.get_minimum_order_size("0xmarket") == live_config().execution.min_order_size

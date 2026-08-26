@@ -596,3 +596,111 @@ def test_prices_at_the_payout_bounds_are_clamped_into_venue_range(
         f"{side.value} price {order.price} is outside the venue's [0.01, 0.99]"
     )
     assert Decimal("0.01") <= order.price <= Decimal("0.99")
+
+
+def _live_config(**execution: object) -> AppConfig:
+    base = {
+        "allow_live_trading": True,
+        "dry_run_force": False,
+        "default_order_size": "5",
+        "min_order_size": "1",
+        "max_order_size": "25",
+        "max_live_order_notional": "2",
+        "min_live_buy_notional": "1",
+    }
+    base.update(execution)
+    return AppConfig(bot={"mode": "live"}, execution=base)
+
+
+def test_live_order_refuses_locally_when_venue_minimum_is_unaffordable() -> None:
+    """
+    The 2026-08-26 live session was rejected with
+    `order is invalid. size (3.22) lower than the minimum: 5`.
+
+    max_live_order_notional was 2, so at 0.62 the builder could afford 3.22
+    shares against a venue floor of 5. It knew only its own min_order_size of
+    1, so it built the order and let the venue refuse it. Refusing here names
+    the real constraint and costs no round trip.
+    """
+
+    builder = OrderBuilder(
+        _live_config(),
+        tick_size_provider=lambda _: Decimal("0.01"),
+        min_size_provider=lambda _: Decimal("5"),
+    )
+    snapshot = MarketSnapshot(
+        market_id="m1",
+        token_id="t1",
+        best_bid=Decimal("0.61"),
+        best_ask=Decimal("0.62"),
+        mid_price=Decimal("0.615"),
+        top_bid_size=Decimal("100"),
+        top_ask_size=Decimal("100"),
+    )
+
+    with pytest.raises(ValueError, match="venue minimum order size"):
+        builder.build(signal=_buy_signal(), snapshot=snapshot)
+
+
+def test_live_order_size_is_raised_to_the_venue_minimum() -> None:
+    """With enough notional headroom, the venue floor sets the size."""
+
+    builder = OrderBuilder(
+        _live_config(max_live_order_notional="5"),
+        tick_size_provider=lambda _: Decimal("0.01"),
+        min_size_provider=lambda _: Decimal("5"),
+    )
+    snapshot = MarketSnapshot(
+        market_id="m1",
+        token_id="t1",
+        best_bid=Decimal("0.61"),
+        best_ask=Decimal("0.62"),
+        mid_price=Decimal("0.615"),
+        top_bid_size=Decimal("100"),
+        top_ask_size=Decimal("100"),
+    )
+
+    order = builder.build(signal=_buy_signal(), snapshot=snapshot)
+
+    assert order.size >= Decimal("5")
+    assert order.price * order.size <= Decimal("5")
+
+
+def test_maker_quote_respects_the_venue_minimum_order_size() -> None:
+    """
+    Maker quotes go to the same venue and hit the same floor. Sizing them by
+    the configured minimum alone would rest a quote the venue refuses.
+    """
+
+    builder = OrderBuilder(
+        _live_config(max_live_order_notional="2"),
+        tick_size_provider=lambda _: Decimal("0.01"),
+        min_size_provider=lambda _: Decimal("5"),
+    )
+    snapshot = MarketSnapshot(
+        market_id="m1",
+        token_id="t1",
+        best_bid=Decimal("0.61"),
+        best_ask=Decimal("0.62"),
+        mid_price=Decimal("0.615"),
+        top_bid_size=Decimal("100"),
+        top_ask_size=Decimal("100"),
+    )
+    signal = TradeSignal(
+        signal_id=uuid4().hex,
+        strategy_name="mm",
+        signal_type=SignalType.MAKER_QUOTE,
+        side=SignalSide.BUY,
+        market_id="m1",
+        token_id="t1",
+        reference_price=Decimal("0.61"),
+        target_price=Decimal("0.61"),
+        observed_move_bps=0.0,
+        reason="test",
+        requested_size=Decimal("5"),
+        post_only=True,
+        limit_price=Decimal("0.61"),
+    )
+
+    with pytest.raises(ValueError, match="venue minimum order size"):
+        builder.build(signal=signal, snapshot=snapshot)

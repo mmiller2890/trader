@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import app.bootstrap as bootstrap_module
 from app.bootstrap import LivePreflightError, bootstrap_app
 from clients.gamma_markets import DiscoveredMarket, MarketOutcome
 from config.schema import AppConfig, AutomaticMarketConfig
@@ -529,3 +530,53 @@ async def test_exit_manager_can_cancel_its_own_resting_maker_exits(
 
     assert services.exit_manager._cancel_order is not None
     assert services.exit_manager._cancel_order == services.submitter.cancel_order
+
+
+@pytest.mark.asyncio
+async def test_order_builder_is_given_a_venue_minimum_size_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Live mode must consult the venue's own minimum order size. Without the
+    provider wired the builder falls back to config alone, which is what let a
+    3.22-share order reach a venue with a floor of 5 on 2026-08-26.
+    """
+
+    monkeypatch.setenv("BOT_DATA_DIR", str(tmp_path / "data"))
+    set_live_credentials(monkeypatch)
+    config_dir = tmp_path / "config"
+    write_live_config(config_dir)
+
+    captured: dict[str, object] = {}
+
+    class Adapter:
+        @classmethod
+        def from_v2(cls, **_: object) -> object:
+            return Adapter()
+
+        def get_tick_size(self, token_id: str) -> Decimal:
+            return Decimal("0.01")
+
+        def get_minimum_order_size(self, market_id: str) -> Decimal:
+            return Decimal("5")
+
+    real_builder = bootstrap_module.OrderBuilder
+
+    def capture(config: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return real_builder(config, **kwargs)  # type: ignore[arg-type]
+
+    async def stub_preflight(**_: object) -> LivePreflightReport:
+        return LivePreflightReport(ok=True, checks=[])
+
+    monkeypatch.setattr("app.bootstrap.ClobClientAdapter", Adapter)
+    monkeypatch.setattr("app.bootstrap.DataApiClient", lambda _: object())
+    monkeypatch.setattr("app.bootstrap.GeoblockClient", lambda _: object())
+    monkeypatch.setattr("app.bootstrap.run_preflight", stub_preflight)
+    monkeypatch.setattr("app.bootstrap.OrderBuilder", capture)
+
+    await bootstrap_app(config_dir)
+
+    provider = captured.get("min_size_provider")
+    assert provider is not None, "live bootstrap must pass a venue minimum provider"
+    assert provider("0xmarket") == Decimal("5")

@@ -35,7 +35,12 @@ execution:
   # raise max_live_order_notional with them.
   default_order_size: 5
   max_order_size: 10
-  min_order_size: 1
+  # Polymarket publishes minimum_order_size per market and rejects anything
+  # under it: `order is invalid. size (3.22) lower than the minimum: 5`. Live
+  # mode reads the real value per market, but this is the floor everywhere
+  # else, and it also sets the dust threshold -- inventory below it cannot be
+  # sold, so it must not be smaller than the venue's own minimum.
+  min_order_size: 5
   max_slippage_bps: 20
   # GTC rests the remainder of a marketable limit order instead of killing it,
   # which is what quoting requires. Exit orders still override this with IOC.
@@ -46,13 +51,17 @@ execution:
   # Per-order live notional ceiling. This is the single most important number
   # in this file: it is the most one order can ever risk.
   #
-  # Held at 2 because preflight requires collateral >= this value and the
-  # funded account holds ~10 USDC, and because the live order path has not yet
-  # completed a clean submission. At 2 the account can carry roughly four
-  # concurrent resting quotes. Raise it once collateral is funded AND a live
-  # session shows a clean order-acceptance rate; quoting at reward-qualifying
-  # size needs this nearer 50.
-  max_live_order_notional: 2
+  # This has a hard floor set by the venue, not by risk appetite: the minimum
+  # order is 5 shares, so a market trading at p needs 5*p of notional headroom
+  # or every order is rejected on arrival. At 2 that meant only markets below
+  # ~$0.40 could trade at all, which is what produced
+  # `size (3.22) lower than the minimum: 5` on 2026-08-26 -- and the two orders
+  # that did fill that session were at 0.36, right at the edge of the band.
+  #
+  # 5 covers the full 0-1 price range at the venue minimum. Against ~10 USDC of
+  # collateral that is roughly two concurrent positions. Quoting at
+  # reward-qualifying size needs this nearer 50.
+  max_live_order_notional: 5
   # Fallback tick grid when the exchange lookup is unavailable. Live mode reads
   # the real tick size per token from the CLOB.
   default_tick_size: 0.01

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from decimal import Decimal
 from pathlib import Path
 
@@ -76,9 +77,18 @@ def test_production_yaml_uses_bounded_quoting_execution() -> None:
     # depends on it. Exits still force IOC.
     assert config.execution.time_in_force == TimeInForce.GTC
     assert config.execution.min_live_buy_notional == Decimal("1")
-    # The per-order live ceiling is the hard cap on a single mistake. It is
-    # held small until the live order path is proven; see bot.yaml.
-    assert config.execution.max_live_order_notional == Decimal("2")
+    # The per-order live ceiling is the hard cap on a single mistake, but it
+    # also has a floor set by the venue: the minimum order is 5 shares, so a
+    # market at price p needs 5*p of headroom or every order is rejected on
+    # arrival. Below 5 the bot can only trade markets under ~$0.40.
+    assert config.execution.max_live_order_notional == Decimal("5")
+    # The dust threshold must not sit under the venue's own minimum, or a
+    # partial fill leaves residue that can never be sold.
+    assert config.execution.min_order_size == Decimal("5")
+    assert (
+        config.execution.max_live_order_notional
+        >= config.execution.min_order_size * Decimal("1.00")
+    )
     assert config.execution.post_only_maker_quotes is True
     assert config.risk.max_data_staleness_seconds == 15
     assert config.market_data.heartbeat_timeout_seconds == 30
@@ -193,8 +203,31 @@ def test_reliability_rejects_unsafe_bounds(payload: dict[str, object]) -> None:
         AppConfig(reliability=payload)
 
 
-def test_checked_in_config_is_never_armed_for_live() -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "config")
+def _tracked_config_only(tmp_path: Path) -> Path:
+    """
+    Copy the version-controlled config fragments, leaving operator.yaml behind.
+
+    operator.yaml is untracked: it holds the operator's own arming state on
+    their machine. Loading it here would make this guard fail for the entire
+    time anyone runs live, which teaches people to ignore a red suite. What
+    ships in git is the thing under test.
+    """
+
+    source = Path(__file__).resolve().parents[1] / "config"
+    destination = tmp_path / "config"
+    (destination / "strategies").mkdir(parents=True, exist_ok=True)
+    for name in ("bot.yaml", "risk.yaml"):
+        shutil.copyfile(source / name, destination / name)
+    for name in ("spike.yaml", "market_maker.yaml"):
+        candidate = source / "strategies" / name
+        if candidate.exists():
+            shutil.copyfile(candidate, destination / "strategies" / name)
+    assert not (destination / "operator.yaml").exists()
+    return destination
+
+
+def test_checked_in_config_is_never_armed_for_live(tmp_path: Path) -> None:
+    config = load_config(_tracked_config_only(tmp_path))
 
     # All three gates must ship closed. Arming live is an operator action.
     assert config.bot.mode is Mode.DRY_RUN

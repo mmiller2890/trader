@@ -68,6 +68,7 @@ class ClobClientAdapter:
         self._read_only = read_only
         self._tick_size_cache: dict[str, Decimal] = {}
         self._neg_risk_cache: dict[str, bool] = {}
+        self._minimum_order_size_cache: dict[str, Decimal] = {}
 
     @classmethod
     def disabled(cls) -> "ClobClientAdapter":
@@ -374,6 +375,42 @@ class ClobClientAdapter:
             return self._config.execution.default_tick_size
         self._tick_size_cache[token_id] = tick_size
         return tick_size
+
+    def get_minimum_order_size(self, market_id: str) -> Decimal:
+        """
+        Return the venue's minimum order size for ``market_id``.
+
+        Polymarket publishes this per market and rejects anything under it with
+        `order is invalid. size (N) lower than the minimum: M`. Knowing it up
+        front lets the order builder refuse locally, with a reason naming the
+        real constraint, instead of spending a round trip to be told.
+
+        Cached because it is immutable for the life of a market. A transport
+        failure falls back to the configured minimum rather than blocking
+        execution, matching how tick size degrades.
+        """
+
+        cached = self._minimum_order_size_cache.get(market_id)
+        if cached is not None:
+            return cached
+        try:
+            raw = self._client.get_market(market_id)
+            value = Decimal(str(raw["minimum_order_size"]))
+        except Exception as exc:
+            logger.warning(
+                "minimum order size lookup failed",
+                extra={
+                    "component": "clob_client",
+                    "event_type": "minimum_order_size_lookup_failed",
+                    "market_id": market_id,
+                    "reason": type(exc).__name__,
+                },
+            )
+            return self._config.execution.min_order_size
+        if value <= 0:
+            return self._config.execution.min_order_size
+        self._minimum_order_size_cache[market_id] = value
+        return value
 
     def get_neg_risk(self, token_id: str) -> bool:
         """Return the cached negative-risk flag required for order signing."""

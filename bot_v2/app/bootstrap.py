@@ -506,6 +506,11 @@ async def bootstrap_app(
         tick_size_provider=(
             clob_client.get_tick_size if is_live_mode(config.bot.mode) else None
         ),
+        min_size_provider=(
+            clob_client.get_minimum_order_size
+            if is_live_mode(config.bot.mode)
+            else None
+        ),
     )
     submitter = OrderSubmitter(
         config=config,

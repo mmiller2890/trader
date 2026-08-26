@@ -13,6 +13,7 @@ from models.tick import SIZE_INCREMENT, quantize_price, quantize_size
 from portfolio.sizing import clamp, fixed_size
 
 TickSizeProvider = Callable[[str], Decimal]
+MinSizeProvider = Callable[[str], Decimal]
 
 
 class OrderBuilder:
@@ -23,9 +24,41 @@ class OrderBuilder:
         config: AppConfig,
         *,
         tick_size_provider: TickSizeProvider | None = None,
+        min_size_provider: MinSizeProvider | None = None,
     ) -> None:
         self._config = config
         self._tick_size_provider = tick_size_provider
+        self._min_size_provider = min_size_provider
+
+    def venue_minimum_for(self, market_id: str) -> Decimal | None:
+        """
+        The venue's own floor for this market, or None when it is unknown.
+
+        Kept separate from the configured minimum so a refusal can say which
+        of the two actually binds: a venue floor the notional cap cannot buy
+        needs different numbers changed than a local limit does.
+        """
+
+        if self._min_size_provider is None:
+            return None
+        try:
+            value = self._min_size_provider(market_id)
+        except Exception:
+            return None
+        return value if value > 0 else None
+
+    def minimum_size_for(self, market_id: str) -> Decimal:
+        """
+        Resolve the binding minimum order size for one market.
+
+        The venue publishes its own floor per market and rejects anything
+        under it. Taking the larger of that and the configured minimum means a
+        looser local setting can never build an order the venue will refuse.
+        """
+
+        configured = self._config.execution.min_order_size
+        venue = self.venue_minimum_for(market_id)
+        return configured if venue is None else max(configured, venue)
 
     def tick_size_for(self, token_id: str) -> Decimal:
         """Resolve the exchange tick size for one token."""
@@ -87,7 +120,8 @@ class OrderBuilder:
             cap_size = (
                 self._config.execution.max_live_order_notional / price
             ).quantize(SIZE_INCREMENT, rounding=ROUND_DOWN)
-            required_size = self._config.execution.min_order_size
+            venue_floor = self.venue_minimum_for(signal.market_id)
+            required_size = self.minimum_size_for(signal.market_id)
             if side == OrderSide.BUY:
                 required_size = max(
                     required_size,
@@ -103,6 +137,16 @@ class OrderBuilder:
                 )
             )
             if required_size > maximum_size:
+                if venue_floor is not None and venue_floor > cap_size:
+                    # The notional cap alone cannot buy the venue's floor, so
+                    # every order in this market is rejected on arrival. Name
+                    # the two numbers that have to change.
+                    raise ValueError(
+                        f"venue minimum order size {venue_floor} costs "
+                        f"{(venue_floor * price).quantize(Decimal('0.01'))} at "
+                        f"{price}, above max_live_order_notional "
+                        f"{self._config.execution.max_live_order_notional}"
+                    )
                 if side == OrderSide.BUY:
                     raise ValueError(
                         "live execution cannot satisfy minimum live BUY notional "
@@ -162,10 +206,12 @@ class OrderBuilder:
             raise ValueError("maker quote price collapsed below the minimum tick")
         price = quantize_price(price, tick_size=tick_size, side=side)
 
+        venue_floor = self.venue_minimum_for(signal.market_id)
+        venue_minimum = self.minimum_size_for(signal.market_id)
         normalized_size = quantize_size(
             clamp(
                 signal.requested_size,
-                self._config.execution.min_order_size,
+                venue_minimum,
                 self._config.execution.max_order_size,
             )
         )
@@ -173,7 +219,14 @@ class OrderBuilder:
             cap_size = quantize_size(
                 self._config.execution.max_live_order_notional / price
             )
-            if cap_size < self._config.execution.min_order_size:
+            if venue_floor is not None and cap_size < venue_floor:
+                raise ValueError(
+                    f"venue minimum order size {venue_floor} costs "
+                    f"{(venue_floor * price).quantize(Decimal('0.01'))} at "
+                    f"{price}, above max_live_order_notional "
+                    f"{self._config.execution.max_live_order_notional}"
+                )
+            if cap_size < venue_minimum:
                 raise ValueError(
                     "maker quote cannot satisfy minimum order size within the "
                     "live notional cap"
