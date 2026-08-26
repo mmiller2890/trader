@@ -18,8 +18,8 @@ over anything else, including this document.
 ## State right now
 
 - Branch: **main** (the operator explicitly chose main over a worktree)
-- HEAD: **dc0b8e1**
-- Suite: **821 passing** (`-W error::RuntimeWarning`, compileall clean)
+- HEAD: **f683231**
+- Suite: **823 passing** (`-W error::RuntimeWarning`, compileall clean)
 - Working tree: **clean**
 
 Two background processes are running and should be left alone unless you mean
@@ -34,20 +34,49 @@ Stop either with `kill $(cat logs/<name>.pid)`.
 
 ## THE FIRST THING TO DO
 
-**Run the shadow-mode dry-run session.** It is the one step of Task 9 that is
-not done, because it needs the bot run against live market data and the agent
-harness would not start the process.
+**Get the P&L leg of the fill-rate decision.** It is the only thing standing
+between here and a real go/no-go on maker entry. The fill-rate axis is measured
+(70.7%) and clears the bar; `scripts/measure_fill_rate.py` computes no P&L, and
+the two live quadrants point opposite ways.
+
+Second, if you want it: a live shadow session still adds one thing the offline
+replay cannot, which is **signal arrival rate** -- how many signals per hour the
+strategy actually raises. The gate's refusal rate itself is already answered
+below, on a much larger sample.
 
 ```bash
-# set edge_gate_mode: shadow in config/risk.yaml first -- it is dry-run only,
-# enforced at config load
+# set edge_gate_mode: shadow in config/risk.yaml first -- dry-run only,
+# enforced at config load. Set it back to enforce afterwards; the shipped
+# config guard tests fail if you forget, which is the point of them.
 BOT_DATA_DIR=data .venv/bin/python -m app.main
 ```
 
-Let it run 30+ minutes, then count how often the gate would have refused (the
-snippet is in the plan file, Task 9 Step 5). **Set `edge_gate_mode` back to
-`enforce` afterwards** -- `tests/test_config.py -k shipped` fails if you forget,
-which is the point of those tests.
+## How often the edge gate refuses -- answered
+
+Shadow mode exists to answer one question, and it did not need the bot running:
+`assess_edge` is a pure function of price and spread, both of which are in every
+recorded book.
+
+```bash
+.venv/bin/python -m scripts.measure_edge_gate --input data/research/books.jsonl
+```
+
+Across 161,883 observations at the shipped `fee_rate: 0.07` /
+`safety_margin_bps: 50`:
+
+| assumed edge | maker entry | taker entry |
+|---|---|---|
+| 120 bps (average directional) | 6.4% | 0.0% |
+| 187 bps (measured spike edge) | 25.6% | 0.8% |
+| 600 bps | 71.6% | 46.4% |
+
+Median book demands **264 bps** maker, **1033 bps** taker. So: **taker entry is
+dead at any plausible edge**, which is the design working, not a
+misconfiguration. And **maker entry at the strategy's own 187 bps clears about a
+quarter of books** -- enforce mode is binding without being prohibitive. Turning
+the gate on will not silently stop the bot trading. That was the open question.
+
+Per observed book, not per signal, and assumes one edge for every book.
 
 ## What happened in the 2026-08-25 evening session
 
@@ -112,6 +141,24 @@ shares. `99abf6d` makes `submit_order` refuse any matched fill larger than the
 order that asked for it, so this fails closed into reconciliation -- but the
 first real fill is what settles it. Watch that specific thing on the next live
 session, and **preserve the journal**, which is what was lost last time.
+
+Evidence found this session, from the SDK source rather than from the venue:
+`py_clob_client_v2` submits orders through `to_token_decimals(x) = int(1e6 * x)`,
+so the *submitted* amounts are unambiguously six-decimal base units. That is
+suggestive about the response format but not proof, since the SDK passes the
+response through unparsed. The guard is kept pointed at the dangerous direction
+deliberately: reading base units as decimals over-books by 1e6 and now hard
+errors, whereas the mirror mistake under-books and would be silent.
+
+**A third latent trap was found and closed** (`3027cd7`). The SDK raises
+`ValueError` for `post_only` with FOK/FAK, and `_build_maker_quote` forces
+`post_only=True` while taking `time_in_force` from the signal -- so a signal
+carrying IOC would have hit it. Not reachable today (all three `post_only=True`
+sites leave TIF unset), but the landing spot was the problem: the generic
+handler around `post_order` would have turned that `ValueError` into
+`ClobUncertainOutcomeError`, recording a deterministic local bug as an *unknown
+outcome*. That is the category that produced the one real divergence on
+2026-08-24. Now refused at both `TradeSignal` validation and the adapter.
 
 ## What Task 8b was for
 
