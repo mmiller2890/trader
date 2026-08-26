@@ -477,3 +477,74 @@ async def test_dust_does_not_jump_the_confirmation_grace_period() -> None:
     held = await state.get_position("m1", "t1")
     assert held is not None
     assert held.quantity == Decimal("4.995")
+
+
+@pytest.mark.asyncio
+async def test_dust_threshold_follows_the_venue_minimum_per_market() -> None:
+    """
+    The dust threshold has to be the floor that actually applies to the market
+    holding the residue, not one global config value.
+
+    minimum_order_size is published per market. Inventory above the configured
+    minimum but below that market's own floor is just as unsellable as any
+    other dust, and treating it as a divergence reproduces the halt loop this
+    whole mechanism exists to prevent.
+    """
+
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    now = datetime(2026, 8, 26, 8, 5, tzinfo=UTC)
+    state._positions[("thin", "t1")] = Position(
+        market_id="thin",
+        token_id="t1",
+        quantity=Decimal("20"),
+        average_entry_price=Decimal("0.40"),
+    )
+    state._lifecycles[("thin", "t1")] = PositionLifecycle(
+        market_id="thin",
+        token_id="t1",
+        opened_at=now - timedelta(minutes=3),
+        last_fill_at=now - timedelta(minutes=2),
+        confirmation_deadline=now - timedelta(seconds=1),
+    )
+
+    result = await state.merge_authoritative_positions(
+        [],
+        now=now,
+        dust_threshold=Decimal("5"),
+        dust_threshold_for=lambda market_id: Decimal("50"),
+    )
+
+    # 20 clears the configured 5 but not this market's floor of 50.
+    assert result.dust_keys == ["thin:t1"]
+    assert result.deferred_keys == []
+    assert result.expired_keys == []
+
+
+@pytest.mark.asyncio
+async def test_dust_threshold_lookup_failure_falls_back_to_the_configured_floor() -> None:
+    """A venue lookup failure must not silently disable dust handling."""
+
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    now = datetime(2026, 8, 26, 8, 5, tzinfo=UTC)
+    state._positions[("m1", "t1")] = Position(
+        market_id="m1",
+        token_id="t1",
+        quantity=Decimal("0.005"),
+        average_entry_price=Decimal("0.36"),
+    )
+    state._lifecycles[("m1", "t1")] = PositionLifecycle(
+        market_id="m1",
+        token_id="t1",
+        opened_at=now - timedelta(minutes=3),
+        last_fill_at=now - timedelta(minutes=2),
+        confirmation_deadline=now - timedelta(seconds=1),
+    )
+
+    def broken(market_id: str) -> Decimal:
+        raise RuntimeError("venue lookup failed")
+
+    result = await state.merge_authoritative_positions(
+        [], now=now, dust_threshold=Decimal("5"), dust_threshold_for=broken
+    )
+
+    assert result.dust_keys == ["m1:t1"]

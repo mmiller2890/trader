@@ -169,7 +169,13 @@ exchange:
     class Adapter:
         @classmethod
         def from_v2(cls, **_: object) -> object:
-            return object()
+            return Adapter()
+
+        def get_tick_size(self, token_id: str) -> Decimal:
+            return Decimal("0.01")
+
+        def get_minimum_order_size(self, market_id: str) -> Decimal:
+            return Decimal("5")
 
     async def capture_preflight(**kwargs: object) -> LivePreflightReport:
         nonlocal observed_tokens

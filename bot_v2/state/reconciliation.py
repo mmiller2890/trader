@@ -70,6 +70,7 @@ class ReconciliationService:
         market_end_lookup: Callable[[str, str], datetime | None] | None = None,
         require_position_market_end: bool = False,
         min_order_size: Decimal = Decimal("1"),
+        min_size_provider: Callable[[str], Decimal] | None = None,
     ) -> None:
         self._state_store = state_store
         self._mode = mode
@@ -81,6 +82,7 @@ class ReconciliationService:
         self._market_end_lookup = market_end_lookup
         self._require_position_market_end = require_position_market_end
         self._min_order_size = min_order_size
+        self._min_size_provider = min_size_provider
 
     async def reconcile_startup(self) -> ReconciliationReport:
         """Run conservative startup reconciliation."""
@@ -202,8 +204,11 @@ class ReconciliationService:
                     market_end_lookup=self._market_end_lookup,
                     # Below the venue's minimum order size no order can close
                     # the gap, so a difference there is dust rather than a
-                    # divergence and must not be raised on every pass.
+                    # divergence and must not be raised on every pass. The floor
+                    # is published per market, so resolve it per market and fall
+                    # back to the configured value when the lookup fails.
                     dust_threshold=self._min_order_size,
+                    dust_threshold_for=self._min_size_provider,
                 )
                 deferred_positions = merge.deferred_keys
                 for key in merge.expired_keys:

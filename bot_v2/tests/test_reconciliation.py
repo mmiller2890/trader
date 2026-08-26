@@ -661,3 +661,46 @@ async def test_dust_residue_does_not_keep_reporting_a_divergence() -> None:
     # A second pass must stay quiet rather than rediscovering it.
     again = await service.reconcile_runtime()
     assert again.deferred_positions == []
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_uses_the_venue_minimum_for_the_dust_threshold() -> None:
+    """
+    The order builder reads minimum_order_size per market; reconciliation has
+    to use the same floor or it will keep flagging inventory nobody can sell.
+
+    Config says 5, this market says 50. A 20-share residue clears the config
+    floor but not the venue's, so without a per-market lookup it would defer,
+    time out, and halt exactly as the 0.005 residue did on 2026-08-26.
+    """
+
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    await state.set_position(
+        Position(
+            market_id="thin",
+            token_id="t1",
+            quantity=Decimal("20"),
+            average_entry_price=Decimal("0.40"),
+        )
+    )
+    state._lifecycles[("thin", "t1")] = PositionLifecycle(
+        market_id="thin",
+        token_id="t1",
+        opened_at=NOW,
+        last_fill_at=NOW,
+        market_end_at=NOW + timedelta(minutes=15),
+    )
+    service = ReconciliationService(
+        state_store=state,
+        mode=Mode.LIVE,
+        open_orders_reader=FakeOrdersReader([]),
+        positions_reader=FakePositionsReader([]),
+        min_order_size=Decimal("5"),
+        min_size_provider=lambda market_id: Decimal("50"),
+    )
+
+    report = await service.reconcile_runtime()
+
+    assert report.deferred_positions == []
+    assert not any("position_confirmation_timeout" in e for e in report.errors)
+    assert await state.get_position("thin", "t1") is None

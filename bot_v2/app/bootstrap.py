@@ -359,6 +359,11 @@ async def bootstrap_app(
                         config.market_data.automatic_market.enabled
                     ),
                     min_order_size=config.execution.min_order_size,
+                    min_size_provider=(
+                        clob_client.get_minimum_order_size
+                        if is_live_mode(config.bot.mode)
+                        else None
+                    ),
                 )
             except Exception as exc:
                 raise LivePreflightError(("client_initialization",)) from exc
@@ -529,6 +534,11 @@ async def bootstrap_app(
             config.market_data.automatic_market.enabled
         ),
         min_order_size=config.execution.min_order_size,
+        min_size_provider=(
+            clob_client.get_minimum_order_size
+            if is_live_mode(config.bot.mode)
+            else None
+        ),
     )
     router = ExecutionRouter(
         config=config,

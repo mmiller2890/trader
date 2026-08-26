@@ -251,6 +251,7 @@ class InMemoryStateStore:
         now: datetime,
         market_end_lookup: Callable[[str, str], datetime | None] | None = None,
         dust_threshold: Decimal = Decimal("0"),
+        dust_threshold_for: Callable[[str], Decimal] | None = None,
     ) -> PositionMergeResult:
         """
         Merge remote truth while preserving pending confirmed local fills.
@@ -259,6 +260,12 @@ class InMemoryStateStore:
         order. When neither side holds that much, the difference between them
         cannot be traded away by anyone, so it is retired as dust instead of
         being deferred and then reported as a divergence on every later pass.
+
+        ``dust_threshold_for`` resolves that floor per market, because the venue
+        publishes it per market. The larger of the two wins, so a looser local
+        setting cannot leave unsellable inventory looking like a divergence. A
+        lookup failure falls back to ``dust_threshold`` rather than disabling
+        dust handling.
         """
 
         async with self._lock:
@@ -297,10 +304,16 @@ class InMemoryStateStore:
                             )
                     continue
                 lifecycle = self._lifecycles.get(key)
+                effective_dust = dust_threshold
+                if dust_threshold_for is not None:
+                    try:
+                        effective_dust = max(effective_dust, dust_threshold_for(key[0]))
+                    except Exception:
+                        effective_dust = dust_threshold
                 if (
-                    dust_threshold > 0
-                    and local_quantity < dust_threshold
-                    and remote_quantity < dust_threshold
+                    effective_dust > 0
+                    and local_quantity < effective_dust
+                    and remote_quantity < effective_dust
                     # Never ahead of the confirmation grace period. That window
                     # exists to stop a stale remote read from discarding a fill
                     # the exchange already confirmed to us, and a sub-threshold
