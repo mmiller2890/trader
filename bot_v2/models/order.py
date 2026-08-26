@@ -45,12 +45,23 @@ class OrderStatus(str, Enum):
     UNKNOWN = "unknown"
 
 
+#: Upper bound for any order identifier this process holds.
+#:
+#: Locally generated ids are short (``pm-bot-`` plus 18 hex, ~25 characters),
+#: but the venue's own ids are 0x-prefixed 32-byte hashes -- 66 characters --
+#: and they land in ``client_order_id`` whenever an order is read back from
+#: the exchange, because Polymarket returns no client id of its own. A 64
+#: cap rejected every resting order with a ValidationError, which surfaced as
+#: remote_open_orders_fetch_failed and halted live trading on 2026-08-26.
+ORDER_ID_MAX_LENGTH = 80
+
+
 class OrderRequest(BaseModel):
     """Validated order request sent to execution submitter."""
 
     model_config = ConfigDict(extra="forbid")
 
-    client_order_id: str = Field(min_length=8, max_length=64)
+    client_order_id: str = Field(min_length=8, max_length=ORDER_ID_MAX_LENGTH)
     market_id: str = Field(min_length=1)
     token_id: str = Field(min_length=1)
     side: OrderSide
@@ -69,7 +80,7 @@ class OrderResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    client_order_id: str = Field(min_length=8, max_length=64)
+    client_order_id: str = Field(min_length=8, max_length=ORDER_ID_MAX_LENGTH)
     exchange_order_id: str | None = None
     market_id: str | None = None
     token_id: str | None = None
@@ -92,7 +103,7 @@ class CancelIntent(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    client_order_id: str = Field(min_length=8, max_length=64)
+    client_order_id: str = Field(min_length=8, max_length=ORDER_ID_MAX_LENGTH)
     exchange_order_id: str | None = None
     market_id: str = Field(min_length=1)
     token_id: str = Field(min_length=1)
@@ -116,7 +127,7 @@ class CancelResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    client_order_id: str = Field(min_length=8, max_length=64)
+    client_order_id: str = Field(min_length=8, max_length=ORDER_ID_MAX_LENGTH)
     exchange_order_id: str | None = None
     outcome: CancelOutcome
     message: str | None = None

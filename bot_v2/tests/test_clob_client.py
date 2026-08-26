@@ -1086,3 +1086,47 @@ def test_minimum_order_size_falls_back_to_config_when_lookup_fails() -> None:
         sdk_factory=BrokenClient,
     )
     assert adapter.get_minimum_order_size("0xmarket") == live_config().execution.min_order_size
+
+
+def test_open_orders_parse_a_full_length_venue_order_id() -> None:
+    """
+    Polymarket order ids are 0x + 32 bytes = 66 characters, but OrderResult
+    capped client_order_id at 64, and get_open_orders puts the venue id in
+    that field because the venue returns no client id of its own.
+
+    Any resting order therefore raised a pydantic ValidationError, which
+    reconciliation reported as remote_open_orders_fetch_failed and which
+    halted live trading on 2026-08-26. It only surfaced once maker entries
+    started leaving orders on the book -- before that the list was always
+    empty, so nothing was ever parsed.
+    """
+
+    venue_order_id = "0x0ee23003d5eda6030673b58a4c697835b2186b8c3a239b94eb7496dd3ff4f3b3"
+    assert len(venue_order_id) == 66
+
+    class RestingOrderClient(FakeV2Client):
+        def get_open_orders(self, params: object = None, only_first_page: bool = False, next_cursor: object = None) -> list[dict[str, object]]:
+            return [
+                {
+                    "id": venue_order_id,
+                    "market": "0xmarket",
+                    "asset_id": "123",
+                    "side": "BUY",
+                    "original_size": "5",
+                    "size_matched": "0",
+                    "price": "0.62",
+                }
+            ]
+
+    adapter = ClobClientAdapter.from_v2(
+        config=live_config(),
+        credentials=complete_credentials(),
+        sdk_factory=RestingOrderClient,
+    )
+
+    orders = adapter.get_open_orders()
+
+    assert len(orders) == 1
+    assert orders[0].exchange_order_id == venue_order_id
+    assert orders[0].requested_size == Decimal("5")
+    assert orders[0].filled_size == Decimal("0")
