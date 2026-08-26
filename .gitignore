@@ -1,0 +1,29 @@
+# Nothing here was tracked when this file was added -- it exists to keep it
+# that way. Task implementers run `git add` on shared paths, so an untracked
+# runtime artefact sitting in the tree gets swept into an unrelated commit.
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Runtime state and operator artefacts. data/ holds the journal, snapshots,
+# positions and recorded books; none of it belongs in version control, and
+# the journal in particular can carry live order detail.
+bot_v2/data/
+bot_v2/logs/
+bot/data/
+bot/logs/
+
+# Local credentials
+.env
+.env.*
+!.env.example
