@@ -614,3 +614,50 @@ async def test_missing_fill_recorder_blocks_live_when_fills_exist() -> None:
     assert report.ok is False
     assert "fill_recorder_not_configured" in report.errors
     assert await state.get_positions() == []
+
+
+@pytest.mark.asyncio
+async def test_dust_residue_does_not_keep_reporting_a_divergence() -> None:
+    """
+    Runtime reconciliation must not raise an incident every pass over inventory
+    the venue will not let anyone trade.
+
+    A live round trip on 2026-08-26 left 0.005 shares against a venue minimum
+    of 5. Each pass deferred, then timed out, and the repeated incidents
+    halted trading. The residue is real but untradeable, so it is retired.
+    """
+
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    await state.set_position(
+        Position(
+            market_id="m1",
+            token_id="t1",
+            quantity=Decimal("0.005"),
+            average_entry_price=Decimal("0.36"),
+        )
+    )
+    state._lifecycles[("m1", "t1")] = PositionLifecycle(
+        market_id="m1",
+        token_id="t1",
+        opened_at=NOW,
+        last_fill_at=NOW,
+        market_end_at=NOW + timedelta(minutes=15),
+        confirmation_deadline=NOW + timedelta(seconds=30),
+    )
+    service = ReconciliationService(
+        state_store=state,
+        mode=Mode.LIVE,
+        open_orders_reader=FakeOrdersReader([]),
+        positions_reader=FakePositionsReader([]),
+        min_order_size=Decimal("5"),
+    )
+
+    report = await service.reconcile_runtime()
+
+    assert report.deferred_positions == []
+    assert not any("position_confirmation_timeout" in e for e in report.errors)
+    assert await state.get_position("m1", "t1") is None
+
+    # A second pass must stay quiet rather than rediscovering it.
+    again = await service.reconcile_runtime()
+    assert again.deferred_positions == []

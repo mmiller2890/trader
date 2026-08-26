@@ -364,3 +364,76 @@ async def test_maker_fills_are_charged_nothing() -> None:
     lifecycle = await store.get_position_lifecycle("m1", "t1")
     assert lifecycle is not None
     assert lifecycle.closed_realized_pnl == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_sub_minimum_residue_is_retired_as_dust_not_deferred() -> None:
+    """
+    A partial fill can leave inventory below the venue's minimum order size,
+    which can never be sold and so can never be reconciled away.
+
+    On 2026-08-26 a live round trip filled 5.00 in and 4.995 out, leaving
+    0.005 shares. Reconciliation treated that as a divergence: it deferred
+    while the confirmation deadline ran, then recorded
+    position_confirmation_timeout on every later pass. The repeated incidents
+    tripped the breaker and halted trading over inventory worth a fifth of a
+    cent. Dust has to be recognised as dust.
+    """
+
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    now = datetime(2026, 8, 26, 8, 5, tzinfo=UTC)
+    state._positions[("m1", "t1")] = Position(
+        market_id="m1",
+        token_id="t1",
+        quantity=Decimal("0.005"),
+        average_entry_price=Decimal("0.36"),
+    )
+    state._lifecycles[("m1", "t1")] = PositionLifecycle(
+        market_id="m1",
+        token_id="t1",
+        opened_at=now - timedelta(minutes=3),
+        last_fill_at=now - timedelta(minutes=2),
+        confirmation_deadline=now + timedelta(seconds=30),
+    )
+
+    result = await state.merge_authoritative_positions(
+        [], now=now, dust_threshold=Decimal("5")
+    )
+
+    assert result.deferred_keys == []
+    assert result.expired_keys == []
+    assert result.dust_keys == ["m1:t1"]
+    # The residue is gone from local state and the deadline is cleared, so no
+    # later pass can re-raise it.
+    assert await state.get_position("m1", "t1") is None
+    lifecycle = await state.get_position_lifecycle("m1", "t1")
+    assert lifecycle is not None
+    assert lifecycle.confirmation_deadline is None
+
+
+@pytest.mark.asyncio
+async def test_a_sellable_divergence_is_still_deferred() -> None:
+    """Dust handling must not swallow a real, tradeable disagreement."""
+
+    state = InMemoryStateStore(mode=Mode.LIVE)
+    now = datetime(2026, 8, 26, 8, 5, tzinfo=UTC)
+    state._positions[("m1", "t1")] = Position(
+        market_id="m1",
+        token_id="t1",
+        quantity=Decimal("40"),
+        average_entry_price=Decimal("0.36"),
+    )
+    state._lifecycles[("m1", "t1")] = PositionLifecycle(
+        market_id="m1",
+        token_id="t1",
+        opened_at=now - timedelta(minutes=3),
+        last_fill_at=now - timedelta(minutes=2),
+        confirmation_deadline=now + timedelta(seconds=30),
+    )
+
+    result = await state.merge_authoritative_positions(
+        [], now=now, dust_threshold=Decimal("5")
+    )
+
+    assert result.deferred_keys == ["m1:t1"]
+    assert result.dust_keys == []

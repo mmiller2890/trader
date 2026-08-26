@@ -118,3 +118,8 @@ class PositionMergeResult(BaseModel):
     deferred_keys: list[str] = Field(default_factory=list)
     expired_keys: list[str] = Field(default_factory=list)
     unknown_market_keys: list[str] = Field(default_factory=list)
+    # Positions retired because both sides hold less than the venue will let
+    # anyone trade. Reported so the operator can see it happened, but never as
+    # a divergence: no order can close the gap, so raising it every pass would
+    # halt the bot over inventory it is not allowed to sell.
+    dust_keys: list[str] = Field(default_factory=list)

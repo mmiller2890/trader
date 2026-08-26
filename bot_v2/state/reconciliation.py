@@ -200,6 +200,10 @@ class ReconciliationService:
                     remote_positions,
                     now=self._now(),
                     market_end_lookup=self._market_end_lookup,
+                    # Below the venue's minimum order size no order can close
+                    # the gap, so a difference there is dust rather than a
+                    # divergence and must not be raised on every pass.
+                    dust_threshold=self._min_order_size,
                 )
                 deferred_positions = merge.deferred_keys
                 for key in merge.expired_keys:

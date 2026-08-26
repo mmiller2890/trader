@@ -250,8 +250,16 @@ class InMemoryStateStore:
         *,
         now: datetime,
         market_end_lookup: Callable[[str, str], datetime | None] | None = None,
+        dust_threshold: Decimal = Decimal("0"),
     ) -> PositionMergeResult:
-        """Merge remote truth while preserving pending confirmed local fills."""
+        """
+        Merge remote truth while preserving pending confirmed local fills.
+
+        ``dust_threshold`` is the smallest quantity the venue will accept in an
+        order. When neither side holds that much, the difference between them
+        cannot be traded away by anyone, so it is retired as dust instead of
+        being deferred and then reported as a divergence on every later pass.
+        """
 
         async with self._lock:
             remote_map = {
@@ -261,6 +269,7 @@ class InMemoryStateStore:
             keys = set(self._positions) | set(remote_map) | set(self._lifecycles)
             deferred: list[str] = []
             expired: list[str] = []
+            dust: list[str] = []
             for key in sorted(keys):
                 local = self._positions.get(key)
                 remote_position = remote_map.get(key)
@@ -288,6 +297,24 @@ class InMemoryStateStore:
                             )
                     continue
                 lifecycle = self._lifecycles.get(key)
+                if (
+                    dust_threshold > 0
+                    and local_quantity < dust_threshold
+                    and remote_quantity < dust_threshold
+                ):
+                    # Neither side can place an order in this market, so the
+                    # gap is permanent. Take remote as truth, stop the
+                    # confirmation clock, and record it as dust.
+                    dust.append(f"{key[0]}:{key[1]}")
+                    if remote_position is not None and remote_quantity > 0:
+                        self._positions[key] = remote_position
+                    else:
+                        self._positions.pop(key, None)
+                    if lifecycle is not None and lifecycle.confirmation_deadline is not None:
+                        self._lifecycles[key] = lifecycle.model_copy(
+                            update={"confirmation_deadline": None}
+                        )
+                    continue
                 if (
                     local is None
                     and remote_position is not None
@@ -337,6 +364,7 @@ class InMemoryStateStore:
                 deferred_keys=deferred,
                 expired_keys=expired,
                 unknown_market_keys=unknown_market,
+                dust_keys=dust,
             )
 
     def _adopt_lifecycle_locked(
